@@ -114,4 +114,5 @@ docker run --rm --network container:bw-secrets-it -e BW_E2E_URL=http://127.0.0.1
   -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
 ```
 
-The design and the plan are in [`../docs/bwss-plan.md`](../docs/bwss-plan.md).
+Design, security review, test results and performance: [`../docs/bwss.md`](../docs/bwss.md).
+The original plan: [`../docs/bwss-plan.md`](../docs/bwss-plan.md).
