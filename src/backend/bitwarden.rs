@@ -44,6 +44,7 @@ enum QueuedOp {
 
 struct Unlocked {
     user_key: SymmetricKey,
+    kdf: KdfParams,
     sync: Value,
     /// Bitwarden folder id → collection id.
     folders: BTreeMap<String, String>,
@@ -245,6 +246,9 @@ impl BitwardenBackend {
                 state.ciphers.insert(id.to_owned(), cid);
             }
         }
+        // Keep the offline copy current, so that what was written is still
+        // there when the next unlock happens without a network.
+        self.save_cache(state.kdf, &state.sync);
     }
 
     /// Replays queued writes. Stops at the first transient failure.
@@ -369,7 +373,7 @@ impl Backend for BitwardenBackend {
             self.save_cache(kdf, &sync);
         }
         let (snap, folders, ciphers) = self.snapshot(&sync, &user_key);
-        *self.state.lock().await = Some(Unlocked { user_key, sync, folders, ciphers });
+        *self.state.lock().await = Some(Unlocked { user_key, kdf, sync, folders, ciphers });
         if !from_cache && let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
         }
@@ -398,11 +402,7 @@ impl Backend for BitwardenBackend {
         state.sync = sync;
         state.folders = folders;
         state.ciphers = ciphers;
-        let kdf =
-            std::fs::read(&self.cache_path).ok().and_then(|b| serde_json::from_slice::<Cache>(&b).ok()).map(|c| c.kdf);
-        if let Some(kdf) = kdf {
-            self.save_cache(kdf, &state.sync);
-        }
+        self.save_cache(state.kdf, &state.sync);
         Ok(Some(snap))
     }
 

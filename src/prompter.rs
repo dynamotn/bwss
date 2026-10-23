@@ -29,7 +29,6 @@ pub enum PromptError {
 
 // libgpg-error codes as pinentry reports them (source 5 = pinentry).
 const ERR_CANCELED: &str = "83886179";
-const ERR_NOT_CONFIRMED: &str = "83886194";
 
 #[derive(Clone)]
 pub struct Prompter {
@@ -172,16 +171,21 @@ impl Prompter {
             let mut c = Conversation::start(&self.program).await?;
             c.set("SETTITLE", "Keyring access").await?;
             c.set("SETDESC", description).await?;
-            c.set("SETOK", "Allow once").await?;
-            c.set("SETNOTOK", "Always allow").await?;
+            c.set("SETOK", "Allow").await?;
             c.set("SETCANCEL", "Deny").await?;
-            let reply = c.command("CONFIRM").await?;
+            // Only an explicit OK grants anything: pinentries differ in how
+            // they report other buttons, so every other answer is a denial.
+            let allowed = matches!(c.command("CONFIRM").await?, Reply::Ok(_));
+            if !allowed {
+                c.finish().await;
+                return Ok(Confirm::Deny);
+            }
+            c.set("SETDESC", "Remember this decision for this application?").await?;
+            c.set("SETOK", "Always allow").await?;
+            c.set("SETCANCEL", "Only this time").await?;
+            let remember = matches!(c.command("CONFIRM").await?, Reply::Ok(_));
             c.finish().await;
-            Ok(match reply {
-                Reply::Ok(_) => Confirm::Once,
-                Reply::Err(e) if e.starts_with(ERR_NOT_CONFIRMED) => Confirm::Always,
-                Reply::Err(_) => Confirm::Deny,
-            })
+            Ok(if remember { Confirm::Always } else { Confirm::Once })
         })
         .await
         .map_err(|_| PromptError::Timeout)?

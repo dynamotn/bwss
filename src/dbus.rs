@@ -34,6 +34,22 @@ fn prop_attributes(props: &HashMap<String, OwnedVariant>) -> Attributes {
         .unwrap_or_default()
 }
 
+/// A secret as one struct `(oayays)`. zbus spreads a returned struct or tuple
+/// over several out-arguments, so methods return it wrapped in a 1-tuple.
+#[derive(serde::Serialize, zbus::wire::Type)]
+pub struct SecretStruct {
+    session: OwnedObjectPath,
+    parameters: Vec<u8>,
+    value: Vec<u8>,
+    content_type: String,
+}
+
+impl From<WireSecret> for SecretStruct {
+    fn from((session, parameters, value, content_type): WireSecret) -> Self {
+        SecretStruct { session, parameters, value, content_type }
+    }
+}
+
 fn empty_variant() -> OwnedVariant {
     OwnedVariant::try_from(Variant::from("")).expect("string variant")
 }
@@ -313,7 +329,7 @@ impl ItemObj {
         &self,
         session: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
-    ) -> Result<WireSecret, SecretError> {
+    ) -> Result<(SecretStruct,), SecretError> {
         self.daemon.session(session.as_str(), sender(&header).as_deref())?;
         if self.daemon.keyring.lock().await.item_locked(&self.id) {
             return Err(SecretError::IsLocked("the item is locked".into()));
@@ -329,7 +345,7 @@ impl ItemObj {
             .map(|i| (i.secret.clone(), i.content_type.clone()))
             .ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
         self.daemon.touch();
-        self.daemon.encode_secret(session.as_str(), &secret, &ct)
+        self.daemon.encode_secret(session.as_str(), &secret, &ct).map(|w| (SecretStruct::from(w),))
     }
 
     async fn set_secret(&self, secret: WireSecret, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
@@ -437,6 +453,19 @@ pub struct PromptObj {
     action: std::sync::Mutex<Option<PromptAction>>,
 }
 
+impl PromptAction {
+    /// The result to report when the prompt is dismissed. It must have the
+    /// type the successful result would have (`ao` for an unlock, `o`
+    /// otherwise): libsecret rejects anything else and then never completes.
+    fn dismissed_result(&self) -> OwnedVariant {
+        let v = match self {
+            PromptAction::Unlock { .. } => Variant::from(Vec::<OwnedObjectPath>::new()),
+            PromptAction::CreateItem { .. } | PromptAction::CreateCollection { .. } => Variant::from(no_prompt()),
+        };
+        OwnedVariant::try_from(v).expect("plain variant")
+    }
+}
+
 impl PromptObj {
     pub async fn register(daemon: &Arc<Daemon>, action: PromptAction) -> Result<OwnedObjectPath, SecretError> {
         let path = format!("{SERVICE_PATH}/prompt/p{}", daemon.next_id());
@@ -461,11 +490,12 @@ impl PromptObj {
         };
         let daemon = self.daemon.clone();
         let path = self.path.clone();
+        let dismissed = action.dismissed_result();
         // The reply must not wait for the user; the outcome goes out as the
         // Completed signal.
         tokio::spawn(async move {
             if !daemon.unlock_interactive().await {
-                return PromptObj::finish(daemon, path, true, empty_variant()).await;
+                return PromptObj::finish(daemon, path, true, dismissed).await;
             }
             let result: SResult<OwnedVariant> = async {
                 match action {
@@ -487,7 +517,7 @@ impl PromptObj {
                 Ok(v) => PromptObj::finish(daemon, path, false, v).await,
                 Err(e) => {
                     tracing::warn!("prompt action failed: {e:?}");
-                    PromptObj::finish(daemon, path, true, empty_variant()).await
+                    PromptObj::finish(daemon, path, true, dismissed).await
                 }
             }
         });
@@ -495,8 +525,8 @@ impl PromptObj {
     }
 
     async fn dismiss(&self) -> Result<(), SecretError> {
-        if self.action.lock().unwrap().take().is_some() {
-            tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, empty_variant()));
+        if let Some(action) = self.action.lock().unwrap().take() {
+            tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, action.dismissed_result()));
         }
         Ok(())
     }

@@ -4,7 +4,10 @@
 Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL, re-read on
 every run so tests can change it between prompts:
 
-    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny" | "cancel"}
+    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny"}
+
+A confirmation is two CONFIRM questions in one conversation (allow?, then
+remember?), answered according to "confirm".
 
 "pins" is consumed one entry per GETPIN (the file is rewritten); an empty
 list cancels. Every command received is appended to $FAKE_PINENTRY_LOG.
@@ -41,6 +44,7 @@ def out(line):
 
 
 out("OK fake pinentry")
+confirms = 0
 for raw in sys.stdin:
     line = raw.rstrip("\n")
     cmd, _, arg = line.partition(" ")
@@ -57,13 +61,10 @@ for raw in sys.stdin:
         out("D " + pin.replace("%", "%25").replace("\n", "%0A"))
         out("OK")
     elif cmd == "CONFIRM":
+        confirms += 1
         answer = load().get("confirm", "deny")
-        if answer == "once":
-            out("OK")
-        elif answer == "always":
-            out("ERR 83886194 Not confirmed")
-        else:
-            out("ERR 83886179 Operation cancelled")
+        ok = answer in ("once", "always") if confirms == 1 else answer == "always"
+        out("OK" if ok else "ERR 83886179 Operation cancelled")
     elif cmd == "BYE":
         out("OK closing connection")
         break

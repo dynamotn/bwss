@@ -50,9 +50,11 @@ def test_store_while_locked_prompts_for_the_password(memory_daemon):
 def test_cancelled_prompt_leaves_the_keyring_locked(memory_daemon):
     d = memory_daemon
     d.pinentry(pins=[])
-    r = d.tool("store", "--label=x", "k", "v", input="value", check=False)
-    assert r.returncode != 0
+    # libsecret treats a dismissed prompt as "nothing stored", not as an error.
+    d.tool("store", "--label=x", "k", "v", input="value", check=False)
     assert d.cli("status").stdout.startswith("locked")
+    unlock(d)
+    assert d.tool("lookup", "k", "v", check=False).returncode != 0
 
 
 def test_dh_session_round_trip_with_secretstorage(memory_daemon, bus):
