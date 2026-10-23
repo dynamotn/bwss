@@ -1,0 +1,12 @@
+# ~/.config/bwss/config.toml
+backend = "bitwarden"
+server_url = "https://vault.bitwarden.com"
+email = "you@example.com"
+# Root folder in the vault; collections are its sub-folders ("secret-service/Work").
+folder = "secret-service"
+# Any pinentry: pinentry-gnome3, pinentry-qt, pinentry-gtk-2 ...
+prompter = "pinentry"
+# "prompt": ask before an app reads an item it did not create. "off": gnome-keyring behaviour.
+acl = "prompt"
+idle_lock_minutes = 0
+sync_interval_seconds = 300

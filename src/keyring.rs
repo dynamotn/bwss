@@ -1,0 +1,358 @@
+//! In-memory keyring state: collections, items, lock state and search.
+//!
+//! While locked, the decrypted items are gone. To let clients find what they
+//! need to unlock (libsecret only unlocks items that a search reported as
+//! locked), a *locked index* of salted attribute hashes is kept on disk, the
+//! same trade-off gnome-keyring makes: it reveals which items exist and lets
+//! someone with the file test guesses of attribute values, never secrets.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, now};
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LockedIndexFile {
+    salt: String,
+    collections: Vec<IndexedCollection>,
+    items: Vec<IndexedItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexedCollection {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexedItem {
+    id: String,
+    collection: String,
+    attrs: BTreeSet<String>,
+}
+
+/// What changed when a new snapshot replaced the old one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Diff {
+    pub created: Vec<(String, String)>,
+    pub changed: Vec<(String, String)>,
+    pub deleted: Vec<(String, String)>,
+    pub collections_created: Vec<String>,
+    pub collections_deleted: Vec<String>,
+}
+
+/// (collection id, item id)
+pub type ItemRef = (String, String);
+
+pub struct Keyring {
+    unlocked: bool,
+    collections: BTreeMap<String, CollectionData>,
+    items: BTreeMap<String, ItemData>,
+    index: LockedIndexFile,
+    index_path: Option<PathBuf>,
+}
+
+fn builtin_collections() -> BTreeMap<String, CollectionData> {
+    let t = now();
+    let mut m = BTreeMap::new();
+    m.insert(
+        LOGIN_COLLECTION.into(),
+        CollectionData { id: LOGIN_COLLECTION.into(), label: "Login".into(), created: t, modified: t },
+    );
+    m.insert(
+        SESSION_COLLECTION.into(),
+        CollectionData { id: SESSION_COLLECTION.into(), label: "Session".into(), created: t, modified: t },
+    );
+    m
+}
+
+impl Keyring {
+    pub fn new(index_path: Option<PathBuf>) -> Self {
+        let index = index_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<LockedIndexFile>(&b).ok())
+            .filter(|i| B64.decode(&i.salt).is_ok_and(|s| s.len() == 32))
+            .unwrap_or_else(|| {
+                let mut salt = [0u8; 32];
+                rand::fill(&mut salt);
+                LockedIndexFile { salt: B64.encode(salt), ..Default::default() }
+            });
+        let mut collections = builtin_collections();
+        for c in &index.collections {
+            collections.entry(c.id.clone()).or_insert(CollectionData {
+                id: c.id.clone(),
+                label: c.label.clone(),
+                created: 0,
+                modified: 0,
+            });
+        }
+        Keyring { unlocked: false, collections, items: BTreeMap::new(), index, index_path }
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        self.unlocked
+    }
+
+    /// The session collection never locks: it lives only in memory.
+    pub fn collection_locked(&self, id: &str) -> bool {
+        id != SESSION_COLLECTION && !self.unlocked
+    }
+
+    pub fn collections(&self) -> impl Iterator<Item = &CollectionData> {
+        self.collections.values()
+    }
+
+    pub fn collection(&self, id: &str) -> Option<&CollectionData> {
+        self.collections.get(id)
+    }
+
+    /// Every item known, locked ones included, as (collection, id).
+    pub fn item_refs(&self) -> Vec<(String, String)> {
+        let mut out: BTreeSet<(String, String)> =
+            self.items.values().map(|i| (i.collection.clone(), i.id.clone())).collect();
+        if !self.unlocked {
+            out.extend(self.index.items.iter().map(|i| (i.collection.clone(), i.id.clone())));
+        }
+        out.into_iter().collect()
+    }
+
+    pub fn items_in(&self, collection: &str) -> Vec<String> {
+        self.item_refs().into_iter().filter(|(c, _)| c == collection).map(|(_, id)| id).collect()
+    }
+
+    /// The item, if it is known and unlocked.
+    pub fn item(&self, id: &str) -> Option<&ItemData> {
+        self.items.get(id)
+    }
+
+    pub fn item_locked(&self, id: &str) -> bool {
+        match self.items.get(id) {
+            Some(i) => self.collection_locked(&i.collection),
+            None => true,
+        }
+    }
+
+    fn hash_attr(&self, name: &str, value: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(B64.decode(&self.index.salt).unwrap_or_default());
+        h.update(name.as_bytes());
+        h.update([0]);
+        h.update(value.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// (unlocked, locked) item refs matching all attributes.
+    pub fn search(&self, query: &Attributes, collection: Option<&str>) -> (Vec<ItemRef>, Vec<ItemRef>) {
+        let in_scope = |c: &str| collection.is_none_or(|want| want == c);
+        let mut unlocked = Vec::new();
+        let mut locked = Vec::new();
+        for item in self.items.values().filter(|i| in_scope(&i.collection) && i.matches(query)) {
+            let r = (item.collection.clone(), item.id.clone());
+            if self.collection_locked(&item.collection) { locked.push(r) } else { unlocked.push(r) }
+        }
+        if !self.unlocked {
+            let wanted: BTreeSet<String> = query.iter().map(|(k, v)| self.hash_attr(k, v)).collect();
+            for e in self.index.items.iter().filter(|e| in_scope(&e.collection) && wanted.is_subset(&e.attrs)) {
+                locked.push((e.collection.clone(), e.id.clone()));
+            }
+        }
+        (unlocked, locked)
+    }
+
+    /// Replaces the persistent contents with a backend snapshot (after unlock
+    /// or refresh) and reports what clients should be told about.
+    pub fn load(&mut self, snap: Snapshot) -> Diff {
+        let was_unlocked = self.unlocked;
+        let old_refs: BTreeSet<(String, String)> = self.item_refs().into_iter().collect();
+        let old_collections: BTreeSet<String> = self.collections.keys().cloned().collect();
+
+        let mut collections = builtin_collections();
+        if let Some(s) = self.collections.get(SESSION_COLLECTION) {
+            collections.insert(SESSION_COLLECTION.into(), s.clone());
+        }
+        for c in snap.collections {
+            collections.insert(c.id.clone(), c);
+        }
+        self.collections = collections;
+
+        let previous = std::mem::take(&mut self.items);
+        let mut items: BTreeMap<String, ItemData> = previous
+            .iter()
+            .filter(|(_, i)| i.collection == SESSION_COLLECTION)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for item in snap.items.into_iter().filter(|i| self.collections.contains_key(&i.collection)) {
+            items.insert(item.id.clone(), item);
+        }
+        self.items = items;
+        self.unlocked = true;
+        let new_refs: BTreeSet<(String, String)> = self.item_refs().into_iter().collect();
+
+        // Changes are only known when the old values were (i.e. on a refresh).
+        let changed = if was_unlocked {
+            new_refs.intersection(&old_refs).filter(|(_, id)| previous.get(id) != self.items.get(id)).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let diff = Diff {
+            created: new_refs.difference(&old_refs).cloned().collect(),
+            deleted: old_refs.difference(&new_refs).cloned().collect(),
+            changed,
+            collections_created: self.collections.keys().filter(|c| !old_collections.contains(*c)).cloned().collect(),
+            collections_deleted: old_collections
+                .iter()
+                .filter(|c| !self.collections.contains_key(*c))
+                .cloned()
+                .collect(),
+        };
+        self.save_index();
+        diff
+    }
+
+    /// Drops all decrypted state except the session collection.
+    pub fn lock(&mut self) {
+        self.items.retain(|_, i| i.collection == SESSION_COLLECTION);
+        self.unlocked = false;
+    }
+
+    pub fn upsert(&mut self, item: ItemData) {
+        self.items.insert(item.id.clone(), item);
+        self.save_index();
+    }
+
+    pub fn remove(&mut self, id: &str) -> Option<ItemData> {
+        let r = self.items.remove(id);
+        self.save_index();
+        r
+    }
+
+    pub fn add_collection(&mut self, c: CollectionData) {
+        self.collections.insert(c.id.clone(), c);
+        self.save_index();
+    }
+
+    pub fn remove_collection(&mut self, id: &str) -> Vec<String> {
+        self.collections.remove(id);
+        let gone: Vec<String> = self.items.values().filter(|i| i.collection == id).map(|i| i.id.clone()).collect();
+        for g in &gone {
+            self.items.remove(g);
+        }
+        self.save_index();
+        gone
+    }
+
+    pub fn set_collection_label(&mut self, id: &str, label: &str) {
+        if let Some(c) = self.collections.get_mut(id) {
+            c.label = label.to_owned();
+            c.modified = now();
+        }
+        self.save_index();
+    }
+
+    fn save_index(&mut self) {
+        if !self.unlocked {
+            return;
+        }
+        let items = self
+            .items
+            .values()
+            .filter(|i| i.collection != SESSION_COLLECTION)
+            .map(|i| IndexedItem {
+                id: i.id.clone(),
+                collection: i.collection.clone(),
+                attrs: i.attributes.iter().map(|(k, v)| self.hash_attr(k, v)).collect(),
+            })
+            .collect();
+        let collections = self
+            .collections
+            .values()
+            .filter(|c| c.id != SESSION_COLLECTION && c.id != LOGIN_COLLECTION)
+            .map(|c| IndexedCollection { id: c.id.clone(), label: c.label.clone() })
+            .collect();
+        self.index.items = items;
+        self.index.collections = collections;
+        if let Some(path) = &self.index_path
+            && let Err(e) = crate::fsutil::write_private(path, &serde_json::to_vec(&self.index).unwrap_or_default())
+        {
+            tracing::warn!("could not save the locked index: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroizing;
+
+    fn item(id: &str, collection: &str, attrs: &[(&str, &str)]) -> ItemData {
+        ItemData {
+            id: id.into(),
+            collection: collection.into(),
+            label: id.into(),
+            attributes: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            secret: Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 1,
+            acl: vec![],
+        }
+    }
+
+    fn q(attrs: &[(&str, &str)]) -> Attributes {
+        attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn search_unlocked_and_locked_through_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut k = Keyring::new(Some(path.clone()));
+        k.load(Snapshot {
+            collections: vec![],
+            items: vec![
+                item("a", "login", &[("service", "gh"), ("user", "me")]),
+                item("b", "login", &[("service", "x")]),
+            ],
+        });
+        assert_eq!(k.search(&q(&[("service", "gh")]), None).0, vec![("login".into(), "a".into())]);
+        k.lock();
+        assert!(k.item("a").is_none());
+
+        // A fresh daemon (restart) still finds locked items, but never the secret.
+        let k2 = Keyring::new(Some(path.clone()));
+        let (unlocked, locked) = k2.search(&q(&[("service", "gh")]), None);
+        assert!(unlocked.is_empty());
+        assert_eq!(locked, vec![("login".into(), "a".into())]);
+        assert!(k2.search(&q(&[("service", "nope")]), None).1.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("gh") && !text.contains("\"me\""));
+    }
+
+    #[test]
+    fn diff_after_refresh() {
+        let mut k = Keyring::new(None);
+        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[]), item("b", "login", &[])] });
+        let mut changed = item("a", "login", &[]);
+        changed.label = "renamed".into();
+        let d = k.load(Snapshot { collections: vec![], items: vec![changed, item("c", "login", &[])] });
+        assert_eq!(d.changed, vec![("login".into(), "a".into())]);
+        assert_eq!(d.created, vec![("login".into(), "c".into())]);
+        assert_eq!(d.deleted, vec![("login".into(), "b".into())]);
+    }
+
+    #[test]
+    fn session_collection_is_never_locked_or_persisted() {
+        let mut k = Keyring::new(None);
+        k.upsert(item("tmp", SESSION_COLLECTION, &[("k", "v")]));
+        k.lock();
+        assert!(!k.item_locked("tmp"));
+        assert_eq!(k.search(&q(&[("k", "v")]), None).0.len(), 1);
+        k.load(Snapshot::default());
+        assert!(k.item("tmp").is_some());
+    }
+}

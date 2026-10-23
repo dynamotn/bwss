@@ -1,0 +1,41 @@
+{
+  "email": " User@Example.COM ",
+  "password": "correct horse battery staple ✓",
+  "pbkdf2": {
+    "iterations": 600000,
+    "masterKey": "Yx2pkVHr74JqramkdcGXZvWkyPMU1kzPHfajYAnYxeg=",
+    "stretched": "IScx2IGgIGPhhmWtrPRPfd+PYVncQrl63OiqADyUlQ7u0r1cdbWuLkVDXqM3RIqbQzsJYG4a/PL5Kw3X4hm5Ew==",
+    "masterPasswordHash": "nzk8IpVM9b451v0PMQ86BtpE8YRMZFMp+iPYApeT03I="
+  },
+  "argon2id": {
+    "iterations": 3,
+    "memory": 64,
+    "parallelism": 4,
+    "masterKey": "wl7duvZh0aKTSdjGhW4RmDt31YPfh8JnPweXmuXBrvE=",
+    "stretched": "lGSPHxKNH2K5kA2PFOz8yIs7FGfOPwkBS71bA/B5rxN283dTuIm4Ht0RPcc7l2dyNZDUQYs7qONvVB9v+K1a8Q=="
+  },
+  "userKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==",
+  "protectedUserKey": "2.ZGVmZ2hpamtsbW5vcHFycw==|FVOvVrsfqRiW90cvQhqPW5fCcFexLPIQKzFP68jJiampjLMpLsnxX0dAleiXKWE047iWjSGBsSy9kw0qb1mfpxiF3feFxzH7gciwMJsTaWA=|UWOE0cjcYnLXgv7h6qlDJsPEHkG0HS54jRjlsqeXkBM=",
+  "encStrings": [
+    {
+      "plain": "",
+      "enc": "2.ZGVmZ2hpamtsbW5vcHFycw==|95X26IAv0VGgIaQRUNSraQ==|w5/bRz27QXlnr7nU2sVc5I8DnbaRD3W7MftHgXRtU1s="
+    },
+    {
+      "plain": "a",
+      "enc": "2.ZGVmZ2hpamtsbW5vcHFycw==|6ky0TfMi0CNQYOW5GRA/zg==|DCwj6MLIxi1qBW53RgcFmQcK68upd9rZbjvBVXl2zWY="
+    },
+    {
+      "plain": "sixteen bytes!!!",
+      "enc": "2.ZGVmZ2hpamtsbW5vcHFycw==|wO64+r6yIecrcFWkXR568uvUFrKpTWJA+QwRrZCFgkY=|vq2XrbsygE0mQfeqyu9ShOksfYQAq5PnBDZNyCRU6Q8="
+    },
+    {
+      "plain": "Tiếng Việt có dấu 🔐",
+      "enc": "2.ZGVmZ2hpamtsbW5vcHFycw==|RwXUzQ6rcgwGwumCSUu2rbibCpZAusq5uvposYPBFiw=|6IMddX2wUGbzrJ2LgvqbowV75pA86JGsPyxXdML1+fU="
+    },
+    {
+      "plain": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "enc": "2.ZGVmZ2hpamtsbW5vcHFycw==|kU+czwmdfZe3MpHPFL8mkDLMiA7GAtzBj/rO3XysCNjE9mWWtUwmRZcshmj/evedpbF15lCJAthefe3jqZDxREqyGOeymnO/pdtwxVDJlrO3V8sAPmNKjg78FnYVxsaeKfEruo7jzICbWV4m5JWSP/TvncBiRqkwMdZ9acCM+6jghiWuIqdpA+RhAxZzoQXPpCuiM/0JtVgpbIG+eWi7pRghKd5gAh5ccWNuGmEBxRUjCmsyDMZKLXhawOwb7ebElnxDtrrNA1QEVO4XsQSlVUj3+133XcbJ6nqNManqV+3vCivkfQAzLCCi7QZ9IPHDpU+dnda3kzZdFBXj84ver0VE7Wpny3Ze16GT6wXvzXvAExHmRb58PIaHhg6BhjYYClnfFG3Omp2p3ygOp3sX39/ls0RfK029Rp8cYUldbVTtjFBHBTEHwYVukWCjycSNPLLZ5ysNqFpMg/e07oKG52qehWq3wpdS5yA8iIyxR52s/EPM1JYCI2NIBH0XeVyFlIor81gaXmWrXBolHivbVM7wzQ5jD/ngso3DUqImD60MHysXXVlO9it99+VMpyP5YDEF7qm6j6J7lkaEfnWCxnMc2yVFd7fhjQNw8fqLXSm8vMYRkJjfXZdSD8hLb83aIjrMsDl5n1wcFZj3uuGqDlIVQhbbhVkee7O07fZ24+3QZX4IAUOmx8pNNarK1//5L/dcGpnJFG0CA/co0gu2rwHnQl9BrcHWMn5HgGuJlijjqAvBXdFtz51B6P0XKafP/bGIwNk1JibJbL1zoFm0BtiILHBb4er4f2EjjsJ/gRRZ0DqHgekmV5fw3b5bOFNxu6kcIfy7WF2crZpIWC55j0SBdttgx/FawQ0QvpeRILVn+duQ0erlcio8a+ujJUPpyakj/gDZ4qXQV6HT3dSTjTTY4WHtApysaQMoTIFPVspa8/0XojKeNn1Na5CPwHd+jBjGTI9tVQtc05Umhteg+6R9SnfBH1brdogmep6f3ia3EWHpDTdcOgE+iNY4EldnTGPFGehfEw6Qu456yAlmLXazhLKQT+CV+fOg8rl4jSYtjsmPxSfwW0h9JphBCs8puljjcrf6b4PpUrfkazhtp0acFYyGi54VovyEPSUwk9FA2u2w3OVaI7xp+JUB3q6evj93OLhHZAA86Y6sEeocwo7gUwmbvKQf116/1Ken/ip+56G8cw3QEqdKid1o3TQYqtkTb+Gw+rxtiXGdgoSYR/efyTg7qsZLfmxbWfLtZinIhmdDsIo1VTNUVwJTUt1QCVWxXJm8ZSLWYB7o9orLtwGp5sPfhHr47EgeV11nCi+rFEGJfMxRa8DPCjdKjUT6|1zOIyeexBD0e55KA/s0FLn1yvCyWX6uMvB9lmPwN1EI="
+    }
+  ]
+}
