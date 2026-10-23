@@ -9,6 +9,8 @@ mod dbus;
 mod fsutil;
 mod keyring;
 mod model;
+#[cfg(test)]
+mod perf;
 mod prompter;
 mod session;
 
