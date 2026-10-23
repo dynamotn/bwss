@@ -204,6 +204,19 @@ docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
 ```
 
+CI runs the same checks on both forges:
+
+- **GitHub** (`.github/workflows/`): fmt and clippy, unit tests on x86_64,
+  aarch64 and macOS, `cargo audit`, and the end-to-end suite against a
+  Vaultwarden service container. It also builds static musl binaries for
+  x86_64 and aarch64. Pushing a `v*` tag creates a release with those
+  binaries and their checksums. Actions are pinned to commit SHAs, and the
+  release path uses no caches.
+- **GitLab** (`.gitlab-ci.yml`): the same jobs. Releases are published to
+  the Generic Package Registry and linked from the release. aarch64 builds
+  need an arm64 runner (`ARM64_RUNNER_TAG`, which defaults to GitLab.com's
+  `saas-linux-small-arm64`).
+
 The full design is in [`docs/design.md`](docs/design.md): storage mapping,
 locking, sessions, prompts, access control, the offline queue, the security
 review and the test matrix. The original plan is in

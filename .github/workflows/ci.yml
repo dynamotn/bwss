@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets
+
+  test:
+    name: unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - run: cargo test --locked
+      - name: Performance budgets
+        run: cargo test --locked --release perf -- --ignored --nocapture
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177  # v2.87.30
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  e2e:
+    name: end-to-end (D-Bus, libsecret, secretstorage, Vaultwarden)
+    runs-on: ubuntu-latest
+    services:
+      vaultwarden:
+        image: vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055
+        ports: ["127.0.0.1:8080:80"]
+        env:
+          SIGNUPS_ALLOWED: "true"
+          SIGNUPS_VERIFY: "false"
+          DISABLE_ICON_DOWNLOAD: "true"
+          I_REALLY_WANT_VOLATILE_STORAGE: "true"
+          LOGIN_RATELIMIT_MAX_BURST: "1000"
+          LOGIN_RATELIMIT_SECONDS: "1"
+    env:
+      # bwss only allows plain http for loopback, which the port mapping provides.
+      BW_E2E_URL: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - name: Install test clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus dbus-daemon libsecret-tools \
+            python3-pytest python3-secretstorage python3-cryptography python3-jeepney
+      - run: cargo build --locked --release
+      - name: Wait for Vaultwarden
+        run: |
+          for _ in $(seq 60); do curl -fsS "$BW_E2E_URL/alive" && exit 0; sleep 2; done
+          exit 1
+      - name: Run end-to-end tests
+        run: dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
+        timeout-minutes: 15
+
+  build:
+    name: static binary (${{ matrix.arch }})
+    needs: [lint, test]
+    uses: ./.github/workflows/static-binary.yml
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    with:
+      arch: ${{ matrix.arch }}
