@@ -681,8 +681,13 @@ impl BitwardenBackend {
             Op::Patch(p) => server_base(state, &p.id),
             _ => None,
         };
+        let before = queue.clone();
         push_op(queue, op, server);
-        self.save_queue(queue, &state.keys.user);
+        // Not on disk, not durable: the app is told, and nothing is kept.
+        if let Err(e) = self.save_queue(queue, &state.keys.user) {
+            *queue = before;
+            return Err(BackendError::Unavailable(format!("the change cannot be queued on disk: {e}")));
+        }
         Self::rebuild(state, queue);
         Ok(())
     }
@@ -837,7 +842,7 @@ impl BitwardenBackend {
                         );
                         let rest = Patch { value: ValueChange::Keep, ..p.clone() };
                         queue[0] = Op::Patch(rest);
-                        self.save_queue(queue, &seal_key);
+                        let _ = self.save_queue(queue, &seal_key);
                         continue;
                     }
                     tracing::warn!("dropping a queued change: the secret was changed elsewhere");
@@ -853,7 +858,8 @@ impl BitwardenBackend {
                 }
             };
             queue.remove(0);
-            self.save_queue(queue, &seal_key);
+            // Logged in `save_queue`; the server already has the change.
+            let _ = self.save_queue(queue, &seal_key);
             self.settle(queue, effect).await?;
             if let Some(cid) = rescan {
                 self.rescan(queue, &cid).await;

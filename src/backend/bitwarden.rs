@@ -465,10 +465,12 @@ impl BitwardenBackend {
         }
     }
 
-    pub(super) fn save_queue(&self, queue: &[Op], key: &SymmetricKey) {
-        if let Err(e) = write_private(&self.queue_path, &serde_json::to_vec(&seal(queue, key)).unwrap_or_default()) {
+    pub(super) fn save_queue(&self, queue: &[Op], key: &SymmetricKey) -> std::io::Result<()> {
+        let saved = write_private(&self.queue_path, &serde_json::to_vec(&seal(queue, key)).unwrap_or_default());
+        if let Err(e) = &saved {
             tracing::warn!("could not write the offline queue: {e}");
         }
+        saved
     }
 
     /// Rebuilds the keyring after the cache or the queue changed.
@@ -501,7 +503,8 @@ impl BitwardenBackend {
     pub(super) async fn queue_changed(&self, queue: &[Op]) -> Result<(), BackendError> {
         let mut guard = self.state.lock().await;
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
-        self.save_queue(queue, &state.keys.user);
+        // Logged in `save_queue`; the change is already in memory.
+        let _ = self.save_queue(queue, &state.keys.user);
         Self::rebuild(state, queue);
         Ok(())
     }

@@ -536,6 +536,26 @@ async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
     assert_eq!(m.item.acl, ["/usr/bin/app"]);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_change_that_cannot_be_kept_on_disk_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.fake.with(|s| s.down = true);
+    let state = v.dir.join("state");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::File::create(state.join("probe")).is_ok() {
+        return; // permissions not enforced (running as root)
+    }
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    let result = v.backend.put_item(&item).await;
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(&result, Err(BackendError::Unavailable(_))), "{result:?}");
+    assert_eq!(v.queued().await, 0, "a change not on disk is not kept in memory either");
+    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+}
+
 impl Vault {
     /// The item as the backend shows it, without a refresh.
     async fn item_offline(&self, id: &str) -> ItemData {

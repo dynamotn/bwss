@@ -21,6 +21,7 @@ const FORMAT: u64 = 2;
 
 /// A queued write. A delete's `cipher_id` is the cipher it was read from,
 /// when known.
+#[derive(Clone)]
 pub enum Op {
     Create { id: String, collection: String, item: ItemData },
     Patch(Patch),
