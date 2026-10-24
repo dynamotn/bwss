@@ -37,6 +37,7 @@ pub enum Op {
 ///
 /// On `Unreadable` the file is still in place and may hold data (for example
 /// queued writes): callers must not overwrite or delete it.
+#[derive(Debug)]
 pub enum Loaded<T> {
     /// The file could not be read or set aside.
     Unreadable(std::io::Error),
@@ -262,7 +263,7 @@ mod tests {
         }
         let back = unseal(&sealed, &key).unwrap();
         assert_eq!(back.len(), 3);
-        let Op::Create { id, collection, item: got } = &back[0] else { panic!() };
+        let Op::Create { id, collection, item: got } = &back[0] else { panic!("expected Create") };
         assert_eq!(id, "id-7f3a-unique");
         assert_eq!(collection, "default");
         assert_eq!(*got, item());
@@ -279,8 +280,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("queue.json");
         std::fs::write(&p, r#"{"ops":[]}"#).unwrap();
-        let Loaded::SetAside(to) = read_versioned(&p, "legacy") else { panic!() };
-        assert_eq!(to, dir.path().join("queue.json.legacy"));
+        let got = read_versioned(&p, "legacy");
+        let Loaded::SetAside(to) = &got else { panic!("expected SetAside, got {got:?}") };
+        assert_eq!(*to, dir.path().join("queue.json.legacy"));
         assert!(!p.exists());
         assert!(dir.path().join("queue.json.legacy").exists());
     }
@@ -294,8 +296,9 @@ mod tests {
         assert!(dir.path().join("queue.json.corrupt").exists());
         // A second corrupt file does not overwrite the first.
         std::fs::write(&p, "nope").unwrap();
-        let Loaded::SetAside(to) = read_versioned(&p, "legacy") else { panic!() };
-        assert_eq!(to, dir.path().join("queue.json.corrupt.1"));
+        let got = read_versioned(&p, "legacy");
+        let Loaded::SetAside(to) = &got else { panic!("expected SetAside, got {got:?}") };
+        assert_eq!(*to, dir.path().join("queue.json.corrupt.1"));
     }
 
     #[test]
@@ -321,9 +324,23 @@ mod tests {
         // The rename fails whoever runs the test: there is nothing to move.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("queue.json");
-        let Loaded::Unreadable(e) = set_aside(&p, "legacy") else { panic!() };
+        let got = set_aside(&p, "legacy");
+        let Loaded::Unreadable(e) = &got else { panic!("expected Unreadable, got {got:?}") };
         assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
         assert!(!dir.path().join("queue.json.legacy").exists());
+    }
+
+    #[test]
+    fn a_corrupt_file_that_cannot_be_set_aside_is_unreadable_and_kept() {
+        // `<name>.corrupt` exceeds NAME_MAX, so the rename fails for any user.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q".repeat(250));
+        std::fs::write(&p, "nope").unwrap();
+        let got = read_versioned(&p, "legacy");
+        let Loaded::Unreadable(e) = &got else { panic!("expected Unreadable, got {got:?}") };
+        assert_ne!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "nope", "the file stays where it was");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -346,7 +363,7 @@ mod tests {
             cipher_id: Some("c1".into()),
         };
         let back = unseal(&seal(&[Op::Patch(patch)], &key), &key).unwrap();
-        let Op::Patch(p) = &back[0] else { panic!() };
+        let Op::Patch(p) = &back[0] else { panic!("expected Patch") };
         assert_eq!((p.id.as_str(), p.base_revision.as_str()), ("pid", "r1"));
         assert_eq!(p.cipher_id.as_deref(), Some("c1"));
         assert_eq!(p.set, vec![("bwss:label".to_string(), "l".to_string(), false)]);

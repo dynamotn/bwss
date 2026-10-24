@@ -308,7 +308,7 @@ mod tests {
     }
 
     fn marked(s: Scan) -> Box<MarkedItem> {
-        let Scan::Marked(m) = s else { panic!() };
+        let Scan::Marked(m) = s else { panic!("expected Marked, got {s:?}") };
         m
     }
 

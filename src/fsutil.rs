@@ -118,7 +118,6 @@ fn user_from_status(status: &str) -> std::io::Result<User> {
 }
 
 /// The effective uid and the groups from `/proc/<pid>/status`.
-#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code, reason = "Linux only; tested everywhere"))]
 fn parse_status(status: &str) -> Option<User> {
     let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::split_whitespace);
     let effective = |name: &str| field(name)?.nth(1)?.parse::<u32>().ok();

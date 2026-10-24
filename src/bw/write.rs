@@ -574,7 +574,8 @@ mod tests {
     }
 
     fn marked(c: &Value, k: &Keys) -> Box<MarkedItem> {
-        let Scan::Marked(m) = scan(c, k) else { panic!() };
+        let s = scan(c, k);
+        let Scan::Marked(m) = s else { panic!("expected Marked, got {s:?}") };
         m
     }
 
