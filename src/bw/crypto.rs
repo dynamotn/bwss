@@ -210,7 +210,9 @@ impl SymmetricKey {
 
     pub fn decrypt_str(&self, value: &str) -> Result<Zeroizing<String>, CryptoError> {
         let bytes = self.decrypt(value)?;
-        String::from_utf8(bytes.to_vec()).map(Zeroizing::new).map_err(|_| CryptoError::Decrypt)
+        // Validate in place: a failed `from_utf8` on an owned copy would leave
+        // the plaintext unwiped inside its error.
+        std::str::from_utf8(&bytes).map(|s| Zeroizing::new(s.to_owned())).map_err(|_| CryptoError::Decrypt)
     }
 
     pub fn decrypt_key(&self, value: &str) -> Result<SymmetricKey, CryptoError> {
@@ -250,6 +252,15 @@ mod tests {
     }
     fn b64(v: &Value) -> Vec<u8> {
         B64.decode(v.as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn decrypt_str_rejects_invalid_utf8_and_keeps_valid_text() {
+        let key = SymmetricKey::generate();
+        let good = key.encrypt(b"h\xc3\xa9llo");
+        assert_eq!(key.decrypt_str(&good).unwrap().as_str(), "h\u{e9}llo");
+        let bad = key.encrypt(&[0xff, 0xfe, b'x']);
+        assert!(matches!(key.decrypt_str(&bad), Err(CryptoError::Decrypt)));
     }
 
     #[test]

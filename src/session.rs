@@ -39,9 +39,13 @@ fn prime() -> BigUint {
     BigUint::parse_bytes(PRIME_HEX.as_bytes(), 16).expect("valid prime")
 }
 
-fn to_fixed(n: &BigUint) -> Vec<u8> {
-    let b = n.to_bytes_be();
-    let mut out = vec![0u8; KEY_BYTES.saturating_sub(b.len())];
+// Known limitation: `num-bigint` cannot zeroize. The DH private exponent
+// and the shared secret live in `BigUint` values that are freed unwiped, and
+// `BigUint::modpow` makes further unwiped temporaries. Only the byte buffers
+// built here, and the derived AES key, are wiped.
+fn to_fixed(n: &BigUint) -> Zeroizing<Vec<u8>> {
+    let b = Zeroizing::new(n.to_bytes_be());
+    let mut out = Zeroizing::new(vec![0u8; KEY_BYTES.saturating_sub(b.len())]);
     out.extend_from_slice(&b);
     out
 }
@@ -62,10 +66,10 @@ impl Session {
                 rand::fill(priv_bytes.as_mut_slice());
                 let private = BigUint::from_bytes_be(priv_bytes.as_ref());
                 let public = BigUint::from(2u8).modpow(&private, &p);
-                let shared = Zeroizing::new(to_fixed(&client.modpow(&private, &p)));
+                let shared = to_fixed(&client.modpow(&private, &p));
                 let mut key = Zeroizing::new([0u8; 16]);
                 Hkdf::<Sha256>::new(None, &shared).expand(&[], key.as_mut()).expect("16 bytes is a valid length");
-                Ok((Session::Aes(key), to_fixed(&public)))
+                Ok((Session::Aes(key), to_fixed(&public).to_vec()))
             }
             other => Err(SessionError::Unsupported(other.to_owned())),
         }

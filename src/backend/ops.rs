@@ -48,7 +48,7 @@ struct SealedItem {
     collection: String,
     label: String,
     attributes: BTreeMap<String, String>,
-    secret: Vec<u8>,
+    secret: Zeroizing<Vec<u8>>,
     content_type: String,
     created: u64,
     modified: u64,
@@ -62,7 +62,7 @@ impl From<&ItemData> for SealedItem {
             collection: i.collection.clone(),
             label: i.label.clone(),
             attributes: i.attributes.clone(),
-            secret: i.secret.to_vec(),
+            secret: Zeroizing::new(i.secret.to_vec()),
             content_type: i.content_type.clone(),
             created: i.created,
             modified: i.modified,
@@ -78,7 +78,7 @@ impl From<SealedItem> for ItemData {
             collection: i.collection,
             label: i.label,
             attributes: i.attributes,
-            secret: Zeroizing::new(i.secret),
+            secret: i.secret,
             content_type: i.content_type,
             created: i.created,
             modified: i.modified,
@@ -212,6 +212,19 @@ mod tests {
             modified: 2,
             acl: vec!["/usr/bin/x".into()],
         }
+    }
+
+    /// Compiles only while queued secrets are wiped on drop.
+    fn _assert_zeroizing(s: &SealedItem) -> &Zeroizing<Vec<u8>> {
+        &s.secret
+    }
+
+    #[test]
+    fn sealed_item_secret_is_zeroizing() {
+        let sealed = SealedItem::from(&item());
+        assert_eq!(_assert_zeroizing(&sealed).as_slice(), b"s3cr3t-plumb-unique");
+        let back = ItemData::from(sealed);
+        assert_eq!(back, item());
     }
 
     #[test]
