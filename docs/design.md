@@ -1,10 +1,19 @@
 # bwss — redesign
 
+This design follows the **dybw data model, version 1**
+(`docs/data-model.md` in the dybw umbrella repository). That spec is
+normative and wins over this document; this document adds the `bwss`
+namespace's own rules (its fields are registered in dybw's
+`docs/namespaces.md`). A change to a shared rule goes through a dybw ADR,
+then the spec, then this document. Section references written "spec §n"
+point into the data model.
+
 This document describes bwss rebuilt from scratch around one idea: **a
 vault item belongs to the keyring because the user marked it, not because of
-where it sits.** It replaces the folder-based design on `main` (a keyring
-folder plus `whole_vault`). It is written for whoever builds it. Choices the
-author made without the user are marked *(builder's call, revisable)*.
+where it sits.** It replaces the folder-based design now on the `legacy`
+branch (a keyring folder plus `whole_vault`). It is written for whoever
+builds it. Choices the author made without the user are marked
+*(builder's call, revisable)*.
 
 ## 1. Intent
 
@@ -22,9 +31,12 @@ solves the same problem for Obsidian:
 - any item, in any folder or none, joins the keyring when it carries the
   custom field `bwss:id`;
 - unmarked items are never decrypted beyond their field names;
-- bwss never overwrites data the user typed: an app's secret goes into the
-  field `bwss:password`, and deleting from an app removes bwss's fields
-  before it ever considers the Bitwarden trash.
+- a changed secret is written back where it was read (spec §6.1), so a
+  hand-marked login stays the one source for the browser, the official
+  clients and apps; a new secret never lands in a password or notes the
+  user owns;
+- deleting from an app removes bwss's fields before it ever considers the
+  Bitwarden trash.
 
 ### Goals
 
@@ -52,18 +64,20 @@ These would make it a failure even if every test passed:
 
 - Any unmarked item's name, username, URI, password or note reaching the
   bus, the cache in plain text, or a log.
-- An app silently replacing a password or note the user typed, or trashing
-  an item that still holds something the user put there.
+- An app writing outside bwss's fields and the value source of the item
+  it read, putting a new secret into a password or notes the user owns, or
+  trashing an item that still holds something the user put there.
 - Two devices disagreeing on which items exist or what their ids are.
 
 ## 2. Vocabulary
 
 | Term | Meaning |
 |---|---|
-| Marker | A custom field named `bwss:id` with a non-empty value |
+| Marker | A custom field named `bwss:id` with a non-empty value after trimming |
 | Marked item | A personal login or secure note, not trashed, carrying a marker |
 | bwss field | Any custom field whose name starts with `bwss:` |
-| Foreign content | Everything in an item that is not a bwss field (see §5.4) |
+| Value source | Where a marked item's secret was read from (§3.2, spec §5) |
+| Foreign content | Everything in an item that is not a bwss field (see §5.4), including other tools' fields |
 | Keyring folder | The folder new items are created in, `secret-service` by default |
 
 ## 3. Item model
@@ -73,7 +87,7 @@ These would make it a failure even if every test passed:
 | Field | Kind | Meaning |
 |---|---|---|
 | `bwss:id` | text | The marker and the item's stable id. bwss generates a UUID (32 hex digits) for items it creates; the user may type any value on items they mark. |
-| `bwss:password` | hidden | The secret, when present and non-empty. All writes go here. |
+| `bwss:password` | hidden | Holds the secret when the field is present, even empty. New items keep their secret here. |
 | `bwss:label` | text | The Secret Service label, when present. Label edits go here. |
 | `bwss:attr:<name>` | text | One lookup attribute each. |
 | `bwss:collection` | text | Collection id; absent means `login` (alias `default`). |
@@ -83,22 +97,27 @@ These would make it a failure even if every test passed:
 | `bwss:acl` | hidden | Executables allowed without asking, one path per line. |
 | `bwss:created` | text | Unix seconds when the item joined the keyring. |
 
-Field names are matched exactly (case-sensitive). Fields with any other
-`bwss:` name are kept on write but otherwise ignored, so newer versions can
-add fields.
+Field names are matched exactly (case-sensitive). If an item carries the
+same field twice, the first in field order counts, and a write changes only
+that one (spec §3.1). Every field bwss does not own is kept on write: other
+namespaces (`obsidian:*`, the reserved `dybw:*`), fields with no namespace,
+and `bwss:` fields this version does not know, so newer versions can add
+some.
 
 ### 3.2 Reading
 
 For a marked item:
 
 - **Label**: `bwss:label` if non-empty, else the item name.
-- **Secret**, first non-empty of:
-  1. `bwss:password`;
-  2. `notes`, when `bwss:location=notes` or the item is a secure note;
-  3. `login.password`.
+- **Secret** (spec §5), from the first **present** source:
+  1. the `bwss:password` field, when it exists, even with an empty value;
+  2. the notes, when `bwss:location=notes`;
+  3. `login.password` for a login, the notes for a secure note.
 
   Then base64-decode when `bwss:encoding=base64`. An empty result is a valid
-  empty secret.
+  empty secret. bwss remembers the value source of each item; presence, not
+  content, decides step 1, so the source does not change when a value
+  becomes empty.
 - **Attributes**: the `bwss:attr:*` fields, plus derived attributes that
   let a hand-marked item be found without typing attributes:
   `bwss:id`, `bwss:name` (item name), `bwss:username` and `bwss:uri` (first
@@ -117,18 +136,27 @@ For a marked item:
   itself becomes `_5f`. Two different ids can therefore never share a path.
   UUIDs that bwss generates are unchanged by the escape.
 - **Duplicate ids** (the usual cause is "Clone item" in a Bitwarden client,
-  which copies the marker): the item with the oldest `creationDate`, then
-  the lowest cipher id, wins on every device. The others are left out of
+  which copies the marker), spec §7: a personal item over an organization
+  item (once those are read, §12), then the oldest `creationDate` (an item
+  without one sorts last), then the lowest cipher id, wins on every
+  device. The others are left out of
   the keyring, a warning is logged, and `bwss status` lists them so the
   user can fix them.
 
 ### 3.4 Unmarked items
 
 To find markers, bwss decrypts the item key (when the item has one) and the
-**names** of the custom fields, nothing else. Values, item names, notes,
-logins and URIs of unmarked items stay ciphertext in memory and on disk. A
-field-name decryption failure skips the item with a warning, the same as
-any undecryptable item.
+**names** of the custom fields, nothing else (spec §4). Values, item names,
+notes, logins and URIs of unmarked items stay ciphertext in memory and on
+disk.
+
+An item bwss cannot inspect (a key it cannot unwrap, field names it cannot
+decrypt, a newer ciphertext format, an organization item) is skipped with a
+warning but is **not** treated as deleted: if it was in the keyring before
+a refresh, it stays there as last read, without `ItemDeleted`, until it can
+be read again or the keyring is locked. Marked items of another type
+(card, identity, SSH key) are skipped and reported, as are items with a
+`bwss:location` or `bwss:encoding` value this version does not know.
 
 ## 4. Collections
 
@@ -151,7 +179,7 @@ any undecryptable item.
   bring it back. *(builder's call, revisable)* The collections shown are the union of
   `login`, the registry and every collection id that marked items use.
   *(builder's call, revisable: the alternative is one sub-folder per
-  collection, which is what `main` does and what this design moves away
+  collection, which is what `legacy` does and what this design moves away
   from.)*
 - **Deleting a collection** applies the delete rule (§5.4) to every item in
   it, after authorizing each one, then removes its registry entry. `login`
@@ -159,19 +187,18 @@ any undecryptable item.
 
 ## 5. Writing
 
-All writes go through one rule: **bwss changes only bwss fields of an item
-it did not create, and only touches the rest of an item when every part it
-touches is its own.**
+All writes go through one rule (spec §6.3, invariant 2): **bwss changes
+only its own fields and the value source of the item it read.** Everything
+else passes through unchanged.
 
 ### 5.1 Creating an item
 
-- `CreateItem` makes a **secure note** in the keyring folder, named after
-  the label, with empty notes, and the fields `bwss:id` (new UUID),
-  `bwss:password`, `bwss:attr:*`, `bwss:collection` (unless `login`),
-  `bwss:content-type` (unless `text/plain`), `bwss:acl` (the creator) and
-  `bwss:created`. *(builder's call, revisable: `main` creates logins; a
-  login with an empty password would show up in browser autofill for no
-  reason.)*
+- `CreateItem` makes a **secure note** (spec §6.2) in the keyring folder,
+  personal (`organizationId: null`), named after the label, with empty
+  notes and no login, and the fields `bwss:id` (new UUID), `bwss:password`
+  (hidden, never the notes), `bwss:attr:*`, `bwss:collection` (unless
+  `login`), `bwss:content-type` (unless `text/plain`), `bwss:acl` (the
+  creator) and `bwss:created`.
 - `replace=true` looks for an item in the same collection with exactly the
   same `bwss:attr:*` attributes (derived attributes do not count) and
   updates it instead.
@@ -180,12 +207,25 @@ touches is its own.**
 
 ### 5.2 Changing the secret
 
-- The new value goes into `bwss:password` (hidden). The login password,
-  the notes and the password history are left alone.
+- The new value goes back to the **value source** it was read from
+  (spec §6.1):
+  - `bwss:password`: the field is updated; the login password, the notes
+    and the password history are left alone;
+  - the notes (`bwss:location=notes`, or a secure note without
+    `bwss:password`): the notes are updated;
+  - `login.password`: the password is updated the way the official clients
+    do it: the old password goes first into `passwordHistory` (at most 5
+    entries) and `login.passwordRevisionDate` is set.
+
+  So an app rotating the token of a hand-marked login updates that login,
+  and the browser and the official clients see the new value. A user who
+  wants an app-only value adds a `bwss:password` field to the item.
 - Non-UTF-8 bytes are stored as base64 with `bwss:encoding=base64`;
   otherwise `bwss:encoding` is removed.
-- **Size**: Bitwarden limits a field value to 5,000 encrypted characters
-  and the notes to 10,000. When the encrypted secret does not fit a field:
+- **Size** (spec §6.4): Bitwarden limits a field value to 5,000 encrypted
+  characters, the login password to 5,000 and the notes to 10,000. A
+  value that does not fit `login.password` fails. When a value whose
+  source is `bwss:password` does not fit the field:
   - if the notes are empty or already hold bwss's secret
     (`bwss:location=notes`), it goes into the notes with
     `bwss:location=notes`, and `bwss:password` is removed;
@@ -208,18 +248,20 @@ touches is its own.**
    Bitwarden trash (restorable for 30 days). Otherwise save it, and it
    simply leaves the keyring.
 
-Foreign content is any of: a non-empty login username, password, TOTP or
-URI; non-empty notes; a custom field whose name does not start with
-`bwss:`; an attachment; a passkey (`login.fido2Credentials`); a non-empty
-password history. The item name alone does not count.
+Foreign content (spec §8.2) is any of: a non-empty login username,
+password, TOTP or URI; non-empty notes; a custom field of **another
+namespace** (for example `obsidian:id`) or with no namespace; an
+attachment; a passkey (`login.fido2Credentials`); a non-empty password
+history. The item name alone does not count. An item another tool also
+marked is therefore never trashed by bwss.
 
 The decision is made against the server's copy, never a stale one:
 step 1 is saved first with `lastKnownRevisionDate`, and step 2 looks at
-what the server returned. If the save is rejected as out of date, bwss
-refetches and starts over at step 1 (a user edit made elsewhere in the
-meantime therefore keeps the item). A delete waiting in the offline queue
-is stored as "delete item X", not as "trash X", and runs these same steps
-when replayed. *(builder's call, revisable)*
+what the server returned (spec §8.2). If the save is rejected as out of
+date, bwss refetches and starts over at step 1 (a user edit made elsewhere
+in the meantime therefore keeps the item). A delete waiting in the offline
+queue is stored as "delete item X", not as "trash X", and runs these same
+steps when replayed.
 
 An item bwss created and nobody edited therefore goes to the trash; a login
 the user marked by hand keeps its password and only loses its bwss fields.
@@ -229,28 +271,35 @@ would find it again after "deleting" it.
 
 ### 5.5 Passing items through
 
-Every write sends the item as the server last returned it, minus
-response-only metadata, so unknown properties, attachments, URIs, passkeys
-and foreign fields survive. It keeps the per-item key (`cipher.key`) and
-sends `lastKnownRevisionDate` and `encryptedFor`.
+Every write (spec §6.3) starts from the cipher exactly as the server last
+returned it and removes only response-only metadata (`id`, `revisionDate`,
+`creationDate`, `deletedDate`, `object`, `edit`, `viewPassword`,
+`permissions`, `collectionIds`, `attachments`, `organizationUseTotp`,
+`data`). Unknown properties (newer item types, archive state), passkeys,
+URIs, TOTP, the folder and other tools' fields survive. It keeps the item
+key (`cipher.key`) and encrypts under it, always sends `passwordHistory`
+back (the server replaces it with what it receives), and sends
+`lastKnownRevisionDate` and `encryptedFor`.
 
 ### 5.6 Conflicts
 
-When the server rejects a write as out of date, bwss refetches the item and
-re-applies **its own field changes** to the fresh copy, then retries once
-more. Because bwss only edits bwss fields (and a creation's own notes),
-edits made elsewhere to the rest of the item are never clobbered. If both
-sides changed the same bwss field, bwss's write wins, except:
+When the server rejects a write as out of date (spec §6.5), bwss refetches
+the item and re-applies **its own changes** (never a stale whole body) to
+the fresh copy, then retries. Edits made elsewhere to parts bwss is not
+changing are never clobbered. Then:
 
+- if the **value source** changed on the server since bwss read it, bwss
+  does not overwrite it: the write fails with an error to the app, and the
+  next refresh shows the server's value. *(builder's call, revisable:
+  Secret Service has no conflict UI, so failing is the only policy offered;
+  the spec also allows a user-chosen policy.)*
 - `bwss:acl` merges as the union of lines, so an "Always allow" given on
   another device survives;
+- other bwss fields changed on both sides take bwss's value;
 - the retry is abandoned, with an error to the app, when the fresh copy is
   trashed or deleted, no longer carries the same `bwss:id`, or now has
   notes where bwss meant to put an oversize secret. bwss never re-marks an
   item the user unmarked.
-
-*(builder's call, revisable: a three-way merge with a conflict prompt, as
-the Obsidian plugin does, is possible later.)*
 
 ## 6. Access control
 
@@ -272,7 +321,7 @@ the Obsidian plugin does, is possible later.)*
 
 ## 7. Unlocking, locking and the locked index
 
-Unchanged from `main`:
+Unchanged from `legacy`:
 
 - One Bitwarden master password unlocks everything, through pinentry (3
   attempts) on the first request or `bwss unlock`. Failed CLI unlocks are
@@ -323,14 +372,18 @@ MarkedItem {
   collection, label, attributes   // explicit bwss:attr:* + derived
   secret: Zeroizing<Vec<u8>>, content_type
   secret_source: Field | BwssNotes | NoteBody | LoginPassword
+  secret_mark                     // keyed fingerprint of the stored value
   acl: Vec<String>, created, modified
 }
 duplicates: Vec<(id, cipher_ids)>
 registry: BTreeMap<collection id, { label, created, deleted }>
 ```
 
-`secret_source` records where the secret was read from (§3.2), so a write
-knows which part it may replace. A per-cipher scan cache keyed by
+`secret_source` records the value source (§3.2), so a write knows which
+part it may replace. `secret_mark` is HMAC-SHA256 of the stored value under
+a key derived from the user key (HKDF, purpose `value-mark`), so a retry
+can tell whether the value source changed on the server (§5.6) without
+keeping a second copy of the value (spec §10). A per-cipher scan cache keyed by
 `(cipher_id, revision_date)` remembers "unmarked" for ciphers that have not
 changed, so a refresh only decrypts field names of changed ciphers.
 
@@ -347,7 +400,10 @@ Op =
   | Patch   { id, base_revision,
               set: [(field, value, hidden)],    // bwss fields to write
               remove: [field],                  // bwss fields to drop
-              notes: Keep | Set(v) | Clear }    // only for bwss's own notes
+              value: Keep                       // or write the value source:
+                   | Set { source, value, base_mark } // §5.2; base_mark
+                                                // detects a changed source
+                   | ClearBwssNotes }           // delete, bwss:location=notes
   | Delete  { id, base_revision }               // §5.4, decided on replay
   | Registry{ collection, entry }               // merged, §4
 ```
@@ -357,8 +413,11 @@ has no cipher id yet. The cipher id is looked up when the op runs.
 
 **Write queue** (`~/.local/state/bwss/queue.json`, mode 0600). The ordered
 list of ops not yet accepted by the server. Field names, field values,
-ids and labels are stored as EncStrings under the user key; only op kinds,
-cipher ids (already plain in the cache) and revision dates are plain. A
+ids, labels and values are stored as EncStrings under the user key; only
+op kinds, value-source kinds, marks, cipher ids (already plain in the
+cache) and revision dates are plain. The queue, the cache and the locked
+index are device state (spec §10): they are never synced or copied to
+another device. A
 queued op is applied to the cache right away, so reads on this device see
 it before the server does.
 
@@ -403,9 +462,11 @@ sequenceDiagram
 ```
 
 - Applying an op always means: take the current copy of the cipher (the
-  server's on retry or flush, the cache's when queuing), apply the op's
-  field changes and merges (`bwss:acl` union, registry union), run the
-  abort checks, and send the result.
+  server's on retry or flush, the cache's when queuing), run the abort
+  checks (including the `base_mark` check on the value source), apply the
+  op's field changes and merges (`bwss:acl` union, registry union), write
+  the value source with password history when it is the login password,
+  and send the result.
 - Once an op is queued, later ops for any item queue behind it, so order
   is kept across items. *(builder's call, revisable: ordering per item
   would let unrelated writes through sooner.)*
@@ -427,7 +488,8 @@ an unlock:
 3. `GET /sync`, replace the cache, re-apply ops still queued.
 4. Rescan, only changed ciphers (§8.1), and diff the marked set by `id`:
    - new id: `ItemCreated` (this includes an item the user just marked);
-   - id gone: `ItemDeleted` (unmarked, trashed or deleted elsewhere);
+   - id gone: `ItemDeleted` (unmarked, trashed or deleted elsewhere), but
+     not for an item that became uninspectable (§3.4);
    - same id, new revision: `ItemChanged`;
    - collections appearing or disappearing: `CollectionCreated` /
      `CollectionDeleted`.
@@ -447,11 +509,16 @@ No sync happens while locked: the user key and the API token are gone.
   does not merge them; `bwss status` lists items with identical collection
   and `bwss:attr:*` sets.
 - Concurrent edits of the same item merge field by field (§5.6); the
-  registry and `bwss:acl` merge as unions.
+  registry and `bwss:acl` merge as unions; a value source changed on both
+  sides fails the app's write rather than overwriting.
+- bwss keeps no local copy of values beyond the encrypted cache, so the
+  spec's guard against a sync clearing many local secrets at once
+  (spec §10) has nothing to protect here: an item leaving the keyring is
+  still in Bitwarden.
 
 ## 9. Sessions, prompts and the bus
 
-Unchanged from `main`: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`
+Unchanged from `legacy`: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`
 sessions owned by the opening bus name (at most 4,096); pinentry over
 Assuan with 120 s timeouts; `Prompt.Completed` carries a result of the
 success type even when dismissed; `org.freedesktop.secrets` requested with
@@ -491,7 +558,7 @@ bwss login --email E [--server URL] --client-id ID [--client-secret-stdin]
 | Unmarked items | Only field names are decrypted; nothing reaches the bus, the index or logs |
 | Marked items' metadata | On the bus while unlocked, by the user's choice (marking) |
 | Secrets | ACL plus fail-closed confirmation; DH-AES sessions on the bus |
-| User data in marked items | Writes touch bwss fields only; trash only when no foreign content is left |
+| User data in marked items | Writes touch bwss fields and the value source only; a new secret never goes into the user's password or notes; trash only when no foreign content (other tools' fields included) is left |
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 file, https only except loopback, redirects disabled |
 | Disk | Bitwarden ciphertext only (cache, queue); hashed locked index |
@@ -502,32 +569,46 @@ Notes:
 - The marker is ciphertext under the user key, so the server can not mark
   a personal item on its own. (For organization items it could, through
   any member with write access; see §12.)
+- bwss holds the security invariants of spec §11 as written there.
 - `bwss:acl` comes from the item. Anyone who can edit the item in
   Bitwarden can grant an executable access; for personal items that is the
   user.
 
 ## 12. Later: organization items
 
-Left out of the first version, but the design should not block it:
+Left out of the first version. When they arrive, bwss adopts spec §9 as
+written; in bwss's terms:
 
 - Organization keys are RSA-OAEP encrypted to the user's public key; the
   private key is in `profile.privateKey`, encrypted with the user key. Use
   an RSA implementation without RUSTSEC-2023-0071 (for example
   `aws-lc-rs`), not the `rsa` crate.
-- Opt-in per organization in the config, because any member with write
-  access to a shared item could mark it, set its `bwss:acl`, or change its
-  `bwss:password`. For organization items, `bwss:acl` should not grant
-  access without a local confirmation.
+- Opt-in in the config, per organization later.
+- A personal item always wins over an organization item with the same id
+  (§3.3).
+- **Claims**: an organization item claiming a `bwss:id` the device already
+  knows (a base entry or a keyring item with that id, even with the same
+  value) is shown to apps only after the user confirms it through
+  pinentry. Only an id new to the device is taken without asking. This
+  needs a device-local base (cipher id, revision, value mark per id),
+  never synced.
+- bwss never writes an app's value into an organization item unless the
+  base already binds the id to that cipher. Declining a claim keeps the
+  local value as a new personal item (§5.1), which then wins.
+- Items with `edit: false` are read-only to apps; items with
+  `viewPassword: false` are skipped.
+- `bwss:acl` on an organization item grants nothing without a local
+  confirmation.
 
 ## 13. Architecture
 
-The module split of `main` is kept. The builder may port code from `main`
+The module split of `legacy` is kept. The builder may port code from `legacy`
 (crypto, API client, sessions, pinentry, ACL identity, D-Bus objects,
 config, fsutil), since none of those change in substance.
 
-| Module | Change from `main` |
+| Module | Change from `legacy` |
 |---|---|
-| `bw/crypto.rs` | Unchanged |
+| `bw/crypto.rs` | Adds the `value-mark` key derivation |
 | `bw/api.rs` | Adds `GET /ciphers/{id}` and `GET /accounts/revision-date`; folder writes are only needed for the keyring folder |
 | `bw/items.rs` | Rewritten: marker scan (field names only), the read and write rules of §3 and §5, foreign-content check, field-level re-apply on conflict |
 | `backend/bitwarden.rs` | Snapshot built from marked items and the collection registry; no sub-folders, no `whole_vault`, no `vault-acl` |
@@ -535,49 +616,62 @@ config, fsutil), since none of those change in substance.
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `keyring.rs`, `session.rs`, `prompter.rs`, `acl.rs`, `config.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault` |
 
-## 14. Compatibility with `main`
+## 14. Compatibility with `legacy`
 
 None, by decision. There is no migration and no special case for items or
-files that `main` wrote:
+files that the folder-based bwss (branch `legacy`) wrote:
 
-- Items `main` created carry `bwss:id`, so they are simply marked items
+- Items `legacy` created carry `bwss:id`, so they are simply marked items
   under the rules above. Their secret is read from `login.password` or the
-  notes, which now count as foreign content: an app's next write goes to
-  `bwss:password` and leaves the old value in place, and a delete strips
-  the bwss fields and keeps the item. Users who want a clean start delete
-  those items, or their bwss fields, by hand.
-- Collections `main` built from sub-folders are not recognised; their
+  notes, and an app's next write goes back there (with password history
+  for a login). Their password or notes count as foreign content, so a
+  delete strips the bwss fields and keeps the item. Users who want a clean
+  start delete those items, or their bwss fields, by hand.
+- Collections `legacy` built from sub-folders are not recognised; their
   items show up in `login` until they get `bwss:collection`.
 - `whole_vault` is an unknown config key and stops the daemon at start.
 - The cache, queue and locked index keep their paths but carry
-  `"format": 2`. A file without it (left by `main`) is not read: the cache
-  and the index are rebuilt, and a queue is renamed `queue.json.main` with
-  a warning, never replayed. `vault-acl` is not read.
+  `"format": 2`. A file without it (left by `legacy`) is not read: the
+  cache and the index are rebuilt, and a queue is renamed
+  `queue.json.legacy` with a warning, never replayed. `vault-acl` is not
+  read.
 
 ## 15. Verification
 
 - **Unit tests** for each rule here, in particular:
-  - reading precedence (label, secret), derived attributes;
+  - reading precedence (label, secret), including a present but empty
+    `bwss:password` and a duplicated field (the first counts), derived
+    attributes;
   - unmarked items: only field names decrypted (assert that decrypting the
     name, notes or login of an unmarked cipher never happens, for example
     with a counting key in tests);
   - path escape is reversible and collision-free;
   - duplicate ids resolved the same way regardless of order;
-  - writes leave foreign content and history untouched; size fallback to
-    notes and its refusal when the notes hold user text;
-  - delete: trash versus strip, for each kind of foreign content;
-  - conflict re-apply keeps a concurrent foreign edit;
+  - write-back to each value source: `bwss:password`, bwss's notes, a
+    note's text, the login password with history (at most 5) and
+    `passwordRevisionDate`; everything else, `obsidian:*` and `dybw:*`
+    fields included, untouched; a new item never uses the notes; size
+    fallback to notes and its refusal when the notes hold user text;
+  - delete: trash versus strip, for each kind of foreign content,
+    including another namespace's marker;
+  - conflict re-apply keeps a concurrent foreign edit, and fails when the
+    value source changed;
+  - an uninspectable item is not reported deleted;
   - the collection registry round trip.
 - **End-to-end** (pytest under `dbus-run-session`, against Vaultwarden,
   checked by the independent Python client in `tests/e2e/bwclient.py`):
   - an item marked by the other client appears after `bwss sync`, findable
-    by `bwss:name`, and an app write lands in `bwss:password` while the
-    login password stays;
+    by `bwss:name`; an app write on that login updates its password, with
+    the old one in the history, and the other client sees it;
+  - a login with a `bwss:password` field: the app write lands in the
+    field and the login password stays;
+  - an item carrying both `bwss:id` and `obsidian:id` is not trashed by a
+    delete;
   - deleting a hand-marked login strips bwss fields and keeps the item;
     deleting an item bwss created trashes it;
   - unmarking in the other client removes it from the keyring;
   - a cloned item does not change which item apps see;
-  - all existing scenarios from `main` (unlock, ACL, offline queue,
+  - all existing scenarios from `legacy` (unlock, ACL, offline queue,
     locked index, collections, sessions).
 - `cargo fmt --check`, `cargo clippy --locked --all-targets`,
   `cargo test --locked`, the ignored perf test, and `cargo audit`.
@@ -586,4 +680,4 @@ files that `main` wrote:
 
 - Internal structure inside each module, error types, log wording.
 - Exact layout of `bwss status` output.
-- Whether to port code from `main` or rewrite it, module by module.
+- Whether to port code from `legacy` or rewrite it, module by module.
