@@ -294,8 +294,9 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 228 pass, 1 ignored (perf) |
-| End-to-end against Vaultwarden 1.37.4 | 55 pass (17 Bitwarden, 19 Secret Service, 8 bus names, 11 config) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 400 pass, 1 ignored (perf) |
+| End-to-end against Vaultwarden 1.37.4 | 93 pass |
+| Line coverage of `src/` (unit + end-to-end, `scripts/coverage.sh`) | coverage 100% lines (unit + e2e) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
 **Not tested yet**: bitwarden.com itself (all server tests used
@@ -329,23 +330,34 @@ docker run -d --rm --name bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false 
 docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
 
-# Line coverage of src/, unit and end-to-end tests combined (instrumented
-# debug build; the report lists the uncovered lines of every file and the
-# lcov data lands in target/lcov.info). COVERAGE_MIN defaults to 100; pass
-# -e COVERAGE_MIN=0 to only measure. Needs a fresh Vaultwarden as above.
+# Line coverage of src/, unit and end-to-end tests combined, gated at 100%
+# (COVERAGE_MIN, default 100; pass -e COVERAGE_MIN=0 to only measure). It
+# builds an instrumented debug build and prints the uncovered lines of every
+# file. src/perf.rs and src/backend/tests.rs are the only exclusions, by the
+# regex (^|/)src/(perf|backend/tests)\.rs$ in scripts/coverage.sh.
+# Recreate the Vaultwarden container for every run: a third run on one
+# container hits HTTP 429.
+docker rm -f bw-it
+docker run -d --rm --name bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false \
+  -e DISABLE_ICON_DOWNLOAD=true -e LOGIN_RATELIMIT_MAX_BURST=1000 \
+  -e LOGIN_RATELIMIT_SECONDS=1 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+  vaultwarden/server:1.37.4
 docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   -v "$PWD":/src -v bwss-target:/target bwss-e2e scripts/coverage.sh
+# The lcov data is /target/lcov.info in the bwss-target volume, and is copied
+# to target/lcov.info when /src is writable (it is in CI, which uploads it).
 ```
 
 CI runs the same checks on both forges:
 
 - **GitHub** (`.github/workflows/`): fmt and clippy, unit tests on x86_64,
-  aarch64 and macOS, `cargo audit`, and the end-to-end suite against a
-  Vaultwarden service container. It also builds static musl binaries for
+  aarch64 and macOS, `cargo audit`, an MSRV check (`rust-version`), the
+  end-to-end suite against a Vaultwarden service container, and the 100%
+  line-coverage gate, which uploads `lcov.info`. It also builds static musl binaries for
   x86_64 and aarch64. Pushing a `v*` tag creates a release with those
   binaries and their checksums. Actions are pinned to commit SHAs, and the
   release path uses no caches.
-- **GitLab** (`.gitlab-ci.yml`): the same jobs. Releases are published to
+- **GitLab** (`.gitlab-ci.yml`): the same jobs, except the MSRV check. Releases are published to
   the Generic Package Registry and linked from the release. aarch64 builds
   need an arm64 runner (`ARM64_RUNNER_TAG`, which defaults to GitLab.com's
   `saas-linux-small-arm64`).
