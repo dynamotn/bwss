@@ -31,9 +31,14 @@ pub enum PromptError {
 const ERR_CANCELED: &str = "83886179";
 const ERR_NOT_CONFIRMED: &str = "83886194";
 
+/// The error code of an `ERR` reply: its first word, compared whole.
+fn err_code(err: &str) -> &str {
+    err.split_whitespace().next().unwrap_or_default()
+}
+
 /// Whether an `ERR` reply is the user's own "no": cancel or not confirmed.
 fn is_users_no(err: &str) -> bool {
-    err.starts_with(ERR_CANCELED) || err.starts_with(ERR_NOT_CONFIRMED)
+    matches!(err_code(err), ERR_CANCELED | ERR_NOT_CONFIRMED)
 }
 
 #[derive(Clone)]
@@ -166,7 +171,7 @@ impl Prompter {
             c.finish().await;
             match reply {
                 Reply::Ok(pin) => Ok(Some(pin.unwrap_or_default())),
-                Reply::Err(e) if e.starts_with(ERR_CANCELED) => Ok(None),
+                Reply::Err(e) if err_code(&e) == ERR_CANCELED => Ok(None),
                 Reply::Err(e) => Err(PromptError::Protocol(format!("GETPIN: {e}"))),
             }
         })
@@ -229,5 +234,8 @@ mod tests {
         assert!(is_users_no("83886194 Not confirmed"));
         assert!(!is_users_no("83918950 Inappropriate ioctl for device"));
         assert!(!is_users_no("garbage"));
+        assert!(!is_users_no("838861790 longer code"), "the whole code, not a prefix");
+        assert!(!is_users_no("838861940"));
+        assert!(is_users_no("83886179"));
     }
 }

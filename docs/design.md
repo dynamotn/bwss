@@ -348,7 +348,12 @@ changing are never clobbered. Then:
   `-w -W -X -T -t`; ruby `-w`; sh, bash, zsh, dash `-e -u -x -v`; none for
   node, nodejs, fish, lua and php. A flag plain in one interpreter takes a
   value in another (`ruby -I dir`, `lua -l mod`), so the lists are per
-  family; any other option means no script. `deno`, `bun`, `busybox` and
+  family. Every argument before the script must be on that list, or a
+  `--` where it means "the script follows" (python, perl, ruby, the
+  shells, node; not php, where `php --` reads stdin, nor fish or lua).
+  Any other argument before it, any argument starting with `+` (`bash +e`,
+  `+O name`), or a script name starting with `+` (or with `-`, unless
+  after `--`), means no script. `deno`, `bun`, `busybox` and
   `java` (subcommands, applets, `-jar`) never get a script identity. The
   script is resolved against `/proc/<pid>/cwd`, canonicalized, and must be
   an existing regular file. The identity, and
@@ -363,8 +368,8 @@ changing are never clobbered. Then:
   (`PYTHONPATH` or a `sitecustomize`, `PERL5OPT`, `RUBYOPT`,
   `NODE_OPTIONS`, `BASH_ENV`). A process that rewrites its title, or
   `chdir`s after starting a script given by a relative path, no longer
-  resolves to its script and becomes an unknown application, asked
-  every time.
+  resolves to a script file and falls back to the bare interpreter, asked
+  every time (Allow / Deny only).
 - An identity holding a control character (a newline in a path could
   plant a second `bwss:acl` line) is an unknown application.
 - **Unknown applications and interpreters without a script file** (any

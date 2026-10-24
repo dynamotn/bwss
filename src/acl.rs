@@ -79,46 +79,63 @@ pub fn describe(caller: &str) -> String {
     }
 }
 
-/// The flags that take no value, and so keep the next argument the
-/// script, for the interpreter `base`; `None` when bwss does not identify
-/// its scripts at all (subcommands, applets, `-jar`). A flag that is plain
-/// in one interpreter takes a value in another (`ruby -I dir`, `lua -l mod`),
-/// so every family has its own short list.
-fn plain_flags(base: &str) -> Option<&'static [&'static str]> {
+/// How bwss reads an interpreter's command line.
+struct Family {
+    /// Flags that take no value, so the next argument may still be the script.
+    plain: &'static [&'static str],
+    /// Whether `--` ends the options and the next argument is the script.
+    dash_dash: bool,
+}
+
+/// The [`Family`] of the interpreter `base`; `None` when bwss does not
+/// identify its scripts at all (subcommands, applets, `-jar`). A flag that is
+/// plain in one interpreter takes a value in another (`ruby -I dir`,
+/// `lua -l mod`), so every family has its own short list. `--` is honoured
+/// only where it means "the script follows" (`php --` reads stdin).
+fn family(base: &str) -> Option<Family> {
     const PYTHON: &[&str] = &["-u", "-B", "-I", "-O", "-OO", "-q", "-s", "-S", "-E"];
     const PERL: &[&str] = &["-w", "-W", "-X", "-T", "-t"];
     const RUBY: &[&str] = &["-w"];
     const SHELL: &[&str] = &["-e", "-u", "-x", "-v"];
     const NONE: &[&str] = &[];
-    match base {
-        "sh" | "bash" | "zsh" | "dash" => Some(SHELL),
-        "node" | "nodejs" | "fish" => Some(NONE),
-        "deno" | "bun" | "busybox" | "java" => None,
-        b if b.starts_with("python") => Some(PYTHON),
-        b if b.starts_with("perl") => Some(PERL),
-        b if b.starts_with("ruby") => Some(RUBY),
-        b if b.starts_with("lua") || b.starts_with("php") => Some(NONE),
-        _ => None,
-    }
+    let (plain, dash_dash) = match base {
+        "sh" | "bash" | "zsh" | "dash" => (SHELL, true),
+        "node" | "nodejs" => (NONE, true),
+        "fish" => (NONE, false),
+        "deno" | "bun" | "busybox" | "java" => return None,
+        b if b.starts_with("python") => (PYTHON, true),
+        b if b.starts_with("perl") => (PERL, true),
+        b if b.starts_with("ruby") => (RUBY, true),
+        b if b.starts_with("lua") || b.starts_with("php") => (NONE, false),
+        _ => return None,
+    };
+    Some(Family { plain, dash_dash })
 }
 
-/// The script argument of `interpreter`'s command line (`/proc/<pid>/cmdline`):
-/// the first argument after the interpreter that is not an option, after
-/// `--`, or after flags from that interpreter's [`plain_flags`] only. Any
-/// other option (`-c`, `-m`, `-e`, `-s`, `-`, one with a value) means there
-/// is no script file.
+/// The script argument of `interpreter`'s command line (`/proc/<pid>/cmdline`).
+/// Every argument before it must be a value-less flag of that interpreter's
+/// [`Family`], or a `--` the family honours. Anything else before it (`-c`,
+/// `-m`, `-e`, `-s`, `-`, `+e`, an option with a value, an unknown flag), or
+/// a candidate that starts with `+` (or with `-`, unless after `--`), means
+/// there is no script file.
 pub fn script_argument(interpreter: &str, cmdline: &[u8]) -> Option<String> {
-    let flags = plain_flags(interpreter.rsplit('/').next().unwrap_or_default())?;
+    let family = family(interpreter.rsplit('/').next().unwrap_or_default())?;
     let raw = cmdline.strip_suffix(b"\0").unwrap_or(cmdline);
     let mut args = raw.split(|&b| b == 0).skip(1);
     let script = loop {
         let arg = std::str::from_utf8(args.next()?).ok()?;
-        match arg {
-            "--" => break std::str::from_utf8(args.next()?).ok()?,
-            a if a.starts_with('-') && flags.contains(&a) => continue,
-            a if a.starts_with('-') => return None,
-            a => break a,
+        if family.plain.contains(&arg) {
+            continue;
         }
+        if arg == "--" && family.dash_dash {
+            let next = std::str::from_utf8(args.next()?).ok()?;
+            // Even after `--`, a `+` name is an option to some shells.
+            break if next.starts_with('+') { return None } else { next };
+        }
+        if arg.starts_with(['-', '+']) {
+            return None;
+        }
+        break arg;
     };
     (!script.is_empty()).then(|| script.to_owned())
 }
@@ -426,6 +443,23 @@ mod tests {
         assert_eq!(arg("/bin/busybox", b"busybox\0sh\0x.sh\0"), None);
         assert_eq!(arg("/usr/lib/jvm/bin/java", b"java\0-jar\0x.jar\0"), None);
         assert_eq!(arg("/usr/bin/git", b"git\0x\0"), None, "not an interpreter");
+    }
+
+    #[test]
+    fn plus_options_and_unknown_arguments_mean_no_script() {
+        let arg = script_argument;
+        // `ln -s trusted.sh ./+e; bash +e evil.sh` must not pass for trusted.sh.
+        assert_eq!(arg("/usr/bin/bash", b"bash\0+e\0evil.sh\0"), None);
+        assert_eq!(arg("/usr/bin/bash", b"bash\0+O\0extglob\0evil.sh\0"), None);
+        assert_eq!(arg("/usr/bin/zsh", b"zsh\0+e\0evil.sh\0"), None);
+        assert_eq!(arg("/bin/dash", b"dash\0+e\0evil.sh\0"), None);
+        assert_eq!(arg("/usr/bin/python3", b"python3\0+x\0"), None, "a script name starting with +");
+        // `--` means "script follows" only where that is so.
+        assert_eq!(arg("/usr/bin/php8.2", b"php\0--\0/home/u/trusted.php\0"), None, "php -- reads stdin");
+        assert_eq!(arg("/usr/bin/php8.2", b"php\0tool.php\0"), Some("tool.php".into()));
+        assert_eq!(arg("/usr/bin/bash", b"bash\0--\0job.sh\0"), Some("job.sh".into()));
+        assert_eq!(arg("/usr/bin/fish", b"fish\0--\0job.fish\0"), None);
+        assert_eq!(arg("/usr/bin/lua5.4", b"lua\0--\0s.lua\0"), None);
     }
 
     #[test]
