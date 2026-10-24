@@ -78,8 +78,9 @@ keychain-bitwarden.
 **Coming from the old folder-based bwss?** There is no migration: start over.
 Items it created carry `bwss:id`, so they show up as marked items, but its
 folder-based collections are not recognised, and an old config with a key
-this version no longer has stops the daemon at start (remove that key). The old cache and locked index are rebuilt, and an old
-offline queue is renamed `queue.json.legacy` and never replayed, so flush
+this version no longer has stops the daemon at start (remove that key).
+The old cache and locked index are rebuilt, and an
+old offline queue is renamed `queue.json.legacy` and never replayed, so flush
 offline writes before upgrading. See
 [`docs/design.md`](docs/design.md) section 14.
 
