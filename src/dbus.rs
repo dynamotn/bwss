@@ -8,8 +8,8 @@ use zeroize::Zeroizing;
 
 use crate::acl::caller_executable;
 use crate::daemon::{
-    Daemon, NewItem, OpenSession, PROMPTS_PER_OWNER, SERVICE_PATH, SESSIONS_PER_OWNER, SESSIONS_TOTAL, SResult,
-    SecretError, WireSecret, collection_path, item_path, no_prompt, oldest_to_evict, op, parse_path,
+    Daemon, NewItem, OpenSession, PROMPTS_PER_OWNER, PromptEntry, PromptSlot, SERVICE_PATH, SResult, SecretError,
+    WireSecret, collection_path, item_path, no_prompt, op, parse_path, prompt_slot,
 };
 use crate::model::{Attributes, LOGIN_COLLECTION, SESSION_COLLECTION};
 use crate::session::Session;
@@ -74,22 +74,15 @@ impl ServiceObj {
         let seq = self.daemon.next_id();
         let path = format!("{SERVICE_PATH}/session/s{seq}");
         let owner = sender(&header).unwrap_or_default();
-        let evicted = {
-            let mut sessions = self.daemon.sessions.lock().unwrap();
-            let mine = sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, s)| (s.seq, p));
-            // A client that never closes its sessions only loses its own oldest.
-            let evicted = oldest_to_evict(mine.clone().map(|(seq, _)| seq), SESSIONS_PER_OWNER)
-                .and_then(|oldest| mine.clone().find(|(seq, _)| *seq == oldest).map(|(_, p)| p.clone()));
-            if let Some(p) = &evicted {
-                sessions.remove(p);
-            }
-            if sessions.len() >= SESSIONS_TOTAL {
-                return Err(SecretError::Failed("too many open sessions".into()));
-            }
-            sessions.insert(path.clone(), Arc::new(OpenSession { seq, owner, session }));
-            evicted
-        };
-        if let Some(p) = evicted {
+        let open = Arc::new(OpenSession { seq, owner, session });
+        let (mut dropped, admitted) = self.daemon.admit_session(open.clone(), &path, false);
+        if !admitted {
+            // Full: free what departed clients left behind before pushing
+            // out a live one.
+            self.daemon.reap_departed().await;
+            dropped.extend(self.daemon.admit_session(open, &path, true).0);
+        }
+        for p in dropped {
             let _ = self.daemon.conn().object_server().remove::<SessionObj, _>(p.as_str()).await;
         }
         self.daemon
@@ -501,50 +494,54 @@ impl PromptObj {
         let owner = owner.unwrap_or_default();
         let seq = daemon.next_id();
         let path = format!("{SERVICE_PATH}/prompt/p{seq}");
-        // A client holds a bounded number of prompts; it loses its own oldest.
+        // The slot is reserved in the same locked section that checks the cap,
+        // so concurrent registrations cannot exceed it. A client that is over
+        // the cap loses its oldest prompt that has not started.
         let victim = {
             let mut prompts = daemon.prompts.lock().unwrap();
-            let mine = prompts.iter().filter(|(_, _, o)| *o == owner).map(|(s, _, _)| *s);
-            oldest_to_evict(mine, PROMPTS_PER_OWNER).and_then(|oldest| {
-                let at = prompts.iter().position(|(s, _, _)| *s == oldest)?;
-                Some(prompts.remove(at))
-            })
+            let held = prompts.iter().filter(|p| p.owner == owner).map(|p| (p.seq, p.started));
+            let victim = match prompt_slot(held, PROMPTS_PER_OWNER) {
+                PromptSlot::Free => None,
+                PromptSlot::Evict(oldest) => {
+                    let at = prompts.iter().position(|p| p.seq == oldest);
+                    at.map(|at| prompts.remove(at))
+                }
+                PromptSlot::Full => return Err(SecretError::Failed("too many outstanding prompts".into())),
+            };
+            prompts.push(PromptEntry { seq, path: path.clone(), owner, started: false });
+            victim
         };
-        if let Some(entry) = victim
-            && !PromptObj::dismiss_pending(daemon, &entry.1).await
-        {
-            // The oldest one is already running: it still counts.
-            daemon.prompts.lock().unwrap().push(entry);
-            return Err(SecretError::Failed("too many outstanding prompts".into()));
+        if let Some(entry) = victim {
+            PromptObj::dismiss_pending(daemon, &entry.path).await;
         }
         let obj = PromptObj { daemon: daemon.clone(), path: path.clone(), action: std::sync::Mutex::new(Some(action)) };
-        daemon.conn().object_server().at(path.as_str(), obj).await.map_err(SecretError::ZBus)?;
-        daemon.prompts.lock().unwrap().push((seq, path.clone(), owner));
+        if let Err(e) = daemon.conn().object_server().at(path.as_str(), obj).await {
+            daemon.prompts.lock().unwrap().retain(|p| p.seq != seq);
+            return Err(SecretError::ZBus(e));
+        }
         Ok(op(&path))
     }
 
-    /// Dismisses a prompt that has not started yet, dropping (and so zeroizing)
-    /// what it holds. False when it is already running.
-    async fn dismiss_pending(daemon: &Arc<Daemon>, path: &str) -> bool {
-        let action = match daemon.conn().object_server().interface::<_, PromptObj>(path).await {
+    /// Dismisses an evicted prompt, dropping (and so zeroizing) what it holds.
+    async fn dismiss_pending(daemon: &Arc<Daemon>, path: &str) {
+        let dismissed = match daemon.conn().object_server().interface::<_, PromptObj>(path).await {
             Ok(iface) => {
                 let obj = iface.get().await;
                 let taken = obj.action.lock().unwrap().take();
-                match taken {
-                    Some(a) => Some(a.dismissed_result()),
-                    None => return false,
-                }
+                taken.map(|a| a.dismissed_result())
             }
-            Err(_) => None,
+            // The object is not registered yet (a concurrent register is still
+            // adding it) or already gone: nothing is held, so report the plain
+            // dismissed result.
+            Err(_) => Some(PromptAction::CreateCollection { label: String::new() }.dismissed_result()),
         };
-        let result =
-            action.unwrap_or_else(|| PromptAction::CreateCollection { label: String::new() }.dismissed_result());
-        PromptObj::finish(daemon.clone(), path.to_owned(), true, result).await;
-        true
+        if let Some(result) = dismissed {
+            PromptObj::finish(daemon.clone(), path.to_owned(), true, result).await;
+        }
     }
 
     async fn finish(daemon: Arc<Daemon>, path: String, dismissed: bool, result: OwnedVariant) {
-        daemon.prompts.lock().unwrap().retain(|(_, p, _)| *p != path);
+        daemon.prompts.lock().unwrap().retain(|p| p.path != path);
         if let Ok(e) = SignalEmitter::new(daemon.conn(), path.clone()) {
             let _ = PromptObj::completed(&e, dismissed, result).await;
         }
@@ -555,6 +552,14 @@ impl PromptObj {
 #[interface(name = "org.freedesktop.Secret.Prompt")]
 impl PromptObj {
     async fn prompt(&self, _window_id: &str) -> Result<(), SecretError> {
+        {
+            let mut prompts = self.daemon.prompts.lock().unwrap();
+            // An evicted prompt is no longer tracked and cannot start.
+            let Some(entry) = prompts.iter_mut().find(|p| p.path == self.path) else {
+                return Err(SecretError::Failed("the prompt was dismissed".into()));
+            };
+            entry.started = true;
+        }
         let Some(action) = self.action.lock().unwrap().take() else {
             return Err(SecretError::Failed("the prompt was already used".into()));
         };
@@ -647,5 +652,24 @@ pub async fn serve(daemon: &Arc<Daemon>) -> zbus::Result<()> {
     let server = daemon.conn().object_server();
     server.at(SERVICE_PATH, ServiceObj { daemon: daemon.clone() }).await?;
     server.at(CONTROL_PATH, ControlObj { daemon: daemon.clone() }).await?;
+    watch_departures(daemon).await?;
     daemon.sync_objects().await
+}
+
+/// Frees the sessions and prompts of a client when it leaves the bus.
+async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
+    use zbus::export::futures_core::Stream;
+    let bus = zbus::fdo::DBusProxy::new(daemon.conn()).await?;
+    let stream = bus.receive_name_owner_changed().await?;
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        let mut stream = std::pin::pin!(stream);
+        while let Some(signal) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+            let Ok(args) = signal.args() else { continue };
+            if args.new_owner().is_none() && args.name().as_str().starts_with(':') {
+                daemon.drop_owner(args.name().as_str()).await;
+            }
+        }
+    });
+    Ok(())
 }

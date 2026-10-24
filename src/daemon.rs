@@ -109,6 +109,8 @@ pub struct NewItem {
 pub const SESSIONS_PER_OWNER: usize = 64;
 /// Most sessions held by all clients together. A new one is refused beyond it.
 pub const SESSIONS_TOTAL: usize = 4096;
+/// How long a failed remote password attempt delays the next one.
+pub const FAILED_UNLOCK_DELAY: Duration = Duration::from_secs(2);
 /// Most outstanding prompt objects one bus client may hold.
 pub const PROMPTS_PER_OWNER: usize = 16;
 
@@ -124,6 +126,48 @@ pub fn oldest_to_evict(seqs: impl IntoIterator<Item = u64>, cap: usize) -> Optio
     if count >= cap { oldest } else { None }
 }
 
+/// What registering one more prompt for a client has to do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptSlot {
+    Free,
+    /// Dismiss the prompt with this sequence number first.
+    Evict(u64),
+    /// Every prompt of the client is already running: refuse the new one.
+    Full,
+}
+
+/// Decides about a new prompt for a client holding `held` prompts, each as
+/// (sequence number, already running). Only a prompt that has not started
+/// may be dismissed, the oldest of those first.
+pub fn prompt_slot(held: impl IntoIterator<Item = (u64, bool)>, cap: usize) -> PromptSlot {
+    let held: Vec<_> = held.into_iter().collect();
+    if held.len() < cap {
+        return PromptSlot::Free;
+    }
+    match oldest_to_evict(held.iter().filter(|(_, running)| !running).map(|(seq, _)| *seq), 1) {
+        Some(seq) => PromptSlot::Evict(seq),
+        None => PromptSlot::Full,
+    }
+}
+
+/// The client holding the most of the given sessions (ties: the lowest name).
+pub fn fattest_owner<'a>(owners: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for o in owners {
+        *counts.entry(o).or_default() += 1;
+    }
+    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0))).map(|(o, _)| o)
+}
+
+/// An outstanding prompt object.
+pub struct PromptEntry {
+    pub seq: u64,
+    pub path: String,
+    pub owner: String,
+    /// `Prompt` was called: the action is running and cannot be dismissed.
+    pub started: bool,
+}
+
 pub struct OpenSession {
     pub seq: u64,
     pub owner: String,
@@ -137,13 +181,15 @@ pub struct Daemon {
     pub config: Config,
     conn: OnceLock<Connection>,
     pub sessions: std::sync::Mutex<HashMap<String, Arc<OpenSession>>>,
-    /// Outstanding prompt objects as (sequence, path, owner).
-    pub prompts: std::sync::Mutex<Vec<(u64, String, String)>>,
+    /// Outstanding prompt objects.
+    pub prompts: std::sync::Mutex<Vec<PromptEntry>>,
     registered: Mutex<BTreeSet<String>>,
     counter: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
     /// Only one interactive unlock (and one access prompt) at a time.
     unlock_gate: Mutex<()>,
+    /// Serializes remote password attempts and spaces out the failed ones.
+    failure_gate: Mutex<()>,
     confirm_gate: Mutex<()>,
 }
 
@@ -161,6 +207,7 @@ impl Daemon {
             counter: AtomicU64::new(1),
             last_activity: std::sync::Mutex::new(Instant::now()),
             unlock_gate: Mutex::new(()),
+            failure_gate: Mutex::new(()),
             confirm_gate: Mutex::new(()),
         })
     }
@@ -280,15 +327,92 @@ impl Daemon {
         Ok(())
     }
 
-    /// Like `unlock_with_password` for remote callers: a failure holds the
-    /// unlock gate for a while, so that parallel guesses queue up behind it.
+    /// Like `unlock_with_password` for remote callers: password attempts take
+    /// turns and a failed one makes the next wait 2 s. This is a speed bump
+    /// against processes of the same user, and it does not hold `unlock_gate`,
+    /// so the interactive unlock is never queued behind it.
     pub async fn unlock_with_password_throttled(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
-        let _gate = self.unlock_gate.lock().await;
+        let _turn = self.failure_gate.lock().await;
         let result = self.unlock_with_password(password).await;
         if result.is_err() {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(FAILED_UNLOCK_DELAY).await;
         }
         result
+    }
+
+    /// Adds a session, first making room under the per-client cap. At the
+    /// global cap it refuses (`None`) unless `force`, which then takes the
+    /// oldest session of the client holding the most. Returns the paths of the
+    /// sessions that were dropped.
+    pub fn admit_session(&self, open: Arc<OpenSession>, path: &str, force: bool) -> (Vec<String>, bool) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut dropped = Vec::new();
+        let mut drop_oldest_of = |sessions: &mut HashMap<String, Arc<OpenSession>>, owner: &str, cap: usize| {
+            let mine = sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, s)| (s.seq, p.clone()));
+            if let Some(oldest) = oldest_to_evict(mine.clone().map(|(seq, _)| seq), cap)
+                && let Some((_, p)) = mine.clone().find(|(seq, _)| *seq == oldest)
+            {
+                sessions.remove(&p);
+                dropped.push(p);
+            }
+        };
+        drop_oldest_of(&mut sessions, &open.owner, SESSIONS_PER_OWNER);
+        if sessions.len() >= SESSIONS_TOTAL {
+            if !force {
+                return (dropped, false);
+            }
+            let fattest = fattest_owner(sessions.values().map(|s| s.owner.as_str())).map(str::to_owned);
+            if let Some(owner) = fattest {
+                drop_oldest_of(&mut sessions, &owner, 1);
+            }
+        }
+        sessions.insert(path.to_owned(), open);
+        (dropped, true)
+    }
+
+    /// Unique bus names that hold sessions or prompts.
+    pub fn known_owners(&self) -> BTreeSet<String> {
+        let sessions = self.sessions.lock().unwrap();
+        let prompts = self.prompts.lock().unwrap();
+        sessions.values().map(|s| s.owner.clone()).chain(prompts.iter().map(|p| p.owner.clone())).collect()
+    }
+
+    /// Frees everything a client held, once it left the bus. Prompts that
+    /// have not started drop their pending secret with their object.
+    pub async fn drop_owner(&self, owner: &str) {
+        let sessions: Vec<String> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let paths: Vec<String> =
+                sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, _)| p.clone()).collect();
+            for p in &paths {
+                sessions.remove(p);
+            }
+            paths
+        };
+        let prompts: Vec<String> = {
+            let mut prompts = self.prompts.lock().unwrap();
+            let paths = prompts.iter().filter(|p| p.owner == owner).map(|p| p.path.clone()).collect();
+            prompts.retain(|p| p.owner != owner);
+            paths
+        };
+        let server = self.conn().object_server();
+        for p in sessions {
+            let _ = server.remove::<crate::dbus::SessionObj, _>(p.as_str()).await;
+        }
+        for p in prompts {
+            let _ = server.remove::<crate::dbus::PromptObj, _>(p.as_str()).await;
+        }
+    }
+
+    /// Drops the sessions and prompts of every client no longer on the bus.
+    pub async fn reap_departed(&self) {
+        let Ok(bus) = zbus::fdo::DBusProxy::new(self.conn()).await else { return };
+        for owner in self.known_owners() {
+            let Ok(name) = zbus::names::BusName::try_from(owner.as_str()) else { continue };
+            if matches!(bus.name_has_owner(name).await, Ok(false)) {
+                self.drop_owner(&owner).await;
+            }
+        }
     }
 
     /// Asks for the master password; returns false when the user gave up.
@@ -568,16 +692,50 @@ mod path_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn eviction_policy_takes_the_oldest_only_at_the_cap() {
-        use super::oldest_to_evict;
         assert_eq!(oldest_to_evict([5, 3, 9], 4), None);
         assert_eq!(oldest_to_evict([5, 3, 9], 3), Some(3));
         assert_eq!(oldest_to_evict([], 1), None);
         assert_eq!(oldest_to_evict([7], 1), Some(7));
     }
 
-    use super::*;
+    #[test]
+    fn prompt_slot_dismisses_the_oldest_unstarted_prompt() {
+        assert_eq!(prompt_slot([(1, false), (2, false)], 3), PromptSlot::Free);
+        // The oldest is running, so the next oldest goes.
+        assert_eq!(prompt_slot([(1, true), (2, false), (3, false)], 3), PromptSlot::Evict(2));
+        assert_eq!(prompt_slot([(4, false), (2, false), (3, true)], 3), PromptSlot::Evict(2));
+        assert_eq!(prompt_slot([(1, true), (2, true)], 2), PromptSlot::Full);
+    }
+
+    #[test]
+    fn fattest_owner_is_the_one_with_most_sessions() {
+        assert_eq!(fattest_owner([":1.2", ":1.1", ":1.2", ":1.3"]), Some(":1.2"));
+        assert_eq!(fattest_owner([":1.2", ":1.1"]), Some(":1.1"));
+        assert_eq!(fattest_owner([]), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_password_attempts_take_turns_and_never_hold_the_unlock_gate() {
+        let (d, _backend) = gated_daemon(None).await;
+        let start = tokio::time::Instant::now();
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let d = d.clone();
+                tokio::spawn(async move { d.unlock_with_password_throttled("wrong").await.is_err() })
+            })
+            .collect();
+        // While the penalty runs, the interactive unlock path is not blocked.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(d.unlock_gate.try_lock().is_ok(), "remote attempts must not hold the interactive gate");
+        for a in attempts {
+            assert!(a.await.unwrap());
+        }
+        assert!(start.elapsed() >= 2 * FAILED_UNLOCK_DELAY);
+    }
 
     use crate::backend::memory::MemoryBackend;
     use crate::model::{CollectionData, Snapshot};
