@@ -29,6 +29,12 @@ pub enum PromptError {
 
 // libgpg-error codes as pinentry reports them (source 5 = pinentry).
 const ERR_CANCELED: &str = "83886179";
+const ERR_NOT_CONFIRMED: &str = "83886194";
+
+/// Whether an `ERR` reply is the user's own "no": cancel or not confirmed.
+fn is_users_no(err: &str) -> bool {
+    err.starts_with(ERR_CANCELED) || err.starts_with(ERR_NOT_CONFIRMED)
+}
 
 #[derive(Clone)]
 pub struct Prompter {
@@ -177,9 +183,17 @@ impl Prompter {
             c.set("SETDESC", description).await?;
             c.set("SETOK", "Allow").await?;
             c.set("SETCANCEL", "Deny").await?;
-            // Only an explicit OK grants anything: pinentries differ in how
-            // they report other buttons, so every other answer is a denial.
-            let allowed = matches!(c.command("CONFIRM").await?, Reply::Ok(_));
+            // Only an explicit OK grants anything. Cancel and "not confirmed"
+            // are the user's no; any other error means the question was never
+            // put (pinentry-curses without a terminal, ...) and is a failure.
+            let allowed = match c.command("CONFIRM").await? {
+                Reply::Ok(_) => true,
+                Reply::Err(e) if is_users_no(&e) => false,
+                Reply::Err(e) => {
+                    c.finish().await;
+                    return Err(PromptError::Protocol(format!("CONFIRM: {e}")));
+                }
+            };
             if !allowed || !offer_always {
                 c.finish().await;
                 return Ok(if allowed { Confirm::Once } else { Confirm::Deny });
@@ -207,5 +221,13 @@ mod tests {
         assert_eq!(&*unescape(&escape(s)), s);
         assert_eq!(&*unescape("pa%25ss%"), "pa%ss%");
         assert_eq!(&*unescape("%zz"), "%zz");
+    }
+
+    #[test]
+    fn only_cancel_and_not_confirmed_are_a_users_no() {
+        assert!(is_users_no("83886179 Operation cancelled"));
+        assert!(is_users_no("83886194 Not confirmed"));
+        assert!(!is_users_no("83918950 Inappropriate ioctl for device"));
+        assert!(!is_users_no("garbage"));
     }
 }

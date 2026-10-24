@@ -233,7 +233,9 @@ What bwss is **not**: a sandbox. Per-app control identifies apps by
 executable path (`/proc/<pid>/exe`), and scripts by the script path in
 their command line, pinned to the process behind each bus connection. Any
 process running as your user can still inspect other processes, rewrite
-its own command line, or fork and exec an allowed binary to pose as it.
+its own command line, slip code into an allowed script through the
+environment (`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`,
+`BASH_ENV`), or fork and exec an allowed binary to pose as it.
 It stops quiet cross-app reads, not a determined local attacker.
 
 ## 🧪 Status
@@ -243,7 +245,7 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control) | 159 pass, 1 ignored (perf) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control) | 163 pass, 1 ignored (perf) |
 | End-to-end against Vaultwarden 1.37.4 | 44 pass (17 Bitwarden, 19 Secret Service, 8 bus names) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 

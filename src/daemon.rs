@@ -1270,6 +1270,13 @@ mod tests {
             ))
         }
 
+        /// A pinentry that answers every CONFIRM with `reply`.
+        fn answering_confirm(reply: &str) -> Self {
+            Self::with_body(&format!(
+                "echo OK\nwhile IFS= read -r l; do\n  case \"$l\" in\n    CONFIRM*) echo '{reply}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n"
+            ))
+        }
+
         /// A pinentry running the shell `body`; `$0.log` is its log.
         fn with_body(body: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
@@ -1365,16 +1372,30 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let exits = ScriptedPinentry::with_body("exit 3\n");
         let hangs = ScriptedPinentry::with_body("echo OK\nsleep 30\n");
+        // pinentry-curses without a terminal: it starts, then cannot ask.
+        let no_tty = ScriptedPinentry::answering_confirm("ERR 83918950 Inappropriate ioctl for device");
         for prompter in [
             Prompter::new("/nonexistent/bwss-pinentry", Duration::from_secs(5)),
             exits.prompter(),
             hangs.prompter_with_timeout(Duration::from_millis(300)),
+            no_tty.prompter(),
         ] {
             let d = synced_daemon(&[GIT], prompter, state.path()).await;
             assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
             let mark = d.confirmed.lock().await.as_ref().map(|s| s.mark("x", GIT));
             assert_eq!(mark, Some(Mark::None), "only the user's own Deny is remembered");
         }
+    }
+
+    #[tokio::test]
+    async fn not_confirmed_is_a_users_deny() {
+        // GPG_ERR_NOT_CONFIRMED: the user pressed the "no" button.
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::answering_confirm("ERR 83886194 Not confirmed");
+        let d = synced_daemon(&[GIT], pin.prompter(), state.path()).await;
+        assert!(d.authorize(GIT, "x", "read").await.is_err());
+        let mark = d.confirmed.lock().await.as_ref().map(|s| s.mark("x", GIT));
+        assert_eq!(mark, Some(Mark::Denied));
     }
 
     #[tokio::test]

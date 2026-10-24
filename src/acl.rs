@@ -45,7 +45,8 @@ const INTERPRETER_PREFIXES: &[&str] = &["python", "perl", "ruby", "lua", "php"];
 
 /// Classifies a caller as `caller_executable` reported it.
 pub fn kind(caller: &str) -> CallerKind {
-    if !caller.starts_with('/') {
+    // ACL lines are joined by newlines: a control character could plant one.
+    if !caller.starts_with('/') || caller.chars().any(char::is_control) {
         return CallerKind::Unknown;
     }
     if let Some((interpreter, script)) = caller.split_once("//") {
@@ -78,21 +79,43 @@ pub fn describe(caller: &str) -> String {
     }
 }
 
-/// Flags that take no value and keep the next argument the script.
-const PLAIN_FLAGS: &[&str] = &["-u", "-B", "-I", "-O", "-OO", "-q", "-w", "-x", "-l"];
+/// The flags that take no value, and so keep the next argument the
+/// script, for the interpreter `base`; `None` when bwss does not identify
+/// its scripts at all (subcommands, applets, `-jar`). A flag that is plain
+/// in one interpreter takes a value in another (`ruby -I dir`, `lua -l mod`),
+/// so every family has its own short list.
+fn plain_flags(base: &str) -> Option<&'static [&'static str]> {
+    const PYTHON: &[&str] = &["-u", "-B", "-I", "-O", "-OO", "-q", "-s", "-S", "-E"];
+    const PERL: &[&str] = &["-w", "-W", "-X", "-T", "-t"];
+    const RUBY: &[&str] = &["-w"];
+    const SHELL: &[&str] = &["-e", "-u", "-x", "-v"];
+    const NONE: &[&str] = &[];
+    match base {
+        "sh" | "bash" | "zsh" | "dash" => Some(SHELL),
+        "node" | "nodejs" | "fish" => Some(NONE),
+        "deno" | "bun" | "busybox" | "java" => None,
+        b if b.starts_with("python") => Some(PYTHON),
+        b if b.starts_with("perl") => Some(PERL),
+        b if b.starts_with("ruby") => Some(RUBY),
+        b if b.starts_with("lua") || b.starts_with("php") => Some(NONE),
+        _ => None,
+    }
+}
 
-/// The script argument of an interpreter's command line (`/proc/<pid>/cmdline`):
+/// The script argument of `interpreter`'s command line (`/proc/<pid>/cmdline`):
 /// the first argument after the interpreter that is not an option, after
-/// `--`, or after flags from [`PLAIN_FLAGS`] only. Any other option (`-c`,
-/// `-m`, `-e`, `-s`, `-`, one with a value) means there is no script file.
-pub fn script_argument(cmdline: &[u8]) -> Option<String> {
+/// `--`, or after flags from that interpreter's [`plain_flags`] only. Any
+/// other option (`-c`, `-m`, `-e`, `-s`, `-`, one with a value) means there
+/// is no script file.
+pub fn script_argument(interpreter: &str, cmdline: &[u8]) -> Option<String> {
+    let flags = plain_flags(interpreter.rsplit('/').next().unwrap_or_default())?;
     let raw = cmdline.strip_suffix(b"\0").unwrap_or(cmdline);
     let mut args = raw.split(|&b| b == 0).skip(1);
     let script = loop {
         let arg = std::str::from_utf8(args.next()?).ok()?;
         match arg {
             "--" => break std::str::from_utf8(args.next()?).ok()?,
-            a if a.starts_with('-') && PLAIN_FLAGS.contains(&a) => continue,
+            a if a.starts_with('-') && flags.contains(&a) => continue,
             a if a.starts_with('-') => return None,
             a => break a,
         }
@@ -112,7 +135,7 @@ pub fn resolve_script(cwd: &Path, arg: &str) -> Option<String> {
 
 /// The script file interpreter process `pid` runs, if any.
 fn script_of(pid: u32) -> Option<String> {
-    let arg = script_argument(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)?;
+    let arg = script_argument(&executable_of(pid)?, &std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)?;
     resolve_script(Path::new(&format!("/proc/{pid}/cwd")), &arg)
 }
 
@@ -366,19 +389,51 @@ mod tests {
 
     #[test]
     fn the_script_is_the_first_plain_argument_after_known_flags() {
-        let arg = |raw: &[u8]| script_argument(raw);
-        assert_eq!(arg(b"python3\0/home/u/tool.py\0--flag\0"), Some("/home/u/tool.py".into()));
-        assert_eq!(arg(b"python3\0-u\0-B\0tool.py\0"), Some("tool.py".into()));
-        assert_eq!(arg(b"bash\0--\0-odd-name.sh\0"), Some("-odd-name.sh".into()));
-        assert_eq!(arg(b"python3\0-c\0print(1)\0"), None, "code on the command line");
-        assert_eq!(arg(b"python3\0-m\0http.server\0"), None, "a module");
-        assert_eq!(arg(b"perl\0-e\0print 1\0"), None);
-        assert_eq!(arg(b"python3\0-\0"), None, "stdin");
-        assert_eq!(arg(b"sh\0-s\0/home/u/trusted.sh\0"), None, "sh -s reads stdin, the rest are arguments");
-        assert_eq!(arg(b"python3\0-W\0/home/u/trusted.py\0evil.py\0"), None, "an option with a value");
-        assert_eq!(arg(b"python3\0"), None, "interactive");
-        assert_eq!(arg(b"python3\0\0"), None);
-        assert_eq!(arg(b""), None);
+        let py = |raw: &[u8]| script_argument("/usr/bin/python3.13", raw);
+        assert_eq!(py(b"python3\0/home/u/tool.py\0--flag\0"), Some("/home/u/tool.py".into()));
+        assert_eq!(py(b"python3\0-u\0-B\0-I\0tool.py\0"), Some("tool.py".into()));
+        assert_eq!(py(b"python3\0--\0-odd-name.py\0"), Some("-odd-name.py".into()));
+        assert_eq!(py(b"python3\0-c\0print(1)\0"), None, "code on the command line");
+        assert_eq!(py(b"python3\0-m\0http.server\0"), None, "a module");
+        assert_eq!(py(b"python3\0-\0"), None, "stdin");
+        assert_eq!(py(b"python3\0-W\0/home/u/trusted.py\0evil.py\0"), None, "an option with a value");
+        assert_eq!(py(b"python3\0-X\0dev\0tool.py\0"), None);
+        assert_eq!(py(b"python3\0"), None, "interactive");
+        assert_eq!(py(b"python3\0\0"), None);
+        assert_eq!(py(b""), None);
+    }
+
+    #[test]
+    fn flags_are_judged_per_interpreter_family() {
+        let arg = script_argument;
+        // Flags that are plain in python take a value elsewhere.
+        assert_eq!(arg("/usr/bin/ruby3.3", b"ruby\0-I\0/tmp/trusted.rb\0evil.rb\0"), None);
+        assert_eq!(arg("/usr/bin/lua5.4", b"lua\0-l\0/tmp/x\0script.lua\0"), None);
+        assert_eq!(arg("/usr/bin/perl", b"perl\0-I\0/tmp/lib\0script.pl\0"), None);
+        assert_eq!(arg("/usr/bin/perl", b"perl\0-x\0/tmp/dir\0script.pl\0"), None);
+        assert_eq!(arg("/usr/bin/perl", b"perl\0-e\0print 1\0"), None);
+        assert_eq!(arg("/usr/bin/perl", b"perl\0-w\0script.pl\0"), Some("script.pl".into()));
+        assert_eq!(arg("/usr/bin/ruby3.3", b"ruby\0-w\0script.rb\0"), Some("script.rb".into()));
+        assert_eq!(arg("/usr/bin/node", b"node\0-r\0/tmp/trusted.js\0evil.js\0"), None);
+        assert_eq!(arg("/usr/bin/node", b"node\0app.js\0"), Some("app.js".into()));
+        assert_eq!(arg("/usr/bin/bash", b"bash\0-e\0-x\0job.sh\0"), Some("job.sh".into()));
+        assert_eq!(arg("/usr/bin/bash", b"bash\0-o\0/tmp/trusted.sh\0evil.sh\0"), None);
+        assert_eq!(arg("/bin/sh", b"sh\0-s\0/home/u/trusted.sh\0"), None, "sh -s reads stdin");
+        assert_eq!(arg("/bin/sh", b"sh\0-c\0echo\0"), None);
+        // No script identity at all: subcommands or launchers.
+        assert_eq!(arg("/usr/bin/deno", b"deno\0run\0x.ts\0"), None);
+        assert_eq!(arg("/usr/bin/bun", b"bun\0x.ts\0"), None);
+        assert_eq!(arg("/bin/busybox", b"busybox\0sh\0x.sh\0"), None);
+        assert_eq!(arg("/usr/lib/jvm/bin/java", b"java\0-jar\0x.jar\0"), None);
+        assert_eq!(arg("/usr/bin/git", b"git\0x\0"), None, "not an interpreter");
+    }
+
+    #[test]
+    fn identities_with_control_characters_are_unknown() {
+        assert_eq!(kind("/usr/bin/gi\nt"), CallerKind::Unknown, "a newline would plant a second ACL line");
+        assert_eq!(kind("/usr/bin/python3//home/u/a\n/usr/bin/git"), CallerKind::Unknown);
+        assert_eq!(kind("/usr/bin/git\t"), CallerKind::Unknown);
+        assert_eq!(kind("/usr/bin/gït"), CallerKind::App, "non-ASCII is fine");
     }
 
     #[test]

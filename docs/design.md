@@ -343,16 +343,30 @@ changing are never clobbered. Then:
   `bash`, `zsh`, `fish`, `dash`, `busybox`, `lua*`, `php*` or `java`.
   An interpreter running a script file is that script. The script is the
   first argument in `/proc/<pid>/cmdline` after the interpreter that is
-  not an option, after `--`, or after value-less flags only (`-u -B -I -O
-  -OO -q -w -x -l`); it is resolved against `/proc/<pid>/cwd`,
-  canonicalized, and must be an existing regular file. The identity, and
+  not an option, after `--`, or after flags that take no value in that
+  interpreter only: python `-u -B -I -O -OO -q -s -S -E`; perl
+  `-w -W -X -T -t`; ruby `-w`; sh, bash, zsh, dash `-e -u -x -v`; none for
+  node, nodejs, fish, lua and php. A flag plain in one interpreter takes a
+  value in another (`ruby -I dir`, `lua -l mod`), so the lists are per
+  family; any other option means no script. `deno`, `bun`, `busybox` and
+  `java` (subcommands, applets, `-jar`) never get a script identity. The
+  script is resolved against `/proc/<pid>/cwd`, canonicalized, and must be
+  an existing regular file. The identity, and
   ACL line, is then `<interpreter>/<script>`: both canonical absolute
   paths joined by one `/`, so the line holds the only `//` (a canonical
   path never contains one); prompts show "`<interpreter>` running
   `<script>`". A script file is treated like an application: "Always
-  allow", creator lines and per-device confirmation all apply. The command
-  line is whatever the process says it is, so a same-user process can
-  claim any script: like the executable, this is a speed bump.
+  allow", creator lines and per-device confirmation all apply. This is a
+  speed bump, like the executable: the command line is whatever the
+  process says it is, so a same-user process can claim any script; and
+  the environment can make a granted script run other code
+  (`PYTHONPATH` or a `sitecustomize`, `PERL5OPT`, `RUBYOPT`,
+  `NODE_OPTIONS`, `BASH_ENV`). A process that rewrites its title, or
+  `chdir`s after starting a script given by a relative path, no longer
+  resolves to its script and becomes an unknown application, asked
+  every time.
+- An identity holding a control character (a newline in a path could
+  plant a second `bwss:acl` line) is an unknown application.
 - **Unknown applications and interpreters without a script file** (any
   other option, such as `-c`, `-m`, `-e`, `-s`, `-` for stdin, an option
   with a value, or no script argument) are asked every time with "Allow /
