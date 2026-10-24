@@ -129,6 +129,11 @@ fn unescape(s: &str) -> Zeroizing<String> {
     Zeroizing::new(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// A failed read from or write to the prompter.
+fn io_error(e: std::io::Error) -> PromptError {
+    PromptError::Protocol(e.to_string())
+}
+
 enum Reply {
     Ok(Option<Zeroizing<String>>),
     Err(String),
@@ -143,8 +148,8 @@ impl Conversation {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| PromptError::Spawn(program.to_owned(), e))?;
-        let stdin = child.stdin.take().ok_or_else(|| PromptError::Protocol("no stdin".into()))?;
-        let stdout = BufReader::new(child.stdout.take().ok_or_else(|| PromptError::Protocol("no stdout".into()))?);
+        let stdin = child.stdin.take().ok_or(PromptError::Protocol("no stdin".into()))?;
+        let stdout = BufReader::new(child.stdout.take().ok_or(PromptError::Protocol("no stdout".into()))?);
         let mut c = Conversation { child, stdin, stdout };
         match c.read_reply().await? {
             Reply::Ok(_) => Ok(c),
@@ -156,7 +161,7 @@ impl Conversation {
         let mut data: Option<Zeroizing<String>> = None;
         loop {
             let mut line = Zeroizing::new(String::new());
-            let n = self.stdout.read_line(&mut line).await.map_err(|e| PromptError::Protocol(e.to_string()))?;
+            let n = self.stdout.read_line(&mut line).await.map_err(io_error)?;
             if n == 0 {
                 return Err(PromptError::Protocol("prompter exited".into()));
             }
@@ -179,9 +184,9 @@ impl Conversation {
     }
 
     async fn command(&mut self, cmd: &str) -> Result<Reply, PromptError> {
-        self.stdin.write_all(cmd.as_bytes()).await.map_err(|e| PromptError::Protocol(e.to_string()))?;
-        self.stdin.write_all(b"\n").await.map_err(|e| PromptError::Protocol(e.to_string()))?;
-        self.stdin.flush().await.map_err(|e| PromptError::Protocol(e.to_string()))?;
+        self.stdin.write_all(cmd.as_bytes()).await.map_err(io_error)?;
+        self.stdin.write_all(b"\n").await.map_err(io_error)?;
+        self.stdin.flush().await.map_err(io_error)?;
         self.read_reply().await
     }
 
@@ -286,18 +291,111 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
         let refuse: Guard = std::sync::Arc::new(move |p: &str| {
-            log.lock().map_err(|e| e.to_string())?.push(p.to_owned());
+            log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(p.to_owned());
             Err(format!("{p} became writable"))
         });
         let p = Prompter::guarded("/nonexistent/pinentry", Duration::from_secs(1), refuse);
         let e = p.password("x", None).await.err().map(|e| e.to_string()).unwrap_or_default();
         assert_eq!(e, "refusing to run the prompter: /nonexistent/pinentry became writable");
         assert!(matches!(p.confirm("x", true).await, Err(PromptError::Untrusted(_))));
-        assert_eq!(seen.lock().map(|s| s.len()).unwrap_or_default(), 2, "checked before every start");
+        assert_eq!(
+            seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+            2,
+            "checked before every start"
+        );
 
         let allow: Guard = std::sync::Arc::new(|_: &str| Ok(()));
         let p = Prompter::guarded("/nonexistent/pinentry", Duration::from_secs(1), allow);
         assert!(matches!(p.password("x", None).await, Err(PromptError::Spawn(..))), "allowed, then started");
+    }
+
+    /// A scripted pinentry from `tests/fixtures/pinentry/`.
+    fn scripted(name: &str, timeout: Duration) -> Prompter {
+        Prompter::new(format!("{}/tests/fixtures/pinentry/{name}", env!("CARGO_MANIFEST_DIR")), timeout)
+    }
+
+    /// The message of the error in `result`, if it is one; a reply is never printed.
+    fn error_of<T>(result: Result<T, PromptError>) -> Option<String> {
+        result.err().as_ref().map(ToString::to_string)
+    }
+
+    const LONG: Duration = Duration::from_secs(20);
+
+    #[tokio::test]
+    async fn a_pin_in_several_data_lines_is_joined_and_status_lines_are_ignored() {
+        let pin = scripted("chunked_pin.sh", LONG).password("d", None).await;
+        assert_eq!(pin.ok().flatten().as_deref().map(String::as_str), Some("abc100%"));
+    }
+
+    #[tokio::test]
+    async fn the_error_of_the_last_attempt_is_shown_in_the_dialog() {
+        let p = scripted("echo_error.sh", LONG);
+        let pin = p.password("d", Some("Wrong password, 50%\nTry again")).await;
+        // SETERROR is escaped on the wire; the script hands it back as it got
+        // it, and the reply is unescaped again: the text makes the round trip.
+        assert_eq!(pin.ok().flatten().as_deref().map(String::as_str), Some("Wrong password, 50%\nTry again"));
+        let pin = p.password("d", None).await;
+        assert_eq!(pin.ok().flatten().as_deref().map(String::as_str), Some(""), "no error, nothing shown");
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_dialog_is_no_password_and_no_error() {
+        let pin = scripted("cancelled.sh", LONG).password("d", None).await;
+        assert!(matches!(pin, Ok(None)), "cancelling is neither a password nor an error");
+    }
+
+    #[tokio::test]
+    async fn a_pinentry_that_refuses_the_greeting_is_a_protocol_error() {
+        let p = scripted("greeting_err.sh", LONG);
+        assert_eq!(
+            error_of(p.password("d", None).await).as_deref(),
+            Some("prompter protocol error: greeting: 83886360 no display")
+        );
+        assert_eq!(
+            error_of(p.confirm("d", false).await).as_deref(),
+            Some("prompter protocol error: greeting: 83886360 no display")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinentry_that_refuses_an_option_names_it() {
+        let p = scripted("set_err.sh", LONG);
+        assert_eq!(
+            error_of(p.password("d", None).await).as_deref(),
+            Some("prompter protocol error: SETTITLE: 83886360 option refused")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_getpin_error_that_is_not_a_cancel_is_a_protocol_error() {
+        let p = scripted("getpin_err.sh", LONG);
+        assert_eq!(
+            error_of(p.password("d", None).await).as_deref(),
+            Some("prompter protocol error: GETPIN: 83918950 Inappropriate ioctl for device")
+        );
+    }
+
+    #[tokio::test]
+    async fn output_that_is_not_text_is_a_protocol_error() {
+        let p = scripted("not_utf8.sh", LONG);
+        let e = error_of(p.password("d", None).await).unwrap_or_default().to_lowercase();
+        assert!(e.starts_with("prompter protocol error: ") && e.contains("utf-8"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_pinentry_that_stopped_listening_is_a_protocol_error() {
+        let p = scripted("stdin_closed.sh", LONG);
+        assert_eq!(
+            error_of(p.password("d", None).await).as_deref(),
+            Some("prompter protocol error: Broken pipe (os error 32)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinentry_that_never_answers_times_out() {
+        let p = scripted("silent.sh", Duration::from_millis(200));
+        assert_eq!(error_of(p.password("d", None).await).as_deref(), Some("the prompt timed out"));
+        assert_eq!(error_of(p.confirm("d", true).await).as_deref(), Some("the prompt timed out"));
     }
 
     #[test]

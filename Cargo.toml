@@ -54,6 +54,8 @@ zeroize = { version = "1.9.1", features = ["derive", "serde"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
+# Tests play the bus driver over a socket pair (acl.rs).
+zbus = { version = "6.0.0", default-features = false, features = ["p2p"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", default-features = false, features = ["process"] }

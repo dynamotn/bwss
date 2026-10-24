@@ -67,6 +67,16 @@ def test_password_stdin_goes_only_to_bwss(squatters):
     assert not any("UnlockWithPassword" in c or PASSWORD in c for c in calls), calls
 
 
+def test_password_stdin_refuses_a_squatter_it_cannot_identify(squatters):
+    # Not dumpable, like the daemon: its /proc/<pid>/exe cannot be read.
+    squatter = squatters(CONTROL, env={**os.environ, "SQUATTER_UNDUMPABLE": "1"})
+    assert squatter.reply == 1
+    r = memory_home().cli("unlock", "--password-stdin", input=PASSWORD + "\n", check=False)
+    assert r.returncode != 0
+    assert f"{CONTROL} is owned by (unknown application) (pid {squatter.proc.pid})" in r.stderr, r.stderr
+    assert not any("UnlockWithPassword" in c or PASSWORD in c for c in squatter.calls()), squatter.calls()
+
+
 def test_password_stdin_refuses_a_squatter_that_execs_bwss(squatters):
     # The squatter forks: the child keeps the name, and the parent (the pid
     # the bus reports) becomes a genuine, blocked `bwss unlock`.

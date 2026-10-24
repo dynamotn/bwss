@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """A stand-in for systemd-logind on a private bus.
 
-    fake_logind.py ADDRESS SESSION_PATH
+    fake_logind.py ADDRESS SESSION_PATH [unknown-pid]
 
 Owns org.freedesktop.login1 on ADDRESS and answers Manager.GetSessionByPID and
-Manager.GetSession with SESSION_PATH. Prints "ready" once it owns the name;
+Manager.GetSession with SESSION_PATH. With "unknown-pid", GetSessionByPID
+fails instead, as for a process that belongs to no session; GetSession still
+answers. Prints "ready" once it owns the name;
 then reads commands from stdin, one per line:
 
     sleep   emit Manager.PrepareForSleep(true)
@@ -17,7 +19,7 @@ import os
 import select
 import sys
 
-from jeepney import DBusAddress, MessageType, new_method_return, new_signal
+from jeepney import DBusAddress, MessageType, new_error, new_method_return, new_signal
 from jeepney.bus_messages import message_bus
 from jeepney.io.blocking import open_dbus_connection
 from jeepney.low_level import HeaderFields
@@ -26,6 +28,7 @@ NAME = "org.freedesktop.login1"
 MANAGER = DBusAddress("/org/freedesktop/login1", bus_name=NAME, interface="org.freedesktop.login1.Manager")
 
 address, session_path = sys.argv[1], sys.argv[2]
+unknown_pid = sys.argv[3:] == ["unknown-pid"]
 session = DBusAddress(session_path, bus_name=NAME, interface="org.freedesktop.login1.Session")
 SIGNALS = {
     "sleep": lambda: new_signal(MANAGER, "PrepareForSleep", "b", (True,)),
@@ -50,5 +53,8 @@ while True:
     except TimeoutError:
         continue
     if msg.header.message_type == MessageType.method_call:
-        if msg.header.fields.get(HeaderFields.member) in ("GetSessionByPID", "GetSession"):
+        member = msg.header.fields.get(HeaderFields.member)
+        if member == "GetSessionByPID" and unknown_pid:
+            conn.send(new_error(msg, "org.freedesktop.login1.NoSessionForPID", "s", ("no session for the pid",)))
+        elif member in ("GetSessionByPID", "GetSession"):
             conn.send(new_method_return(msg, "o", (session_path,)))

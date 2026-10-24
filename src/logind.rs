@@ -54,8 +54,8 @@ where
 {
     let manager = zbus::Proxy::new(conn, SERVICE, MANAGER_PATH, MANAGER_IFACE).await?;
     // Subscribe before the lookup, so no signal falls in between.
-    let mut sleeps = manager.receive_signal("PrepareForSleep").await?;
-    let mut locks = match current_session(&manager).await {
+    let sleeps = manager.receive_signal("PrepareForSleep").await?;
+    let locks = match current_session(&manager).await {
         Ok(path) => {
             let session = zbus::Proxy::new(conn, SERVICE, path, SESSION_IFACE).await?;
             Some(session.receive_signal("Lock").await?)
@@ -66,6 +66,19 @@ where
         }
     };
     tracing::info!("locking on sleep{}", if locks.is_some() { " and screen lock" } else { "" });
+    serve(sleeps, locks, lock).await;
+    Ok(())
+}
+
+/// Calls `lock` on every sleep and every session lock, until the sleep
+/// stream ends (the connection to logind closed).
+async fn serve<S, L, F, Fut>(mut sleeps: S, mut locks: Option<L>, lock: &F)
+where
+    S: Stream<Item = zbus::Message> + Unpin,
+    L: Stream<Item = zbus::Message> + Unpin,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
         tokio::select! {
             msg = next(&mut sleeps) => {
@@ -94,7 +107,6 @@ where
             }
         }
     }
-    Ok(())
 }
 
 /// `PrepareForSleep(true)` locks; `PrepareForSleep(false)` is the wake-up.
@@ -124,6 +136,7 @@ fn session_id(var: Option<String>) -> Option<String> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -142,14 +155,80 @@ mod tests {
         assert_eq!(session_id(None), None);
     }
 
+    /// A `lock` callback that counts its calls.
+    fn counting(count: &AtomicUsize) -> impl Fn() -> std::future::Ready<()> + '_ {
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        }
+    }
+
+    /// A stream of ready `items`, which then ends. With `after_yield`, the
+    /// first poll is pending once, so another stream is polled before it.
+    struct Items {
+        items: std::collections::VecDeque<zbus::Message>,
+        pending_once: bool,
+    }
+
+    impl Items {
+        fn new(items: impl IntoIterator<Item = zbus::Message>, after_yield: bool) -> Self {
+            Items { items: items.into_iter().collect(), pending_once: after_yield }
+        }
+    }
+
+    impl Stream for Items {
+        type Item = zbus::Message;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+            if std::mem::take(&mut self.pending_once) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(self.items.pop_front())
+        }
+    }
+
+    fn sleep_signal(starting: bool) -> zbus::Message {
+        zbus::Message::signal(MANAGER_PATH, MANAGER_IFACE, "PrepareForSleep").build(&starting).unwrap()
+    }
+
+    fn session_lock_signal() -> zbus::Message {
+        zbus::Message::signal("/org/freedesktop/login1/session/_32", SESSION_IFACE, "Lock").build(&()).unwrap()
+    }
+
     #[tokio::test]
     async fn no_system_bus_returns_without_locking() {
         let locked = AtomicUsize::new(0);
         let builder = zbus::connection::Builder::address("unix:path=/nonexistent/bwss-test-bus");
-        run_with(builder, || async {
-            locked.fetch_add(1, Ordering::SeqCst);
-        })
-        .await;
+        run_with(builder, counting(&locked)).await;
         assert_eq!(locked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn going_to_sleep_locks_and_waking_up_does_not() {
+        let locked = AtomicUsize::new(0);
+        let sleeps = Items::new([sleep_signal(false), sleep_signal(true)], false);
+        serve(sleeps, None::<Items>, &counting(&locked)).await;
+        assert_eq!(locked.load(Ordering::SeqCst), 1, "PrepareForSleep(true) locks once, (false) never");
+    }
+
+    #[tokio::test]
+    async fn a_session_lock_signal_locks() {
+        let locked = AtomicUsize::new(0);
+        // The connection closes (the sleep stream ends) only after a yield,
+        // so the lock signal is certainly handled first, on every run.
+        let sleeps = Items::new([], true);
+        serve(sleeps, Some(Items::new([session_lock_signal()], false)), &counting(&locked)).await;
+        assert_eq!(locked.load(Ordering::SeqCst), 1, "Session.Lock locks once");
+    }
+
+    #[tokio::test]
+    async fn sleep_still_locks_after_the_session_signal_ended() {
+        let locked = AtomicUsize::new(0);
+        // The sleep signal arrives only after a yield, so the (already ended)
+        // session stream is certainly seen first, on every run.
+        let sleeps = Items::new([sleep_signal(true)], true);
+        serve(sleeps, Some(Items::new([], false)), &counting(&locked)).await;
+        assert_eq!(locked.load(Ordering::SeqCst), 1, "sleep locks although screen lock no longer can");
     }
 }

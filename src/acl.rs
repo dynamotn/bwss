@@ -186,10 +186,7 @@ impl Identities {
     /// The executable behind the sender of `header`, or [`UNKNOWN`].
     pub async fn caller_executable(&self, conn: &Connection, header: &Header<'_>) -> String {
         let Some(sender) = header.sender() else { return UNKNOWN.into() };
-        let seen = match DBusProxy::new(conn).await {
-            Ok(proxy) => look_up(&proxy, BusName::Unique(sender.to_owned())).await,
-            Err(_) => None,
-        };
+        let seen = look_up_via(conn, BusName::Unique(sender.to_owned())).await;
         settle(&mut crate::sync::lock(&self.pins), sender.as_str(), seen)
     }
 
@@ -197,10 +194,7 @@ impl Identities {
     /// cannot be reused before its first call.
     pub async fn appeared(&self, conn: &Connection, name: &str) {
         let Ok(unique) = zbus::names::UniqueName::try_from(name) else { return };
-        let seen = match DBusProxy::new(conn).await {
-            Ok(proxy) => look_up(&proxy, BusName::Unique(unique)).await,
-            Err(_) => None,
-        };
+        let seen = look_up_via(conn, BusName::Unique(unique)).await;
         first_sight(&mut crate::sync::lock(&self.pins), name, seen);
     }
 
@@ -213,6 +207,12 @@ impl Identities {
     pub fn forget(&self, name: &str) {
         crate::sync::lock(&self.pins).remove(name);
     }
+}
+
+/// [`look_up`] over a proxy of the bus driver on `conn`; `None` without one.
+async fn look_up_via(conn: &Connection, name: BusName<'_>) -> Option<Pin> {
+    let proxy = DBusProxy::new(conn).await.ok()?;
+    look_up(&proxy, name).await
 }
 
 /// Reads the process behind `name` now, through its pidfd when the bus
@@ -278,10 +278,14 @@ fn observe(pid: Option<u32>, pidfd: Option<BorrowedFd<'_>>) -> Option<Pin> {
         Some(script) => script_identity(&exe, &script),
         None => exe,
     };
-    if pidfd.is_some_and(|fd| pidfd_pid(fd) != FdPid::Pid(pid)) || start_time(pid) != Some(start) {
-        return None;
-    }
-    Some(Pin { pid, start, identity })
+    let fd_now = pidfd.map(pidfd_pid);
+    unchanged(pid, start, fd_now, start_time(pid)).then_some(Pin { pid, start, identity })
+}
+
+/// Whether the reads were about one process: the pidfd, if there was one,
+/// still names `pid`, and its start time is still `start`.
+fn unchanged(pid: u32, start: u64, pidfd_now: Option<FdPid>, start_now: Option<u64>) -> bool {
+    pidfd_now.is_none_or(|fd| fd == FdPid::Pid(pid)) && start_now == Some(start)
 }
 
 /// The identity of `name` given what was `seen` now: the first sight is
@@ -313,7 +317,12 @@ fn parse_start_time(stat: &str) -> Option<u64> {
 
 /// The pid a pidfd refers to, from `/proc/self/fdinfo`.
 fn pidfd_pid(fd: BorrowedFd<'_>) -> FdPid {
-    match std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())) {
+    read_fdinfo(Path::new(&format!("/proc/self/fdinfo/{}", fd.as_raw_fd())))
+}
+
+/// The pid in the `fdinfo` file at `path`.
+fn read_fdinfo(path: &Path) -> FdPid {
+    match std::fs::read_to_string(path) {
         Ok(info) => parse_pidfd_pid(&info).map_or(FdPid::Gone, FdPid::Pid),
         Err(_) => FdPid::Unreadable,
     }
@@ -424,6 +433,8 @@ pub fn same_executable(owner: &str, me: &Path) -> bool {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::sync::lock;
 
     #[test]
     fn same_executable_sees_through_links_and_replaced_binaries() {
@@ -762,6 +773,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_pidfd_pins_the_process_it_names_and_no_other() {
+        use rustix::process::{PidfdFlags, getpid, pidfd_open};
+
+        let me = std::process::id();
+        let expected = Pin { pid: me, start: start_time(me).unwrap(), identity: executable_of(me).unwrap() };
+        let fd = pidfd_open(getpid(), PidfdFlags::empty()).unwrap();
+        assert_eq!(observe(Some(me), Some(fd.as_fd())), Some(expected.clone()));
+        assert_eq!(observe(None, Some(fd.as_fd())), Some(expected), "the pidfd alone is enough");
+        assert_eq!(observe(Some(me.wrapping_add(1)), Some(fd.as_fd())), None, "the bus and the pidfd disagree");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interpreter_running_a_script_file_is_pinned_as_that_script() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = std::fs::canonicalize(dir.path()).unwrap().join("job.sh");
+        // It says it is running, then waits for its input to close.
+        std::fs::write(&script, "echo ready\nread _\n").unwrap();
+        let mut child = Command::new("sh").arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let pin = observe(Some(child.id()), None);
+        let shell = executable_of(child.id()).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+
+        let identity = pin.unwrap().identity;
+        assert_eq!(identity, format!("{shell}/{}", script.display()));
+        assert_eq!(kind(&identity), CallerKind::Script);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn this_process_reads_back_through_proc() {
         let me = std::process::id();
         let start = start_time(me).unwrap();
@@ -770,5 +819,117 @@ mod tests {
         assert_eq!(seen, Pin { pid: me, start, identity: executable_of(me).unwrap() });
         assert_eq!(observe(Some(me.wrapping_add(1 << 30)), None), None, "no such process");
         assert_eq!(observe(None, None), None);
+    }
+
+    #[test]
+    fn a_process_that_changed_during_the_reads_is_not_pinned() {
+        use FdPid::*;
+        assert!(unchanged(7, 100, None, Some(100)), "no pidfd: the start time decides");
+        assert!(unchanged(7, 100, Some(Pid(7)), Some(100)));
+        assert!(!unchanged(7, 100, None, Some(101)), "the pid was reused");
+        assert!(!unchanged(7, 100, None, None), "the process is gone");
+        assert!(!unchanged(7, 100, Some(Pid(8)), Some(100)), "the pidfd names another process now");
+        assert!(!unchanged(7, 100, Some(Gone), Some(100)), "the process exited");
+        assert!(!unchanged(7, 100, Some(Unreadable), Some(100)), "a pidfd that was readable no longer is");
+    }
+
+    #[test]
+    fn fdinfo_is_read_from_a_file_and_an_unreadable_one_is_not_a_gone_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("3");
+        std::fs::write(&info, "pos:\t0\nPid:\t1234\n").unwrap();
+        assert_eq!(read_fdinfo(&info), FdPid::Pid(1234));
+        std::fs::write(&info, "pos:\t0\nPid:\t-1\n").unwrap();
+        assert_eq!(read_fdinfo(&info), FdPid::Gone);
+        assert_eq!(read_fdinfo(&dir.path().join("missing")), FdPid::Unreadable);
+    }
+
+    /// How the stand-in bus driver answers `GetConnectionCredentials`.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum Credentials {
+        /// With a `ProcessID` and no `ProcessFD`: a bus that cannot send one.
+        PidOnly,
+        /// With an error: a bus without the method.
+        Refused,
+    }
+
+    /// The bus driver (`org.freedesktop.DBus`) as far as callers are looked up,
+    /// answering every name with the pid of this test process.
+    #[cfg(target_os = "linux")]
+    struct Driver(Credentials);
+
+    #[cfg(target_os = "linux")]
+    #[zbus::interface(name = "org.freedesktop.DBus")]
+    impl Driver {
+        async fn get_connection_credentials(
+            &self,
+            _name: &str,
+        ) -> zbus::fdo::Result<HashMap<String, zbus::OwnedVariant>> {
+            match self.0 {
+                Credentials::PidOnly => {
+                    Ok(HashMap::from([("ProcessID".to_owned(), zbus::OwnedVariant::from(std::process::id()))]))
+                }
+                Credentials::Refused => Err(zbus::fdo::Error::NotSupported("no credentials".into())),
+            }
+        }
+
+        #[zbus(name = "GetConnectionUnixProcessID")]
+        async fn get_connection_unix_process_id(&self, _name: &str) -> u32 {
+            std::process::id()
+        }
+    }
+
+    /// A client connection whose peer plays the bus driver; keep the second
+    /// connection alive as long as the first is used.
+    #[cfg(target_os = "linux")]
+    async fn fake_bus(credentials: Credentials) -> (Connection, Connection) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let driver = zbus::connection::Builder::unix_stream(a)
+            .server(zbus::Guid::generate())
+            .p2p()
+            .serve_at("/org/freedesktop/DBus", Driver(credentials))
+            .build();
+        let (driver, client) =
+            tokio::try_join!(driver, zbus::connection::Builder::unix_stream(b).p2p().build()).unwrap();
+        (client, driver)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn call_from(sender: &str) -> zbus::message::Message {
+        zbus::message::Message::method_call("/org/example/Object", "Method").sender(sender).build(&()).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_caller_is_pinned_by_pid_when_the_bus_sends_no_pidfd_or_no_credentials() {
+        let me = std::process::id();
+        let expected = Pin { pid: me, start: start_time(me).unwrap(), identity: executable_of(me).unwrap() };
+        for credentials in [Credentials::PidOnly, Credentials::Refused] {
+            let (client, _driver) = fake_bus(credentials).await;
+            let ids = Identities::default();
+            assert!(ids.names().is_empty());
+
+            ids.appeared(&client, ":1.7").await;
+            assert_eq!(ids.names(), [":1.7"], "pinned when it appeared");
+            assert_eq!(lock(&ids.pins).get(":1.7"), Some(&expected));
+
+            let call = call_from(":1.8");
+            assert_eq!(ids.caller_executable(&client, &call.header()).await, expected.identity);
+            assert_eq!(lock(&ids.pins).get(":1.8"), Some(&expected), "pinned by its first call");
+
+            ids.forget(":1.7");
+            assert_eq!(ids.names(), [":1.8"]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_call_without_a_sender_is_an_unknown_application() {
+        let (client, _driver) = fake_bus(Credentials::PidOnly).await;
+        let msg = zbus::message::Message::method_call("/org/example/Object", "Method").build(&()).unwrap();
+        assert_eq!(Identities::default().caller_executable(&client, &msg.header()).await, UNKNOWN);
     }
 }

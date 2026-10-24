@@ -26,12 +26,25 @@ class SystemBus(str):
     proc = None
 
 
-@pytest.fixture
-def system_bus():
-    """A private dbus-daemon, standing in for the system bus."""
+def private_bus(match_rule_limit=None):
+    """A private dbus-daemon, standing in for the system bus. With
+    `match_rule_limit`, a connection may add that many match rules only."""
     sock = Path(tempfile.mkdtemp(prefix="bwss-sysbus-")) / "bus"
     address = SystemBus(f"unix:path={sock}")
-    proc = subprocess.Popen(["dbus-daemon", "--session", "--nofork", f"--address={address}"])
+    if match_rule_limit is None:
+        command = ["dbus-daemon", "--session", "--nofork", f"--address={address}"]
+    else:
+        config = sock.parent / "bus.conf"
+        config.write_text(
+            "<busconfig><type>session</type>"
+            f"<listen>{address}</listen>"
+            '<policy context="default"><allow send_destination="*" eavesdrop="true"/>'
+            '<allow eavesdrop="true"/><allow own="*"/></policy>'
+            f'<limit name="max_match_rules_per_connection">{match_rule_limit}</limit>'
+            "</busconfig>"
+        )
+        command = ["dbus-daemon", "--nofork", f"--config-file={config}"]
+    proc = subprocess.Popen(command)
     for _ in range(100):
         if sock.exists():
             break
@@ -39,15 +52,33 @@ def system_bus():
     else:
         raise RuntimeError("dbus-daemon did not start")
     address.proc = proc
+    return address
+
+
+def stop_bus(address):
+    if address.proc.poll() is None:
+        address.proc.terminate()
+    address.proc.wait(10)
+
+
+@pytest.fixture
+def system_bus():
+    address = private_bus()
     yield address
-    if proc.poll() is None:
-        proc.terminate()
-    proc.wait(10)
+    stop_bus(address)
+
+
+@pytest.fixture
+def limited_bus():
+    """A bus that refuses a client's first match rule beyond the limit."""
+    address = private_bus(match_rule_limit=1)
+    yield address
+    stop_bus(address)
 
 
 class FakeLogind:
-    def __init__(self, address):
-        self.proc = subprocess.Popen([sys.executable, FAKE_LOGIND, address, SESSION], stdin=subprocess.PIPE,
+    def __init__(self, address, *options):
+        self.proc = subprocess.Popen([sys.executable, FAKE_LOGIND, address, SESSION, *options], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True)
         assert self.proc.stdout.readline().strip() == "ready"
 
@@ -173,3 +204,54 @@ def test_losing_the_system_bus_is_logged_and_the_daemon_keeps_serving(started, s
     assert started.cli("status").stdout.startswith("unlocked")
     started.cli("lock")
     assert started.cli("status").stdout.startswith("locked")
+
+
+@pytest.fixture
+def logind_without_pid_lookup(system_bus):
+    f = FakeLogind(system_bus, "unknown-pid")
+    yield f
+    f.stop()
+
+
+def test_the_session_of_the_environment_is_used_when_logind_does_not_know_the_process(
+    system_bus, logind_without_pid_lookup
+):
+    d = daemon_on(system_bus)
+    d.env["XDG_SESSION_ID"] = "32"
+    d.start()
+    try:
+        assert wait_log(d, "locking on sleep and screen lock"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        logind_without_pid_lookup.emit("lock")
+        assert wait_locked(d)
+    finally:
+        d.stop()
+
+
+def test_without_any_session_only_sleep_locks(system_bus, logind_without_pid_lookup):
+    d = daemon_on(system_bus)
+    d.env.pop("XDG_SESSION_ID", None)
+    d.start()
+    try:
+        assert wait_log(d, "no logind session"), (d.home / "daemon.log").read_text()
+        assert wait_log(d, "locking on sleep"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        logind_without_pid_lookup.emit("lock")
+        logind_without_pid_lookup.emit("sleep")
+        assert wait_locked(d)
+        log = (d.home / "daemon.log").read_text()
+        assert "locking on sleep and screen lock" not in log, log
+        assert "session lock requested" not in log, log
+        assert "system is going to sleep" in log, log
+    finally:
+        d.stop()
+
+
+def test_a_bus_that_refuses_the_subscription_is_logged_and_the_daemon_keeps_serving(limited_bus):
+    d = daemon_on(limited_bus).start()
+    try:
+        assert wait_log(d, "cannot listen to logind"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        assert d.proc.poll() is None
+    finally:
+        d.stop()

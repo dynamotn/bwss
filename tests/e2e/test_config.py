@@ -33,15 +33,16 @@ def login(d, secret="csecret"):
     return d.cli("login", "--client-id", "user.cid", "--client-secret-stdin", input=secret + "\n")
 
 
-def on_terminal(d, *args, answer):
-    """Runs the CLI with a terminal as stdin and stderr, answers its question,
-    and returns (exit code, stdout, what the terminal showed)."""
+def on_terminal(d, *args, answer, until=b"Type"):
+    """Runs the CLI with a terminal as stdin and stderr, answers its question
+    (the terminal shows `until` by then), and returns (exit code, stdout, what
+    the terminal showed)."""
     master, slave = pty.openpty()
     proc = subprocess.Popen([BWSS, *args], env=d.env, stdin=slave, stdout=subprocess.PIPE, stderr=slave)
     os.close(slave)
     shown = b""
     try:
-        while b"Type" not in shown:
+        while until not in shown:
             ready, _, _ = select.select([master], [], [], 10)
             assert ready, f"no question on the terminal: {shown!r}"
             shown += os.read(master, 1024)
@@ -120,6 +121,33 @@ def test_an_unreadable_credentials_file_stops_the_daemon_naming_it():
         creds.chmod(0o600)
     assert r.returncode != 0 and str(creds) in r.stderr and "Permission denied" in r.stderr, r.stderr
     assert "csecret" not in r.stderr
+
+
+def test_login_asks_for_the_secret_on_a_terminal():
+    d = bitwarden_home()
+    code, out, shown = on_terminal(d, "login", "--client-id", "user.cid", answer="tty-secret", until=b"client_secret: ")
+    assert code == 0, (out, shown)
+    assert "API key client_secret: " in shown
+    creds = d.state / "profiles" / PROFILE / "credentials"
+    assert tomllib.loads(creds.read_text())["client_secret"] == "tty-secret"
+    assert str(creds) in out
+
+
+def test_login_without_a_secret_saves_nothing():
+    d = bitwarden_home()
+    r = d.cli("login", "--client-id", "user.cid", "--client-secret-stdin", input="\n", check=False)
+    assert r.returncode != 0 and r.stderr.strip() == "bwss: no input", r.stderr
+    assert not (d.state / "profiles" / PROFILE / "credentials").exists()
+
+
+def test_login_that_cannot_save_names_the_file():
+    d = bitwarden_home()
+    creds = d.state / "profiles" / PROFILE / "credentials"
+    creds.mkdir(parents=True)  # a directory where the file goes: the rename over it fails
+    r = d.cli("login", "--client-id", "user.cid", "--client-secret-stdin", input="csecret\n", check=False)
+    assert r.returncode != 0 and str(creds) in r.stderr, r.stderr
+    assert "csecret" not in r.stderr
+    assert creds.is_dir() and not any(creds.iterdir()), "nothing was put in its place"
 
 
 def test_login_needs_a_profile():
@@ -318,3 +346,49 @@ def test_a_migration_with_an_untrusted_prompter_changes_nothing():
     assert r.returncode != 0 and "`prompter`" in r.stderr, r.stderr
     assert not d.config.exists()
     assert (old / "config.toml").read_text() == text
+
+
+def test_a_device_flag_that_cannot_be_cleared_names_the_file():
+    d = Daemon({"backend": "memory"})
+    tools = d.state / "tools" / "bwss"
+    for command, flag in ((("acl", "on"), "acl-off"), (("index", "derived", "off"), "index-derived")):
+        (tools / flag).mkdir(parents=True)  # a directory where the flag file goes
+        r = d.cli(*command, check=False)
+        assert r.returncode != 0 and str(tools / flag) in r.stderr, (command, r.stderr)
+        assert (tools / flag).is_dir()
+
+
+def test_the_daemon_names_a_directory_it_cannot_create():
+    d = Daemon({"backend": "memory"})
+    (d.home / "cache").write_text("")  # a file where the cache directory goes
+    r = run_daemon(d)
+    assert r.returncode != 0 and str(d.home / "cache" / "bwss") in r.stderr, r.stderr
+
+    d = bitwarden_home()
+    profiles = d.state / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / PROFILE).write_text("")  # a file where the profile directory goes
+    r = run_daemon(d)
+    assert r.returncode != 0 and str(profiles / PROFILE) in r.stderr, r.stderr
+
+
+def test_the_log_level_defaults_to_info_and_follows_bwss_log():
+    d = Daemon({"backend": "memory"})
+    del d.env["BWSS_LOG"]
+    d.start()
+    try:
+        assert d.cli("status").stdout.startswith("locked")
+    finally:
+        d.stop()
+    log = (d.home / "daemon.log").read_text()
+    assert "serving org.freedesktop.secrets" in log and "DEBUG" not in log, log
+
+    d = Daemon({"backend": "memory"})
+    d.env["BWSS_LOG"] = "not a [ valid filter"
+    d.start()
+    try:
+        d.cli("status")
+    finally:
+        d.stop()
+    log = (d.home / "daemon.log").read_text()
+    assert "serving org.freedesktop.secrets" in log and "DEBUG" not in log, "an invalid filter means the default: " + log

@@ -211,7 +211,7 @@ async fn owner_of(bus: &DBusProxy<'_>, name: &str) -> String {
     let Ok(owner) = bus.get_name_owner(name).await else { return acl::UNKNOWN.into() };
     let pid = bus.get_connection_unix_process_id(BusName::Unique(owner.as_ref())).await.ok();
     let exe = pid.and_then(acl::executable_of);
-    let who = pid.map_or_else(|| owner.to_string(), |pid| format!("pid {pid}"));
+    let who = pid.map_or(owner.to_string(), |pid| format!("pid {pid}"));
     format!("{} ({who})", exe.as_deref().unwrap_or(acl::UNKNOWN))
 }
 
@@ -257,10 +257,46 @@ async fn claim_names(conn: &zbus::Connection, replace: bool) -> anyhow::Result<(
     Ok(())
 }
 
-async fn run_daemon(replace: bool) -> anyhow::Result<()> {
-    for failure in hardening::harden() {
+/// The pinentry check that runs right before every start: `Err` says why not.
+fn verify_pinentry(trust: &Trust, program: &str) -> Result<(), String> {
+    trust.verify(std::path::Path::new(program)).map(|_| ()).map_err(|e| format!("{e:#}"))
+}
+
+/// Warns about each step of the process hardening that did not work.
+fn log_hardening_failures(failures: impl IntoIterator<Item = String>) {
+    for failure in failures {
         tracing::warn!("process hardening incomplete: {failure}");
     }
+}
+
+/// Pulls from the backend every `period`, the first time one period from now.
+fn spawn_sync(d: Arc<Daemon>, period: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            d.refresh().await;
+        }
+    })
+}
+
+/// Locks the keyring once it has been idle for more than `limit`, checking
+/// every `poll`.
+fn spawn_idle_lock(d: Arc<Daemon>, limit: Duration, poll: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(poll);
+        loop {
+            tick.tick().await;
+            if d.keyring.lock().await.is_unlocked() && d.idle_for() > limit {
+                d.lock().await;
+            }
+        }
+    })
+}
+
+async fn run_daemon(replace: bool) -> anyhow::Result<()> {
+    log_hardening_failures(hardening::harden());
     let paths = Paths::from_env();
     let trust = Trust::system()?;
     let config = config::load(&paths, &trust)?;
@@ -285,9 +321,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     let prompter = Prompter::guarded(
         config.pinentry.clone(),
         Duration::from_secs(120),
-        Arc::new(move |program: &str| {
-            guard.verify(std::path::Path::new(program)).map(|_| ()).map_err(|e| format!("{e:#}"))
-        }),
+        Arc::new(move |program: &str| verify_pinentry(&guard, program)),
     );
     let daemon = Daemon::new(Keyring::new(index, Some(paths.index_derived())), backend, prompter, config.clone());
     daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
@@ -299,29 +333,11 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     tracing::info!("serving {SECRETS_NAME}");
 
     // Periodic pull from Bitwarden.
-    let d = daemon.clone();
-    let interval = Duration::from_secs(config.sync_interval_seconds.max(30));
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            d.refresh().await;
-        }
-    });
+    spawn_sync(daemon.clone(), Duration::from_secs(config.sync_interval_seconds.max(30)));
     // Idle lock.
     if config.lock_timeout_minutes > 0 {
-        let d = daemon.clone();
         let limit = Duration::from_secs(config.lock_timeout_minutes.saturating_mul(60));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tick.tick().await;
-                if d.keyring.lock().await.is_unlocked() && d.idle_for() > limit {
-                    d.lock().await;
-                }
-            }
-        });
+        spawn_idle_lock(daemon.clone(), limit, Duration::from_secs(30));
     }
 
     // Sleep and screen lock, from logind on the system bus.
@@ -338,6 +354,16 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     }
     daemon.lock().await;
     Ok(())
+}
+
+/// What `bwss status` prints. The first line of `backend` is the summary; the
+/// backend may add lines with what the user may want to fix (duplicates,
+/// skipped items), which are indented.
+fn status_lines(unlocked: bool, items: u32, backend: &str) -> Vec<String> {
+    let (summary, details) = backend.split_once('\n').unwrap_or((backend, ""));
+    let mut lines = vec![format!("{}, {items} item(s), {summary}", if unlocked { "unlocked" } else { "locked" })];
+    lines.extend(details.lines().map(|line| format!("  {line}")));
+    lines
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -370,12 +396,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Status => {
             let (unlocked, items, backend): (bool, u32, String) = control().await?.call("Status", &()).await?;
-            // The first line is the summary; the backend may add lines with
-            // what the user may want to fix (duplicates, skipped items).
-            let (summary, details) = backend.split_once('\n').unwrap_or((backend.as_str(), ""));
-            println!("{}, {items} item(s), {summary}", if unlocked { "unlocked" } else { "locked" });
-            for line in details.lines() {
-                println!("  {line}");
+            for line in status_lines(unlocked, items, &backend) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -455,6 +477,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -493,5 +516,100 @@ mod tests {
         assert!(secrets.contains(owner) && secrets.contains("use --replace"), "{secrets}");
         let replaced = name_refusal(SECRETS_NAME, owner, true);
         assert!(replaced.contains(owner) && replaced.contains("does not allow replacement"), "{replaced}");
+    }
+
+    #[test]
+    fn status_is_one_summary_line_then_the_backends_details_indented() {
+        assert_eq!(status_lines(true, 3, "memory"), ["unlocked, 3 item(s), memory"]);
+        assert_eq!(
+            status_lines(false, 0, "bitwarden (me@example.org)\n2 duplicates\n1 item skipped"),
+            ["locked, 0 item(s), bitwarden (me@example.org)", "  2 duplicates", "  1 item skipped"]
+        );
+        assert_eq!(status_lines(false, 1, "x\n"), ["locked, 1 item(s), x"], "no details, no extra lines");
+    }
+
+    /// A file the logs go into; `capture_logs` returns it.
+    struct Captured {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    fn text(logs: &Captured) -> String {
+        std::fs::read_to_string(&logs.path).unwrap()
+    }
+
+    /// Logs from here on go into the returned file until the guard is dropped.
+    fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::fs::File::create(&path).unwrap())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        (Captured { _dir: dir, path }, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[test]
+    fn each_failed_hardening_step_is_a_warning() {
+        let (out, _guard) = capture_logs();
+        log_hardening_failures(Vec::new());
+        assert_eq!(text(&out), "", "nothing failed, nothing logged");
+        log_hardening_failures(["PR_SET_DUMPABLE: boom".to_owned(), "RLIMIT_CORE: bang".to_owned()]);
+        let text = text(&out);
+        assert_eq!(text.matches("WARN").count(), 2, "{text}");
+        assert!(text.contains("process hardening incomplete: PR_SET_DUMPABLE: boom"), "{text}");
+        assert!(text.contains("process hardening incomplete: RLIMIT_CORE: bang"), "{text}");
+    }
+
+    #[test]
+    fn a_pinentry_that_fails_the_check_is_refused_with_the_reason() {
+        let trust = Trust::system().unwrap();
+        let why = verify_pinentry(&trust, "/nonexistent/bwss-test/pinentry").unwrap_err();
+        assert!(why.starts_with("pinentry /nonexistent/bwss-test/pinentry"), "{why}");
+    }
+
+    /// A daemon on a memory backend (password "pw"), unlocked, with no bus.
+    async fn unlocked_daemon() -> (Arc<Daemon>, Arc<MemoryBackend>) {
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, config::Config::default());
+        d.unlock_with_password("pw").await.unwrap();
+        (d, backend)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_backend_is_pulled_every_period_and_not_before() {
+        let (out, _guard) = capture_logs();
+        let (d, backend) = unlocked_daemon().await;
+        // A locked backend under an unlocked keyring makes every pull log a failure.
+        backend.lock().await;
+        let pulls = || text(&out).matches("refresh failed").count();
+        let task = spawn_sync(d, Duration::from_secs(100));
+        tokio::time::sleep(Duration::from_secs(99)).await;
+        assert_eq!(pulls(), 0, "the first pull is one period after the start, not at once");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(pulls(), 1);
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        assert_eq!(pulls(), 2);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_keyring_is_locked_at_the_next_check() {
+        let (d, _backend) = unlocked_daemon().await;
+        let task = spawn_idle_lock(d.clone(), Duration::ZERO, Duration::from_secs(30));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(!d.keyring.lock().await.is_unlocked());
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keyring_used_within_the_limit_stays_unlocked() {
+        let (d, _backend) = unlocked_daemon().await;
+        let task = spawn_idle_lock(d.clone(), Duration::from_secs(3600), Duration::from_secs(30));
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert!(d.keyring.lock().await.is_unlocked());
+        task.abort();
     }
 }

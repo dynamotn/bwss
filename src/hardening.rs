@@ -12,15 +12,36 @@ mod imp {
     use rustix::process::{DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit};
 
     pub fn harden() -> Vec<String> {
-        let mut failed = Vec::new();
-        if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
-            failed.push(format!("PR_SET_DUMPABLE: {e}"));
-        }
         let none = Rlimit { current: Some(0), maximum: Some(0) };
-        if let Err(e) = setrlimit(Resource::Core, none) {
-            failed.push(format!("RLIMIT_CORE: {e}"));
+        [
+            failure("PR_SET_DUMPABLE", set_dumpable_behavior(DumpableBehavior::NotDumpable)),
+            failure("RLIMIT_CORE", setrlimit(Resource::Core, none)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// What to log when the syscall `what` returned `result`; nothing on success.
+    fn failure(what: &str, result: Result<(), rustix::io::Errno>) -> Option<String> {
+        result.err().map(|e| format!("{what}: {e}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use rustix::io::Errno;
+
+        use super::*;
+
+        #[test]
+        fn a_failed_syscall_is_named_and_a_successful_one_is_silent() {
+            assert_eq!(failure("PR_SET_DUMPABLE", Ok(())), None);
+            assert_eq!(
+                failure("RLIMIT_CORE", Err(Errno::PERM)),
+                Some(format!("RLIMIT_CORE: {}", Errno::PERM)),
+                "the failure names the syscall and the errno"
+            );
         }
-        failed
     }
 }
 
