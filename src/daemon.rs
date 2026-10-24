@@ -80,6 +80,12 @@ impl From<BackendError> for SecretError {
     }
 }
 
+/// The keyring locked while a write was in flight. The backend has already
+/// stored the item, so the next unlock shows it.
+fn locked_during_write() -> SecretError {
+    SecretError::IsLocked("the keyring was locked during the write".into())
+}
+
 pub type SResult<T> = Result<T, SecretError>;
 
 /// The attributes an app set: derived ones (`bwss:*`, design §3.2) left out.
@@ -434,7 +440,9 @@ impl Daemon {
         }
         let path = op(&item_path(collection, &item.id));
         let r = (collection.to_owned(), item.id.clone());
-        self.keyring.lock().await.upsert(item);
+        if !self.keyring.lock().await.upsert(item) {
+            return Err(locked_during_write());
+        }
         let diff = if is_new {
             Diff { created: vec![r], ..Default::default() }
         } else {
@@ -457,7 +465,9 @@ impl Daemon {
             self.backend.put_item(&item).await?;
         }
         let r = (item.collection.clone(), item.id.clone());
-        self.keyring.lock().await.upsert(item);
+        if !self.keyring.lock().await.upsert(item) {
+            return Err(locked_during_write());
+        }
         self.publish(Diff { changed: vec![r], ..Default::default() }).await;
         self.touch();
         Ok(())
@@ -527,6 +537,117 @@ mod tests {
     use super::*;
 
     use crate::backend::memory::MemoryBackend;
+    use crate::model::{CollectionData, Snapshot};
+    use tokio::sync::Notify;
+
+    /// A memory backend whose `put_item` stops until the test lets it go.
+    struct GatedBackend {
+        inner: MemoryBackend,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for GatedBackend {
+        async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+            self.inner.unlock(password).await
+        }
+        async fn lock(&self) {
+            self.inner.lock().await;
+        }
+        async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
+            self.inner.refresh().await
+        }
+        async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+            self.inner.create_collection(label).await
+        }
+        async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
+            self.inner.delete_collection(id, items).await
+        }
+        async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+            // Stored, but the answer is held back until the test says so.
+            self.inner.put_item(item).await?;
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+            self.inner.delete_item(item).await
+        }
+        async fn describe(&self) -> String {
+            self.inner.describe().await
+        }
+    }
+
+    async fn gated_daemon(seed: Option<ItemData>) -> (Arc<Daemon>, Arc<GatedBackend>) {
+        let backend =
+            Arc::new(GatedBackend { inner: MemoryBackend::new("pw"), entered: Notify::new(), release: Notify::new() });
+        if let Some(item) = seed {
+            backend.inner.unlock("pw").await.unwrap();
+            backend.inner.put_item(&item).await.unwrap();
+        }
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None), backend.clone(), prompter, Config::default());
+        d.unlock_with_password("pw").await.unwrap();
+        (d, backend)
+    }
+
+    fn stored_item(id: &str) -> ItemData {
+        ItemData {
+            id: id.into(),
+            collection: LOGIN_COLLECTION.into(),
+            label: "l".into(),
+            attributes: Attributes::from([("k".to_owned(), "v".to_owned())]),
+            secret: Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 1,
+            acl: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_during_create_keeps_nothing_in_memory() {
+        let (d, backend) = gated_daemon(None).await;
+        let new = NewItem {
+            label: "l".into(),
+            attributes: Attributes::from([("k".to_owned(), "v".to_owned())]),
+            secret: Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            replace: false,
+        };
+        let task = tokio::spawn({
+            let d = d.clone();
+            async move { d.create_item(LOGIN_COLLECTION, new, "/usr/bin/x").await }
+        });
+        backend.entered.notified().await;
+        d.lock().await;
+        backend.release.notify_one();
+        assert!(matches!(task.await.unwrap(), Err(SecretError::IsLocked(_))));
+        let k = d.keyring.lock().await;
+        assert!(k.item_refs().is_empty());
+        assert!(!k.is_unlocked());
+        drop(k);
+        // The backend stored it, so the next unlock shows it.
+        d.unlock_with_password("pw").await.unwrap();
+        assert_eq!(d.keyring.lock().await.item_refs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lock_during_update_drops_the_item() {
+        let (d, backend) = gated_daemon(Some(stored_item("x"))).await;
+        let task = tokio::spawn({
+            let d = d.clone();
+            async move { d.update_item("x", |i| i.label = "new".into()).await }
+        });
+        backend.entered.notified().await;
+        d.lock().await;
+        backend.release.notify_one();
+        assert!(matches!(task.await.unwrap(), Err(SecretError::IsLocked(_))));
+        assert!(d.keyring.lock().await.item("x").is_none());
+        d.unlock_with_password("pw").await.unwrap();
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().label, "new");
+    }
 
     #[tokio::test]
     async fn replace_ignores_derived_attributes() {

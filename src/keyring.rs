@@ -225,9 +225,15 @@ impl Keyring {
         self.unlocked = false;
     }
 
-    pub fn upsert(&mut self, item: ItemData) {
+    /// Stores the item. While locked only the session collection takes
+    /// items; any other is dropped and `false` returned.
+    pub fn upsert(&mut self, item: ItemData) -> bool {
+        if self.collection_locked(&item.collection) {
+            return false;
+        }
         self.items.insert(item.id.clone(), item);
         self.save_index();
+        true
     }
 
     pub fn remove(&mut self, id: &str) -> Option<ItemData> {
@@ -380,6 +386,18 @@ mod tests {
         assert!(!k.item_locked("tmp"));
         assert_eq!(k.search(&q(&[("k", "v")]), None).0.len(), 1);
         k.load(Snapshot::default());
+        assert!(k.item("tmp").is_some());
+    }
+
+    #[test]
+    fn upsert_after_lock_keeps_nothing() {
+        let mut k = Keyring::new(None);
+        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[])] });
+        k.lock();
+        assert!(!k.upsert(item("late", "login", &[("k", "v")])));
+        assert!(k.item("late").is_none());
+        assert!(k.items.is_empty());
+        assert!(k.upsert(item("tmp", SESSION_COLLECTION, &[])));
         assert!(k.item("tmp").is_some());
     }
 }
