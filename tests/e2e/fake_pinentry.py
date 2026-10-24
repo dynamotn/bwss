@@ -4,15 +4,15 @@
 Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL, re-read on
 every run so tests can change it between prompts:
 
-    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny", "delay": 0}
+    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny", "release": "/path"}
 
 A confirmation is two CONFIRM questions in one conversation (allow?, then
 remember?), answered according to "confirm".
 
 "pins" is consumed one entry per GETPIN (the file is rewritten); an empty
-list cancels. "delay" waits that many seconds before answering a GETPIN, as
-a user taking their time would. Every command received is appended to
-$FAKE_PINENTRY_LOG.
+list cancels. With "release", a GETPIN is answered only once that file
+exists, as a user who takes their time would (the test creates it). Every
+command received is appended to $FAKE_PINENTRY_LOG.
 """
 
 import json
@@ -54,7 +54,11 @@ for raw in sys.stdin:
     # One log line per command, even when the text has line breaks.
     log(f"{cmd} {urllib.parse.unquote(arg)}".rstrip().replace("\n", " "))
     if cmd == "GETPIN":
-        time.sleep(load().get("delay", 0))
+        release = load().get("release")
+        for _ in range(600):
+            if not release or os.path.exists(release):
+                break
+            time.sleep(0.05)
         ctl = load()
         pins = ctl.get("pins", [])
         if not pins:

@@ -367,9 +367,19 @@ def _wait_until(check, tries=100):
     return False
 
 
+def _logged_departure(d, name):
+    """Whether the daemon log shows that `name` left and was dropped."""
+    import re
+
+    text = re.sub(r"\x1b\[[0-9;]*m", "", (d.home / "daemon.log").read_text())
+    owner = re.compile(rf"owner={re.escape(name)}(\s|$)")
+    return any("a client left the bus" in line and owner.search(line) for line in text.splitlines())
+
+
 def test_only_the_client_that_asked_may_start_its_prompt(memory_daemon, bus, other_bus):
     d = memory_daemon
-    d.pinentry(pins=[PASSWORD], delay=1)
+    release = d.home / "release-pinentry"
+    d.pinentry(pins=[PASSWORD], release=str(release))
     prompt = _call(bus, SVC, "org.freedesktop.Secret.Service", "Unlock", "ao", ([LOGIN],)).body[1]
     for member in ("Prompt", "Dismiss"):
         sig, body = ("s", ("",)) if member == "Prompt" else ("", ())
@@ -383,6 +393,7 @@ def test_only_the_client_that_asked_may_start_its_prompt(memory_daemon, bus, oth
     assert own.header.message_type.name == "method_return", own.body
     again = _call(bus, prompt, PROMPT_IFACE, "Prompt", "s", ("",))
     assert again.header.message_type.name == "error" and "already used" in again.body[0], again.body
+    release.touch()
     assert _wait_until(lambda: d.cli("status").stdout.startswith("unlocked"))
 
 
@@ -390,9 +401,11 @@ def test_a_started_prompt_is_cancelled_when_its_client_leaves(memory_daemon, bus
     import secretstorage as ss
 
     d = memory_daemon
-    # The user answers only after the client has gone.
-    d.pinentry(pins=[PASSWORD], delay=2)
+    # The user answers only after the daemon saw the client go.
+    release = d.home / "release-pinentry"
+    d.pinentry(pins=[PASSWORD], release=str(release))
     gone = ss.dbus_init()
+    name = gone.unique_name
     session = _open_plain(gone)
     props = {
         "org.freedesktop.Secret.Item.Label": ("s", "left behind"),
@@ -404,7 +417,10 @@ def test_a_started_prompt_is_cancelled_when_its_client_leaves(memory_daemon, bus
     assert item == "/" and prompt != "/", created.body
     started = _call(gone, prompt, PROMPT_IFACE, "Prompt", "s", ("",))
     assert started.header.message_type.name == "method_return", started.body
+    assert _wait_until(lambda: any(p.startswith("GETPIN") for p in d.prompts())), "the dialog is up"
     gone.close()
+    assert _wait_until(lambda: _logged_departure(d, name)), "the daemon dropped the client"
+    release.touch()
     # The password still unlocks the keyring, but the departed client's item
     # is never written.
     assert _wait_until(lambda: d.cli("status").stdout.startswith("unlocked"))

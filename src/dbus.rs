@@ -578,14 +578,25 @@ impl PromptObj {
     }
 }
 
-impl PromptObj {
-    fn check_owner(&self, owner: &str, header: &Header<'_>) -> Result<(), SecretError> {
-        if sender(header).as_deref() == Some(owner) {
-            Ok(())
-        } else {
-            Err(SecretError::AccessDenied("the prompt belongs to another client".into()))
-        }
+/// Whether `sender` may start or dismiss the prompt at `path`: only the bus
+/// name that asked for it, and only while it is tracked.
+fn may_control(prompts: &[PromptEntry], path: &str, sender: Option<&str>) -> Result<(), SecretError> {
+    match prompts.iter().find(|p| p.path == path) {
+        None => Err(SecretError::Failed("the prompt was dismissed".into())),
+        Some(p) if Some(p.owner.as_str()) == sender => Ok(()),
+        Some(_) => Err(SecretError::AccessDenied("the prompt belongs to another client".into())),
     }
+}
+
+/// Takes a started prompt's action to run it. `None` when it was dismissed,
+/// or when its client left the bus (`drop_owner` stops tracking the prompt
+/// before it drops the action): then nothing runs.
+fn claim_action(prompts: &std::sync::Mutex<Vec<PromptEntry>>, path: &str, slot: &ActionSlot) -> Option<PromptAction> {
+    // Under the prompts lock, so `drop_owner` either ran before (nothing
+    // runs) or after the action was claimed.
+    let prompts = lock(prompts);
+    let action = lock(slot).take();
+    action.filter(|_| prompts.iter().any(|p| p.path == path))
 }
 
 #[interface(name = "org.freedesktop.Secret.Prompt")]
@@ -598,7 +609,9 @@ impl PromptObj {
                 return Err(SecretError::Failed("the prompt was dismissed".into()));
             };
             // Prompt paths are predictable: only the client that asked may start it.
-            self.check_owner(&entry.owner, &header)?;
+            if Some(entry.owner.as_str()) != sender(&header).as_deref() {
+                return Err(SecretError::AccessDenied("the prompt belongs to another client".into()));
+            }
             let unused = lock(&self.action).as_ref().filter(|_| !entry.started).map(PromptAction::dismissed_result);
             let Some(dismissed) = unused else {
                 return Err(SecretError::Failed("the prompt was already used".into()));
@@ -615,7 +628,7 @@ impl PromptObj {
             let unlocked = daemon.unlock_interactive().await;
             // Gone when the prompt was dismissed meanwhile (which signalled)
             // or its client left the bus (nobody to tell): nothing runs.
-            let Some(action) = lock(&slot).take() else { return };
+            let Some(action) = claim_action(&daemon.prompts, &path, &slot) else { return };
             if !unlocked {
                 drop(action);
                 return PromptObj::finish(daemon, path, true, dismissed).await;
@@ -648,10 +661,7 @@ impl PromptObj {
     }
 
     async fn dismiss(&self, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
-        let owner = lock(&self.daemon.prompts).iter().find(|p| p.path == self.path).map(|p| p.owner.clone());
-        if let Some(owner) = owner {
-            self.check_owner(&owner, &header)?;
-        }
+        may_control(&lock(&self.daemon.prompts), &self.path, sender(&header).as_deref())?;
         if let Some(action) = lock(&self.action).take() {
             tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, action.dismissed_result()));
         }
@@ -751,4 +761,42 @@ async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, owner: &str) -> PromptEntry {
+        PromptEntry { seq: 1, path: path.into(), owner: owner.into(), started: true, registered: true }
+    }
+
+    fn slot() -> ActionSlot {
+        Arc::new(std::sync::Mutex::new(Some(PromptAction::CreateCollection { label: "x".into() })))
+    }
+
+    #[test]
+    fn only_the_owner_of_a_tracked_prompt_may_control_it() {
+        let prompts = [entry("/p1", ":1.1")];
+        assert!(may_control(&prompts, "/p1", Some(":1.1")).is_ok());
+        assert!(matches!(may_control(&prompts, "/p1", Some(":1.2")), Err(SecretError::AccessDenied(_))));
+        assert!(matches!(may_control(&prompts, "/p1", None), Err(SecretError::AccessDenied(_))));
+        // No longer tracked (finished, evicted, or its client left): nobody may.
+        assert!(may_control(&prompts, "/p2", Some(":1.1")).is_err());
+    }
+
+    #[test]
+    fn a_started_prompt_runs_only_while_it_is_tracked() {
+        let prompts = std::sync::Mutex::new(vec![entry("/p1", ":1.1")]);
+        let held = slot();
+        assert!(claim_action(&prompts, "/p1", &held).is_some());
+        assert!(claim_action(&prompts, "/p1", &held).is_none(), "taken once");
+
+        // The client left: `drop_owner` stopped tracking the prompt before
+        // `cancel` reached the action. The unlock returning now runs nothing.
+        let held = slot();
+        lock(&prompts).retain(|p| p.owner != ":1.1");
+        assert!(claim_action(&prompts, "/p1", &held).is_none());
+        assert!(lock(&held).is_none(), "and the action is dropped");
+    }
 }

@@ -231,14 +231,17 @@ fn ask_text(caller: &str, action: &str, label: &str, kind: CallerKind) -> String
         }
         CallerKind::App | CallerKind::Script => "",
     };
-    // The path comes from the caller's process: it must not add lines.
+    // The path comes from the caller's process and the label from whoever
+    // wrote the item: neither may add lines or reorder the text.
     let who = crate::prompter::one_line(&crate::acl::describe(caller));
+    let label = crate::prompter::one_line(label);
     format!("{who}\n\nwants to {action} the keyring item\n\n\"{label}\"{why}")
 }
 
 /// The text of the one-time question about a line that synced in.
 fn confirm_line_text(caller: &str, action: &str, label: &str) -> String {
     let caller = crate::prompter::one_line(&crate::acl::describe(caller));
+    let label = crate::prompter::one_line(label);
     format!(
         "Allow {caller}, granted on another device?\n\nIt wants to {action} the keyring item\n\n\"{label}\"\n\n\
          This is asked once on this device; a denial is remembered."
@@ -510,6 +513,7 @@ impl Daemon {
     /// password still being asked for may unlock the keyring, but nothing
     /// the client asked for runs.
     pub async fn drop_owner(&self, owner: &str) {
+        tracing::debug!(owner = %owner, "a client left the bus; dropping its sessions and prompts");
         self.identities.forget(owner);
         let sessions: Vec<String> = {
             let mut sessions = lock(&self.sessions);
@@ -1249,6 +1253,18 @@ mod tests {
             confirm_line_text("/usr/bin/git", "read", "l")
                 .starts_with("Allow /usr/bin/git, granted on another device?")
         );
+    }
+
+    #[test]
+    fn a_right_to_left_override_cannot_reorder_a_prompt() {
+        // Shown raw, U+202E would display "/home/u/bin/hs.gpj" as ".../jpg.sh".
+        let caller = "/home/u/bin/\u{202e}hs.gpj";
+        let label = "\u{202e}knab\u{2069} token\nfake line";
+        for text in [ask_text(caller, "read", label, CallerKind::App), confirm_line_text(caller, "read", label)] {
+            assert!(text.contains("/home/u/bin/\u{fffd}hs.gpj"), "{text:?}");
+            assert!(text.contains("\"\u{fffd}knab\u{fffd} token\u{fffd}fake line\""), "{text:?}");
+            assert!(!text.chars().any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')));
+        }
     }
 
     #[test]

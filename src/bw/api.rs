@@ -300,6 +300,31 @@ impl Api {
     }
 }
 
+/// What is reserved before the body arrives: the announced length, but at
+/// most 1 MiB, so a lying header cannot make bwss allocate the whole cap.
+fn initial_capacity(announced: Option<usize>) -> usize {
+    announced.unwrap_or(0).min(1024 * 1024)
+}
+
+/// The capacity to grow to when `need` bytes no longer fit in `capacity`:
+/// double, but never past `limit` (`need` is within it).
+fn grown_capacity(capacity: usize, need: usize, limit: usize) -> usize {
+    capacity.saturating_mul(2).min(limit).max(need)
+}
+
+/// Appends `chunk`. When the buffer must grow, the bytes move into a new
+/// buffer and the old one is wiped as it drops, so a reallocation never
+/// leaves an unwiped copy of the body behind.
+fn append_wiped(body: &mut Zeroizing<Vec<u8>>, chunk: &[u8], limit: usize) {
+    let need = body.len().saturating_add(chunk.len());
+    if need > body.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity(grown_capacity(body.capacity(), need, limit)));
+        grown.extend_from_slice(body);
+        *body = grown;
+    }
+    body.extend_from_slice(chunk);
+}
+
 /// The body of `res` as text, refused as soon as it is known to exceed
 /// `limit` bytes: from its announced length, or while the chunks arrive.
 async fn read_capped(mut res: reqwest::Response, limit: usize) -> Result<Zeroizing<String>, ApiError> {
@@ -308,13 +333,12 @@ async fn read_capped(mut res: reqwest::Response, limit: usize) -> Result<Zeroizi
     if announced.is_some_and(|n| n > limit) {
         return Err(too_large());
     }
-    // Reserved up front, so growing never leaves unwiped copies behind.
-    let mut body = Zeroizing::new(Vec::with_capacity(announced.unwrap_or(0)));
+    let mut body = Zeroizing::new(Vec::with_capacity(initial_capacity(announced)));
     while let Some(chunk) = res.chunk().await.map_err(|e| ApiError::Network(e.without_url().to_string()))? {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(too_large());
         }
-        body.extend_from_slice(&chunk);
+        append_wiped(&mut body, &chunk, limit);
     }
     Ok(match String::from_utf8(std::mem::take(&mut *body)) {
         Ok(text) => Zeroizing::new(text),
@@ -346,8 +370,9 @@ fn enc(segment: &str) -> String {
 }
 
 /// `text` without control characters: ANSI escape sequences (CSI, OSC and
-/// the other string controls, two-byte escapes) are dropped whole, and every
-/// other C0 or C1 control becomes a space.
+/// the other string controls, two-byte escapes) are dropped whole, every
+/// other C0 or C1 control and the line separators become a space, and
+/// invisible format characters (`prompter::is_invisible`) are dropped.
 fn strip_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -374,19 +399,29 @@ fn strip_controls(text: &str) -> String {
     };
     while let Some(c) = chars.next() {
         match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => skip_csi(&mut chars),
-                Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut chars),
-                // Intermediate bytes, then one final byte (`ESC ( B`).
-                Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
-                    while chars.next_if(|c| ('\u{20}'..='\u{2f}').contains(c)).is_some() {}
+            '\u{1b}' => match chars.peek() {
+                Some('[') => {
                     chars.next();
+                    skip_csi(&mut chars);
                 }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    skip_string(&mut chars);
+                }
+                // Intermediate bytes, then one final byte (`ESC ( B`), or a
+                // final byte alone (`ESC c`).
+                Some('\u{20}'..='\u{7e}') => {
+                    while chars.next_if(|c| ('\u{20}'..='\u{2f}').contains(c)).is_some() {}
+                    chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+                }
+                // A lone ESC: only it goes, what follows is text.
                 _ => {}
             },
             '\u{9b}' => skip_csi(&mut chars),
             '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
-            c if c.is_control() => out.push(' '),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => out.push(' '),
+            // Zero width, so dropped: bidi overrides cannot reorder the text.
+            c if crate::prompter::is_invisible(c) => {}
             c => out.push(c),
         }
     }
@@ -501,6 +536,12 @@ mod tests {
             "message": "bad\u{1b}[31mred\u{1b}[0m\nnext\u{7} \u{9b}2Jx \u{1b}]0;title\u{7}end \u{1b}(Bok\u{85}\u{1b}"
         });
         assert_eq!(describe_error(&body), "badred next x end ok");
+        // Invisible format characters go too: bidi overrides cannot reorder it.
+        let bidi = json!({ "message": "use\u{202e}gnorw\u{202c} \u{200b}x\u{feff}y\u{ad}z\u{2066}!\u{2069}" });
+        assert_eq!(describe_error(&bidi), "usegnorw xyz!");
+        // A lone ESC goes alone: what follows it is not a sequence.
+        let lone = json!({ "message": "a\u{1b}ébc \u{1b}\u{1b}[1mx \u{1b}\nz" });
+        assert_eq!(describe_error(&lone), "aébc x z");
         // Control strings end at ST, as `ESC \` or as C1, or at the end of the text.
         let strings = json!({ "message": "a\u{1b}P1q\u{1b}\\b \u{9d}x\u{9c}c \u{90}dcs\u{7}d \u{1b}]never" });
         assert_eq!(describe_error(&strings), "ab c d");
@@ -543,6 +584,23 @@ mod tests {
         let mut api = Api::new(resolve_server_urls(url).unwrap(), "d".into()).unwrap();
         api.body_limit = limit;
         api.prelogin("a@b.c").await
+    }
+
+    #[test]
+    fn the_body_buffer_is_reserved_modestly_and_grown_into_wiped_copies() {
+        assert_eq!(initial_capacity(None), 0);
+        assert_eq!(initial_capacity(Some(10)), 10);
+        assert_eq!(initial_capacity(Some(MAX_BODY)), 1024 * 1024, "a claimed length reserves at most 1 MiB");
+        // Doubling, never past the cap, never below what is needed.
+        assert_eq!(grown_capacity(0, 10, 100), 10);
+        assert_eq!(grown_capacity(64, 65, 1000), 128);
+        assert_eq!(grown_capacity(64, 65, 100), 100);
+        let mut body = Zeroizing::new(Vec::with_capacity(initial_capacity(Some(4))));
+        for chunk in [&b"abcd"[..], b"efgh", b"ijklmnop", b"q"] {
+            append_wiped(&mut body, chunk, 100);
+            assert!(body.capacity() <= 100);
+        }
+        assert_eq!(body.as_slice(), b"abcdefghijklmnopq");
     }
 
     #[tokio::test]

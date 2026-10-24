@@ -915,8 +915,8 @@ boundary for `--password-stdin`.
 | API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
 | Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a program the user cannot replace or one under bwss's own prefix (§10); bwss refuses to run as root |
 | Disk | Bitwarden ciphertext only (cache, queue under its own derived key after a one-time migration, ACL confirmations); hashed locked index without derived attributes unless this device opted in (§7) |
-| Server input | KDF bounds, MAC checked before decrypt, response bodies capped at 256 MiB while they are read, error text stripped of control characters (ANSI escapes included) and clipped |
-| Prompt text | The caller's path is shown on one line: line breaks and other control characters become U+FFFD |
+| Server input | KDF bounds, MAC checked before decrypt, response bodies capped at 256 MiB while they are read, error text stripped of control characters (ANSI escapes included) and invisible format characters, then clipped |
+| Prompt text | The caller's path and the item label are shown on one line: line breaks, other control characters and invisible format characters (category Cf, bidi overrides and isolates included, and U+2028/U+2029) become U+FFFD |
 
 Notes:
 

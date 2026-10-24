@@ -258,7 +258,9 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 - Offline writes are queued under a key of their own, derived from your
   vault key. Server answers are capped at 256 MiB, and server error text
   is stripped of control characters before it is shown or logged. An
-  application's path in a pinentry prompt is shown on one line.
+  application's path and an item's label in a pinentry prompt are shown on
+  one line, with control and invisible bidi characters replaced, so they
+  cannot add or reorder text.
 - Only the `bwss` CLI itself may send the master password to the daemon
   (`Control1.UnlockWithPassword`); any other executable is refused.
 - The config file may be synced with your dotfiles, so nothing in it can

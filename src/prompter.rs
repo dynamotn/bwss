@@ -60,10 +60,46 @@ struct Conversation {
     stdout: BufReader<ChildStdout>,
 }
 
-/// `s` on one line for a prompt: line breaks and every other control
-/// character become U+FFFD, so a file name cannot add text of its own.
+/// Characters that are not controls but still change what text looks like:
+/// the line and paragraph separators (U+2028, U+2029) and every character of
+/// general category Cf (Unicode 15.1), which std cannot query: soft hyphen,
+/// Arabic and Syriac marks, ZWSP/ZWNJ/ZWJ, LRM/RLM/ALM, the bidi embeddings,
+/// overrides and isolates, invisible operators, BOM, interlinear
+/// annotation, a few script-specific format marks, and the tag characters.
+const INVISIBLE: &[(char, char)] = &[
+    ('\u{ad}', '\u{ad}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61c}', '\u{61c}'),
+    ('\u{6dd}', '\u{6dd}'),
+    ('\u{70f}', '\u{70f}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8e2}', '\u{8e2}'),
+    ('\u{180e}', '\u{180e}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{2028}', '\u{202e}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{fff9}', '\u{fffb}'),
+    ('\u{110bd}', '\u{110bd}'),
+    ('\u{110cd}', '\u{110cd}'),
+    ('\u{13430}', '\u{1343f}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0001}', '\u{e0001}'),
+    ('\u{e0020}', '\u{e007f}'),
+];
+
+/// Whether `c` is in [`INVISIBLE`].
+pub fn is_invisible(c: char) -> bool {
+    INVISIBLE.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
+}
+
+/// `s` on one line for a prompt: line breaks, every other control character
+/// and every invisible format character (bidi overrides included) become
+/// U+FFFD, so a file name or a label cannot add or reorder text.
 pub fn one_line(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { '\u{fffd}' } else { c }).collect()
+    s.chars().map(|c| if c.is_control() || is_invisible(c) { '\u{fffd}' } else { c }).collect()
 }
 
 fn escape(s: &str) -> String {
@@ -271,6 +307,53 @@ mod tests {
             "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e\u{fffd}f\u{fffd}g\u{fffd}h\u{fffd}i"
         );
         assert_eq!(one_line("naïve ✓"), "naïve ✓");
+    }
+
+    /// Every character the review named, plus the rest of category Cf.
+    const INVISIBLE: &[char] = &[
+        '\u{ad}',
+        '\u{61c}',
+        '\u{200b}',
+        '\u{200c}',
+        '\u{200d}',
+        '\u{200e}',
+        '\u{200f}',
+        '\u{202a}',
+        '\u{202b}',
+        '\u{202c}',
+        '\u{202d}',
+        '\u{202e}',
+        '\u{2060}',
+        '\u{2061}',
+        '\u{2062}',
+        '\u{2063}',
+        '\u{2064}',
+        '\u{2066}',
+        '\u{2067}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{feff}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{600}',
+        '\u{6dd}',
+        '\u{180e}',
+        '\u{206f}',
+        '\u{fffb}',
+        '\u{110bd}',
+        '\u{e0001}',
+        '\u{e007f}',
+    ];
+
+    #[test]
+    fn one_line_replaces_bidi_and_other_invisible_format_characters() {
+        for &c in INVISIBLE {
+            assert_eq!(one_line(&format!("a{c}b")), "a\u{fffd}b", "U+{:04X}", u32::from(c));
+            assert!(is_invisible(c), "U+{:04X}", u32::from(c));
+        }
+        for c in ['a', ' ', 'é', '\u{2010}', '\u{2070}', '\u{fffd}', '\u{e0080}'] {
+            assert!(!is_invisible(c), "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]
