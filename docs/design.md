@@ -388,7 +388,7 @@ MarkedItem {
   collection, label, attributes   // explicit bwss:attr:* + derived
   secret: Zeroizing<Vec<u8>>, content_type
   secret_source: Field | BwssNotes | NoteBody | LoginPassword
-  secret_mark                     // keyed fingerprint of the stored value
+  secret_mark                     // keyed fingerprint of the decrypted value
   acl: Vec<String>, created, modified
 }
 duplicates: Vec<(id, cipher_ids)>
@@ -396,10 +396,16 @@ registry: BTreeMap<collection id, { label, created, deleted }>
 ```
 
 `secret_source` records the value source (§3.2), so a write knows which
-part it may replace. `secret_mark` is HMAC-SHA256 of the stored value under
-a key derived from the user key (HKDF, purpose `value-mark`), so a retry
-can tell whether the value source changed on the server (§5.6) without
-keeping a second copy of the value (spec §10). A per-cipher scan cache keyed by
+part it may replace. `secret_mark` is HMAC-SHA256 of
+`bwss:id ‖ 0x00 ‖ text` under a key derived from the user key (HKDF,
+purpose `value-mark`), where `text` is the value source's **decrypted**
+text before any base64 decoding; the Obsidian plugin computes its mark the
+same way. A retry can then tell whether the value source changed on the
+server (§5.6) without keeping a second copy of the value (spec §10).
+The mark is never taken over ciphertext: official clients re-encrypt every
+value with a fresh IV on any save, so an unchanged value would look
+changed. The id keeps two items holding the same secret from sharing a
+mark. A per-cipher scan cache keyed by
 `(cipher_id, revision_date)` remembers "unmarked" for ciphers that have not
 changed, so a refresh only decrypts field names of changed ciphers.
 
@@ -413,29 +419,37 @@ bwss's own parts of one item, never as a whole item body:
 ```
 Op =
   | Create  { id, collection, body }            // the full new secure note
-  | Patch   { id, base_revision,
+  | Patch   { id, base_revision, cipher_id?,
               set: [(field, value, hidden)],    // bwss fields to write
               remove: [field],                  // bwss fields to drop
+              acl_add: [line],                  // merged as a union
               value: Keep                       // or write the value source:
-                   | Set { source, value, base_mark } // §5.2; base_mark
-                                                // detects a changed source
-                   | ClearBwssNotes }           // delete, bwss:location=notes
-  | Delete  { id, base_revision }               // §5.4, decided on replay
+                   | Set { source, value, base_mark, owned } }
+                                                // §5.2; base_mark detects a
+                                                // changed source; owned: an
+                                                // earlier binary write made
+                                                // bwss:password the source
+  | Delete  { id, base_revision, cipher_id? }   // §5.4, decided on replay
   | Registry{ collection, entry }               // merged, §4
 ```
 
 An op names its item by `id`, not by cipher id, because a queued create
-has no cipher id yet. The cipher id is looked up when the op runs.
+has no cipher id yet. The cipher id is looked up when the op runs. The
+optional `cipher_id` on `Patch` and `Delete` records the cipher the op was
+read from, as a hint only: when the item cannot be found by `id`, the op
+waits only while *that* cipher is still there but cannot be read right now,
+and is dropped as gone otherwise. One unreadable item elsewhere in the
+vault can therefore never hold up the queue. Ops written without it keep
+the older behaviour.
 
 **Write queue** (`~/.local/state/bwss/queue.json`, mode 0600). The ordered
-list of ops not yet accepted by the server. Field names, field values,
-ids, labels and values are stored as EncStrings under the user key; only
-op kinds, value-source kinds, marks, cipher ids (already plain in the
-cache) and revision dates are plain. The queue, the cache and the locked
+list of ops not yet accepted by the server, sealed as a whole: the file is
+`{ "format": 2, "ops": "<EncString>" }`, one EncString under the user key
+holding every op with its ids, fields, values, marks, cipher ids and
+revision dates. Only `format` is plain. The queue, the cache and the locked
 index are device state (spec §10): they are never synced or copied to
-another device. A
-queued op is applied to the cache right away, so reads on this device see
-it before the server does.
+another device. A queued op is applied to the cache right away, so reads on
+this device see it before the server does.
 
 **Locked index** (`~/.cache/bwss/locked-index.json`), as in §7.
 
