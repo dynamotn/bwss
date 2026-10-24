@@ -101,7 +101,7 @@ flowchart TB
 | Collection `session` | memory only; never stored, never locked |
 | Item | a **login** item (secure notes made by other clients are also read) |
 | Label | item name |
-| Secret | `login.password`. Base64 plus `bwss:encoding=base64` when the bytes are not UTF-8. It moves to `notes` (with `bwss:location=notes`) when its encrypted form exceeds the 5,000-character password limit, and is refused above the 10,000-character notes limit. |
+| Secret | `login.password`. Base64 plus `bwss:encoding=base64` when the bytes are not UTF-8. It moves to `notes` (with `bwss:location=notes`) when its encrypted form exceeds the 5,000-character password limit, and is refused above the 10,000-character notes limit. A non-empty custom field `bwss:password`, which the user adds (to a vault item, say), takes precedence over all of these; edits then write the secret back into that field and leave the login password, the notes and the password history alone. |
 | Attributes | text fields `bwss:attr:<name>` |
 | Bookkeeping | `bwss:id` (stable id shared by all devices), `bwss:content-type`, `bwss:acl` (hidden field), `bwss:created` |
 | Collection `vault` (`whole_vault = true`) | every other personal login and secure note, in any folder or none; read-only |

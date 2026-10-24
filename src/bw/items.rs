@@ -23,6 +23,9 @@ pub const F_CREATED: &str = "bwss:created";
 /// Set by the user on a vault item outside the keyring folders: the
 /// collection it shows up in, instead of `vault`.
 pub const F_COLLECTION: &str = "bwss:collection";
+/// Set by the user on any item: when not empty, the secret is this field
+/// rather than the login password or the notes, and edits write it back here.
+pub const F_PASSWORD: &str = "bwss:password";
 
 /// Searchable attributes of items outside the keyring folders (`whole_vault`).
 pub const A_NAME: &str = "bwss:name";
@@ -103,9 +106,14 @@ pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Resu
             attributes.insert(attr.to_owned(), value.to_string());
         }
     }
-    let in_notes = get(F_LOCATION).as_deref() == Some("notes") || ty == TYPE_SECURE_NOTE;
-    let raw = if in_notes { cipher.get("notes") } else { cipher.pointer("/login/password") };
-    let text = dec(raw, &key)?.unwrap_or_default();
+    let text = match get(F_PASSWORD).filter(|p| !p.is_empty()) {
+        Some(p) => Zeroizing::new(p),
+        None => {
+            let in_notes = get(F_LOCATION).as_deref() == Some("notes") || ty == TYPE_SECURE_NOTE;
+            let raw = if in_notes { cipher.get("notes") } else { cipher.pointer("/login/password") };
+            dec(raw, &key)?.unwrap_or_default()
+        }
+    };
     let secret = if get(F_ENCODING).as_deref() == Some("base64") {
         Zeroizing::new(B64.decode(text.as_bytes()).map_err(|_| CryptoError::Decrypt)?)
     } else {
@@ -196,8 +204,10 @@ pub fn encode(
 
     // Keep other clients' fields; rewrite ours.
     let mut out_fields: Vec<Value> = Vec::new();
+    let mut in_field = false;
     if let Some(c) = existing {
         let decrypted = fields(c, &key)?;
+        in_field = decrypted.iter().any(|(n, v)| n == F_PASSWORD && !v.is_empty());
         let raw = c.get("fields").and_then(Value::as_array).cloned().unwrap_or_default();
         for ((name, _), f) in decrypted.iter().zip(raw) {
             if !name.starts_with(PREFIX) {
@@ -231,6 +241,14 @@ pub fn encode(
     }
     let enc_secret = if text.is_empty() { None } else { Some(key.encrypt_str(&text)) };
     let len = enc_secret.as_ref().map_or(0, String::len);
+    if in_field {
+        // The user keeps this secret in bwss:password: leave the login and the notes alone.
+        if len > MAX_PASSWORD_ENC {
+            return Err(MapError::TooLarge);
+        }
+        add(F_PASSWORD, &text, FIELD_HIDDEN);
+        return Ok(finish(body, out_fields, item, existing, &key, ty, folder_id));
+    }
     let in_notes = ty == TYPE_SECURE_NOTE || len > MAX_PASSWORD_ENC;
     if len > MAX_NOTES_ENC {
         return Err(MapError::TooLarge);
@@ -267,11 +285,24 @@ pub fn encode(
         body.entry("passwordHistory").or_insert(Value::Null);
     }
 
+    Ok(finish(body, out_fields, item, existing, &key, ty, folder_id))
+}
+
+/// The properties every write carries, whichever field holds the secret.
+fn finish(
+    mut body: Map<String, Value>,
+    fields: Vec<Value>,
+    item: &ItemData,
+    existing: Option<&Value>,
+    key: &SymmetricKey,
+    ty: u64,
+    folder_id: &str,
+) -> Map<String, Value> {
     body.insert("type".into(), json!(ty));
     body.insert("folderId".into(), json!(folder_id));
     body.insert("organizationId".into(), Value::Null);
     body.insert("name".into(), json!(key.encrypt_str(&item.label)));
-    body.insert("fields".into(), Value::Array(out_fields));
+    body.insert("fields".into(), Value::Array(fields));
     body.entry("favorite").or_insert(json!(false));
     body.entry("reprompt").or_insert(json!(0));
     body.entry("key").or_insert(Value::Null);
@@ -279,7 +310,7 @@ pub fn encode(
     if let Some(rev) = existing.and_then(|c| c.get("revisionDate")) {
         body.insert("lastKnownRevisionDate".into(), rev.clone());
     }
-    Ok(body)
+    body
 }
 
 #[cfg(test)]
@@ -403,6 +434,34 @@ mod tests {
         let field = json!({ "type": 0, "name": key.encrypt_str(F_COLLECTION), "value": key.encrypt_str(" Work ") });
         let placed = json!({ "id": "p", "type": 2, "name": key.encrypt_str("N"), "fields": [field] });
         assert_eq!(requested_collection(&placed, &key).unwrap().as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn bwss_password_field_wins_and_is_written_back() {
+        let key = SymmetricKey::generate();
+        let field = |n: &str, v: &str| json!({ "type": 1, "name": key.encrypt_str(n), "value": key.encrypt_str(v) });
+        let mut cipher = json!({
+            "id": "p", "type": 1, "name": key.encrypt_str("Router"), "revisionDate": "",
+            "login": { "password": key.encrypt_str("web-ui"), "username": key.encrypt_str("admin") },
+            "notes": key.encrypt_str("n"), "fields": [field(F_PASSWORD, "wifi-psk")]
+        });
+        let it = decode(&cipher, &key, "login").unwrap();
+        assert_eq!(&*it.secret, b"wifi-psk");
+
+        let mut edited = it.clone();
+        edited.secret = Zeroizing::new(b"new-psk".to_vec());
+        let body = encode(&edited, Some(&cipher), &key, "f").unwrap();
+        assert_eq!(body["login"], cipher["login"]);
+        assert_eq!(body["notes"], cipher["notes"]);
+        assert!(!body.contains_key("passwordHistory"));
+        let back = as_server(body, "p");
+        assert_eq!(&*decode(&back, &key, "login").unwrap().secret, b"new-psk");
+        let names: Vec<_> = fields(&back, &key).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names.iter().filter(|n| *n == F_PASSWORD).count(), 1);
+
+        // An empty bwss:password does not count.
+        cipher["fields"] = json!([field(F_PASSWORD, "")]);
+        assert_eq!(&*decode(&cipher, &key, "login").unwrap().secret, b"web-ui");
     }
 
     #[test]

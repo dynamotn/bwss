@@ -221,3 +221,21 @@ def test_vault_items_can_choose_their_collection(account):
         assert account.items(f"{FOLDER}/projects")["fresh"]["password"] == "new"
     finally:
         d.stop()
+
+
+def test_bwss_password_field_is_the_secret(account):
+    account.add_login("Personal", "Router", "web-ui", {"bwss:password": "wifi-psk"})
+    c = account.add_login(FOLDER, "Kept", "login-pw", {"bwss:attr:svc": "kept", "bwss:password": "field-pw"})
+    d = bitwarden_daemon(account, whole_vault=True).start()
+    try:
+        unlock(d, account)
+        assert d.tool("lookup", "bwss:name", "Router").stdout == "wifi-psk"
+        assert d.tool("lookup", "svc", "kept").stdout == "field-pw"
+        # A rotation lands in the field; the login password stays as it was.
+        d.tool("store", "--label=Kept", "svc", "kept", input="rotated")
+        kept = account.items(FOLDER)["Kept"]
+        assert kept["fields"]["bwss:password"] == "rotated"
+        assert kept["password"] == "login-pw"
+        assert kept["id"] == c["id"]
+    finally:
+        d.stop()

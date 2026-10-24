@@ -94,7 +94,7 @@ flowchart LR
 | default collection (`login`, alias `default`) | folder **`secret-service`** |
 | collection "Work" | folder `secret-service/Work` |
 | item label | item name |
-| secret | login password (notes for very large secrets; base64 for binary data) |
+| secret | login password (notes for very large secrets; base64 for binary data), or a custom field `bwss:password` when you add one |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
 | `vault` collection (with `whole_vault = true`) | every other personal item, read-only |
