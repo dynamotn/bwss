@@ -135,7 +135,10 @@ impl Api {
     }
 
     /// Sends a request and returns the body text of a 2xx answer.
-    async fn send_text(&self, req: reqwest::RequestBuilder) -> Result<String, ApiError> {
+    ///
+    /// The body is wrapped in `Zeroizing` at once because the login answer
+    /// carries the access token.
+    async fn send_text(&self, req: reqwest::RequestBuilder) -> Result<Zeroizing<String>, ApiError> {
         let res = req
             .header("Bitwarden-Client-Name", CLIENT_NAME)
             .header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"))
@@ -144,7 +147,7 @@ impl Api {
             .await
             .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
         let status = res.status().as_u16();
-        let text = res.text().await.map_err(|e| ApiError::Network(e.without_url().to_string()))?;
+        let text = Zeroizing::new(res.text().await.map_err(|e| ApiError::Network(e.without_url().to_string()))?);
         if !(200..300).contains(&status) {
             return Err(ApiError::Http { status, message: describe_error(&parse_body(&text)) });
         }
@@ -173,6 +176,10 @@ impl Api {
 
     /// Logs in with a personal API key. It authenticates only; decrypting
     /// still needs the master password.
+    ///
+    /// Known limitation: reqwest copies the client secret (form body) and
+    /// the access token (Authorization header) into its own buffers, which
+    /// bwss cannot wipe.
     pub async fn login(&mut self, key: &ApiKey) -> Result<(), ApiError> {
         let form = [
             ("grant_type", "client_credentials"),
@@ -183,13 +190,9 @@ impl Api {
             ("deviceIdentifier", self.device_id.as_str()),
             ("deviceName", "bwss"),
         ];
-        let body = self.send(self.http.post(format!("{}/connect/token", self.urls.identity)).form(&form)).await?;
-        let token = body
-            .get("access_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ApiError::Protocol("no access token".into()))?;
-        let ttl = body.get("expires_in").and_then(Value::as_u64).unwrap_or(3600).saturating_sub(60).max(60);
-        self.token = Some((Zeroizing::new(token.to_owned()), Instant::now() + Duration::from_secs(ttl)));
+        let text = self.send_text(self.http.post(format!("{}/connect/token", self.urls.identity)).form(&form)).await?;
+        let (token, ttl) = parse_token_response(&text)?;
+        self.token = Some((token, Instant::now() + Duration::from_secs(ttl)));
         Ok(())
     }
 
@@ -268,6 +271,18 @@ impl Api {
     }
 }
 
+/// Reads the token answer straight into wiped storage; returns the token
+/// and the seconds it stays usable (with a safety margin).
+fn parse_token_response(text: &str) -> Result<(Zeroizing<String>, u64), ApiError> {
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: Zeroizing<String>,
+        expires_in: Option<u64>,
+    }
+    let r: TokenResponse = serde_json::from_str(text).map_err(|_| ApiError::Protocol("no access token".into()))?;
+    Ok((r.access_token, r.expires_in.unwrap_or(3600).saturating_sub(60).max(60)))
+}
+
 fn parse_body(text: &str) -> Value {
     if text.is_empty() { Value::Null } else { serde_json::from_str(text).map(normalize_keys).unwrap_or(Value::Null) }
 }
@@ -294,6 +309,19 @@ fn describe_error(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_response_yields_token_and_ttl() {
+        let (t, ttl) = parse_token_response(r#"{"access_token":"tok","expires_in":3600,"x":1}"#).unwrap();
+        assert_eq!(t.as_str(), "tok");
+        assert_eq!(ttl, 3540);
+        let (_, ttl) = parse_token_response(r#"{"access_token":"tok"}"#).unwrap();
+        assert_eq!(ttl, 3540);
+        let (_, ttl) = parse_token_response(r#"{"access_token":"tok","expires_in":10}"#).unwrap();
+        assert_eq!(ttl, 60);
+        assert!(matches!(parse_token_response(r#"{"expires_in":1}"#), Err(ApiError::Protocol(_))));
+        assert!(matches!(parse_token_response("not json"), Err(ApiError::Protocol(_))));
+    }
 
     #[test]
     fn api_key_debug_is_redacted() {

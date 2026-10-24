@@ -39,10 +39,10 @@ fn prime() -> BigUint {
     BigUint::parse_bytes(PRIME_HEX.as_bytes(), 16).expect("valid prime")
 }
 
-// Known limitation: `num-bigint` cannot zeroize. The DH private exponent
-// and the shared secret live in `BigUint` values that are freed unwiped, and
-// `BigUint::modpow` makes further unwiped temporaries. Only the byte buffers
-// built here, and the derived AES key, are wiped.
+/// Known limitation: `num-bigint` cannot zeroize. The DH private exponent
+/// and the shared secret live in `BigUint` values that are freed unwiped, and
+/// `BigUint::modpow` makes further unwiped temporaries. Only the byte buffers
+/// built here, and the derived AES key, are wiped.
 fn to_fixed(n: &BigUint) -> Zeroizing<Vec<u8>> {
     let b = Zeroizing::new(n.to_bytes_be());
     let mut out = Zeroizing::new(vec![0u8; KEY_BYTES.saturating_sub(b.len())]);
