@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use super::crypto::{CryptoError, SymmetricKey, value_mark};
 use super::fields::{
     A_ID, A_NAME, A_URI, A_USERNAME, F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_LABEL,
-    F_LOCATION, F_PASSWORD, field_names, field_value, first_index,
+    F_LOCATION, F_PASSWORD, Location, field_names, field_value, first_index,
 };
 use super::items::{item_key, parse_date};
 use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION};
@@ -136,10 +136,10 @@ fn read_marked(
     let location = field(F_LOCATION)?;
     // Only the value `notes` is a mark; an empty or blank one counts as
     // absent (spec §5, §6.4, ADR 0010).
-    let in_notes = match location.as_deref().map(|l| l.trim()) {
-        None | Some("") => false,
-        Some("notes") => true,
-        Some(_) => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_LOCATION}"))),
+    let in_notes = match Location::classify(location.as_deref().map(String::as_str)) {
+        Location::Absent => false,
+        Location::Notes => true,
+        Location::Unknown => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_LOCATION}"))),
     };
     let encoding = field(F_ENCODING)?;
     let base64 = match encoding.as_deref().map(String::as_str) {
@@ -461,6 +461,11 @@ mod tests {
             let c = login(&k, &[id.clone(), f("bwss:location", blank)], Some("pw"), Some("mine"));
             let m = marked(scan(&c, &k));
             assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::LoginPassword, b"pw".as_slice()));
+        }
+        // the mark is the exact value "notes": anything else is unknown
+        for odd in [" notes ", "notes\n", "Notes"] {
+            let c = login(&k, &[id.clone(), f("bwss:location", odd)], Some("pw"), Some("mine"));
+            assert!(matches!(scan(&c, &k), Scan::Skipped(_)), "{odd:?}");
         }
         // undecryptable field names -> Uninspectable
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);

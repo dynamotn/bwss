@@ -11,8 +11,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
-    F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, F_PASSWORD, PREFIX,
-    field_names,
+    F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, F_PASSWORD, Location,
+    PREFIX, field_names,
 };
 use super::items::{MAX_NOTES_ENC, MAX_PASSWORD_ENC, RESPONSE_ONLY, format_date, item_key};
 use super::scan::{Keys, Scan, ValueSource, normalize_collection, scan};
@@ -120,6 +120,13 @@ impl<'k> Fields<'k> {
         }
     }
 
+    /// Whether the first `bwss:location` is exactly `notes` (the one
+    /// classification scan, write and delete share).
+    fn is_notes_marked(&self) -> Result<bool, CryptoError> {
+        let value = self.value(F_LOCATION)?;
+        Ok(Location::classify(value.as_deref().map(String::as_str)) == Location::Notes)
+    }
+
     /// Sets the first field called `name` to an already encrypted value,
     /// keeping its kind; appends a field when there is none.
     fn set_enc(&mut self, name: &str, enc: String, hidden: bool) {
@@ -189,14 +196,14 @@ fn now_rfc3339() -> String {
 /// and the notes are empty or already bwss's (design §5.2).
 fn write_owned_field(body: &mut Map<String, Value>, fields: &mut Fields, stored: &str) -> Result<(), WriteError> {
     let enc = fields.key.encrypt_str(stored);
-    let bwss_notes = fields.value(F_LOCATION)?.is_some_and(|l| l.as_str() == "notes");
+    let bwss_notes = fields.is_notes_marked()?;
     if enc.len() <= MAX_FIELD_ENC {
         fields.set_enc(F_PASSWORD, enc, true);
         // The notes held an older copy of the secret (spec §6.4, ADR 0010):
         // clear it and its mark in the same write.
         if bwss_notes {
             body.insert("notes".into(), Value::Null);
-            fields.remove_all(F_LOCATION);
+            fields.remove_first(F_LOCATION);
         }
         return Ok(());
     }
@@ -386,7 +393,7 @@ pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteErr
     let mut body = pass_through(object);
     let key = item_key(cipher, &keys.user)?;
     let mut fields = Fields::read(cipher, &key)?;
-    if fields.value(F_LOCATION)?.is_some_and(|l| l.as_str() == "notes") {
+    if fields.is_notes_marked()? {
         body.insert("notes".into(), Value::Null);
     }
     fields.remove_prefix(PREFIX);
@@ -874,6 +881,35 @@ mod tests {
         let c = login(&k, &[id, pw], None, Some("mine"));
         let body = apply(&c, &set_secret(&c, &k, &small), &k).unwrap();
         assert_eq!(dec_with(&k.user, &body["notes"]), "mine");
+    }
+
+    #[test]
+    fn clearing_the_mark_removes_only_the_first_location() {
+        let k = keys();
+        let c = login(
+            &k,
+            &[
+                ("bwss:id", "x", false),
+                ("bwss:password", "old", true),
+                ("bwss:location", "notes", false),
+                ("bwss:location", " ", false),
+            ],
+            None,
+            Some("stale"),
+        );
+        let body = apply(&c, &set_secret(&c, &k, b"short"), &k).unwrap();
+        assert!(body["notes"].is_null());
+        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:password", "bwss:location"]);
+        assert_eq!(field(&body, &k.user, "bwss:location"), Some((" ".into(), 0)));
+    }
+
+    #[test]
+    fn only_the_exact_notes_mark_lets_strip_clear_the_notes() {
+        let k = keys();
+        for odd in [" notes ", "notes\n", "Notes", ""] {
+            let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", odd, false)], Some("mine"));
+            assert_eq!(strip(&c, &k).unwrap()["notes"], c["notes"], "{odd:?}");
+        }
     }
 
     #[test]

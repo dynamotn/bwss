@@ -28,6 +28,28 @@ pub const A_URI: &str = "bwss:uri";
 /// opted in (`bwss index derived on`).
 pub const DERIVED: [&str; 4] = [A_ID, A_NAME, A_USERNAME, A_URI];
 
+/// What the first `bwss:location` field says (spec §6.4, ADR 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Location {
+    /// No field, or a value empty or blank after trimming.
+    Absent,
+    /// Exactly `notes`: the notes hold bwss's secret.
+    Notes,
+    /// Any other value, which this version does not know.
+    Unknown,
+}
+
+impl Location {
+    pub fn classify(value: Option<&str>) -> Self {
+        match value {
+            Some("notes") => Self::Notes,
+            None => Self::Absent,
+            Some(v) if v.trim().is_empty() => Self::Absent,
+            Some(_) => Self::Unknown,
+        }
+    }
+}
+
 fn field_array(cipher: &Value) -> &[Value] {
     cipher.get("fields").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
@@ -64,6 +86,18 @@ pub fn first_index(names: &[Option<String>], name: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn location_classes() {
+        assert_eq!(Location::classify(None), Location::Absent);
+        for blank in ["", " ", "  ", "\t\n"] {
+            assert_eq!(Location::classify(Some(blank)), Location::Absent, "{blank:?}");
+        }
+        assert_eq!(Location::classify(Some("notes")), Location::Notes);
+        for other in [" notes ", "notes\n", "Notes", "NOTES", "attachment", "field"] {
+            assert_eq!(Location::classify(Some(other)), Location::Unknown, "{other:?}");
+        }
+    }
 
     #[test]
     fn names_only_are_decrypted() {
