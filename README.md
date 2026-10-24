@@ -24,7 +24,6 @@ so every app that already talks to gnome-keyring or KWallet works unchanged.
 The storage behind it is your Bitwarden vault: any login or secure note you
 mark with a `bwss:id` field becomes a keyring item.
 
-
 ```console
 $ secret-tool store --label="GitHub token" service github user me
 Password: ••••••••          # first use: a pinentry dialog asks for your Bitwarden master password
@@ -38,19 +37,20 @@ keyring of every other machine running bwss.
 ## 🏷️ Marking items for bwss
 
 An item joins the keyring when it carries a custom field named `bwss:id`.
-The value can be anything. Add the field to a personal login or secure note,
-in any folder, with any Bitwarden client:
-
-```console
-$ secret-tool lookup bwss:name GitHub
-ghp_8x7…
-```
+The value can be any non-empty text. Add the field to a personal login or
+secure note, in any folder, with any Bitwarden client.
 
 - **Unmarked items stay private.** bwss reads only their field names. They
   are never decrypted further and never reach the bus.
 - **Finding a hand-marked item.** Apps see derived attributes `bwss:id`,
   `bwss:name`, `bwss:username` and `bwss:uri`, so you can look an item up
-  with `secret-tool lookup bwss:name GitHub` even though no app created it.
+  with `secret-tool lookup bwss:name GitHub` even though no app created it:
+
+  ```console
+  $ secret-tool lookup bwss:name GitHub
+  ghp_8x7…
+  ```
+
 - **Where the secret is read from.** The first of these that exists wins:
   1. a custom field `bwss:password` (even when empty);
   2. the item's notes, when the field `bwss:location=notes` is set;
@@ -59,8 +59,8 @@ ghp_8x7…
   password keeps the old one in password history, like the official clients.
   Add a `bwss:password` field when you want an app-only value and leave the
   login password alone.
-- **Binary secrets** never go into a login password or a note text. bwss adds
-  a hidden `bwss:password` field with `bwss:encoding=base64` instead.
+- **Binary secrets** never go into the user's login password or note text. bwss
+  adds a hidden `bwss:password` field with `bwss:encoding=base64` instead.
 - **New items** that apps create are personal secure notes in the `folder`
   from your config (default `secret-service`), with the secret in
   `bwss:password`. A very large secret uses the new note's own notes.
@@ -78,7 +78,9 @@ keychain-bitwarden.
 **Coming from the old folder-based bwss?** There is no migration: start over.
 Items it created carry `bwss:id`, so they show up as marked items, but its
 folder-based collections are not recognised, and an old config with a key
-this version no longer has stops the daemon at start (remove that key). See
+this version no longer has stops the daemon at start (remove that key). The old cache and locked index are rebuilt, and an old
+offline queue is renamed `queue.json.legacy` and never replayed, so flush
+offline writes before upgrading. See
 [`docs/design.md`](docs/design.md) section 14.
 
 ## ✨ Features
@@ -106,7 +108,7 @@ this version no longer has stops the daemon at start (remove that key). See
   URIs, custom fields, attachments and history, and a replaced login
   password goes into password history.
 - **Small and self-contained**: one binary, and the musl build is fully
-  static (about 14 MB). It talks to Bitwarden directly, with no `bw` CLI or
+  static. It talks to Bitwarden directly, with no `bw` CLI or
   Node.js.
 
 ## 🧭 How it compares
@@ -217,10 +219,9 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring) | 98 pass |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring) | 98 pass, 1 ignored (perf) |
+| End-to-end against Vaultwarden 1.37.4 | 26 pass (14 Bitwarden, 12 Secret Service) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
-
-The end-to-end suite and `cargo audit` are described under Development.
 
 **Not tested yet**: bitwarden.com itself (all server tests used
 Vaultwarden), desktop apps such as Chromium and VS Code under a real
@@ -230,6 +231,7 @@ session, and end-to-end tests on x86_64.
 
 - a PAM module for unlock-at-login;
 - the Flatpak secret portal;
+- `bwss import`, to tag existing Bitwarden logins from any folder;
 - organization collections;
 - push updates instead of polling.
 
