@@ -17,6 +17,10 @@ pub enum ApiError {
     Http { status: u16, message: String },
     #[error("unexpected response: {0}")]
     Protocol(String),
+    /// A write before this session's first `/sync` (for example right
+    /// after a logout and a new login): it can be sent after the next sync.
+    #[error("sync before writing items")]
+    NotSynced,
 }
 
 impl ApiError {
@@ -30,6 +34,7 @@ impl ApiError {
         match self {
             ApiError::Network(_) => true,
             ApiError::Http { status, .. } => *status == 429 || *status >= 500,
+            ApiError::NotSynced => true,
             ApiError::Protocol(_) => false,
         }
     }
@@ -234,7 +239,7 @@ impl Api {
 
     fn with_owner(&self, mut body: Map<String, Value>) -> Result<Value, ApiError> {
         // Required by Vaultwarden 1.37+, optional on bitwarden.com.
-        let owner = self.user_id.clone().ok_or_else(|| ApiError::Protocol("sync before writing items".into()))?;
+        let owner = self.user_id.clone().ok_or(ApiError::NotSynced)?;
         body.insert("encryptedFor".into(), Value::String(owner));
         Ok(Value::Object(body))
     }
@@ -303,6 +308,15 @@ mod tests {
     fn normalizes_pascal_case() {
         let v = normalize_keys(json!({ "Profile": { "Key": "k" }, "Ciphers": [{ "RevisionDate": "d" }] }));
         assert_eq!(v, json!({ "profile": { "key": "k" }, "ciphers": [{ "revisionDate": "d" }] }));
+    }
+
+    #[test]
+    fn writing_before_a_sync_is_transient() {
+        // A logout (and a new login) during a flush clears the profile: the
+        // op must wait for the next sync, never be dropped.
+        let api = Api::new(resolve_server_urls("http://127.0.0.1:1").unwrap(), "d".into()).unwrap();
+        let e = api.with_owner(Map::new()).unwrap_err();
+        assert!(e.is_transient(), "{e}");
     }
 
     #[test]
