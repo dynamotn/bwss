@@ -328,6 +328,13 @@ docker run -d --rm --name bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false 
   -e I_REALLY_WANT_VOLATILE_STORAGE=true vaultwarden/server:latest
 docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
+
+# Line coverage of src/, unit and end-to-end tests combined (instrumented
+# debug build; the report lists the uncovered lines of every file and the
+# lcov data lands in target/lcov.info). COVERAGE_MIN defaults to 100; pass
+# -e COVERAGE_MIN=0 to only measure. Needs a fresh Vaultwarden as above.
+docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
+  -v "$PWD":/src -v bwss-target:/target bwss-e2e scripts/coverage.sh
 ```
 
 CI runs the same checks on both forges:

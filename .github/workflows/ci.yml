@@ -105,6 +105,41 @@ jobs:
         run: dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
         timeout-minutes: 15
 
+  coverage:
+    name: line coverage (unit + end-to-end)
+    runs-on: ubuntu-latest
+    services:
+      vaultwarden:
+        image: vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055
+        ports: ["127.0.0.1:8080:80"]
+        env:
+          SIGNUPS_ALLOWED: "true"
+          SIGNUPS_VERIFY: "false"
+          DISABLE_ICON_DOWNLOAD: "true"
+          I_REALLY_WANT_VOLATILE_STORAGE: "true"
+          LOGIN_RATELIMIT_MAX_BURST: "1000"
+          LOGIN_RATELIMIT_SECONDS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the end-to-end image
+        run: docker build -t bwss-e2e -f tests/e2e/Dockerfile .
+      - name: Wait for Vaultwarden
+        run: |
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:8080/alive && exit 0; sleep 2; done
+          exit 1
+      - name: Measure coverage
+        # Task 12 raises COVERAGE_MIN to 100.
+        run: |
+          docker run --rm --network host -e BW_E2E_URL=http://127.0.0.1:8080 -e COVERAGE_MIN=0 \
+            -v "$PWD":/src -v bwss-e2e-target:/target bwss-e2e scripts/coverage.sh
+        timeout-minutes: 45
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: lcov
+          path: target/lcov.info
+
   build:
     name: static binary (${{ matrix.arch }})
     needs: [lint, test]

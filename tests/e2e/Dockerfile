@@ -13,6 +13,10 @@ RUN apt-get update \
 # (ADR 0008), so the fake one is installed like a real one, owned by root.
 COPY --chmod=755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
 
+# Coverage (scripts/coverage.sh) and the clippy the checks use on Linux.
+RUN rustup component add llvm-tools-preview clippy \
+ && cargo install cargo-llvm-cov --locked --version '^0.9'
+
 # root can write anywhere, so bwss trusts no pinentry as root: the tests run
 # as an ordinary user. The build stays root (CARGO_HOME, the /target volume).
 RUN useradd --create-home --uid 1000 tester
