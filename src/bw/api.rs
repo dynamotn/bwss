@@ -307,6 +307,7 @@ fn describe_error(body: &Value) -> String {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 use super::{Backend, BackendError};
 use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now};
+use crate::sync::lock;
 
 pub struct MemoryBackend {
     password: String,
@@ -25,7 +26,7 @@ impl MemoryBackend {
     }
 
     fn check(&self) -> Result<(), BackendError> {
-        if *self.unlocked.lock().unwrap() { Ok(()) } else { Err(BackendError::Locked) }
+        if *lock(&self.unlocked) { Ok(()) } else { Err(BackendError::Locked) }
     }
 }
 
@@ -35,12 +36,12 @@ impl Backend for MemoryBackend {
         if password != self.password {
             return Err(BackendError::WrongPassword);
         }
-        *self.unlocked.lock().unwrap() = true;
-        Ok(self.data.lock().unwrap().clone())
+        *lock(&self.unlocked) = true;
+        Ok(lock(&self.data).clone())
     }
 
     async fn lock(&self) {
-        *self.unlocked.lock().unwrap() = false;
+        *lock(&self.unlocked) = false;
     }
 
     async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
@@ -50,7 +51,7 @@ impl Backend for MemoryBackend {
 
     async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
         self.check()?;
-        let mut data = self.data.lock().unwrap();
+        let mut data = lock(&self.data);
         let mut id = label.trim().to_lowercase();
         while data.collections.iter().any(|c| c.id == id) {
             id.push('_');
@@ -62,7 +63,7 @@ impl Backend for MemoryBackend {
 
     async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
         self.check()?;
-        let mut data = self.data.lock().unwrap();
+        let mut data = lock(&self.data);
         if data.items.iter().any(|i| i.collection == id && !items.contains(&i.id)) {
             return Err(BackendError::Rejected("the collection changed meanwhile; try again".into()));
         }
@@ -73,7 +74,7 @@ impl Backend for MemoryBackend {
 
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
         self.check()?;
-        let mut data = self.data.lock().unwrap();
+        let mut data = lock(&self.data);
         data.items.retain(|i| i.id != item.id);
         data.items.push(item.clone());
         Ok(())
@@ -81,11 +82,11 @@ impl Backend for MemoryBackend {
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
         self.check()?;
-        self.data.lock().unwrap().items.retain(|i| i.id != item.id);
+        lock(&self.data).items.retain(|i| i.id != item.id);
         Ok(())
     }
 
     async fn describe(&self) -> String {
-        format!("memory backend, {} item(s)", self.data.lock().unwrap().items.len())
+        format!("memory backend, {} item(s)", lock(&self.data).items.len())
     }
 }

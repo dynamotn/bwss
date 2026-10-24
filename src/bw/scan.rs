@@ -259,6 +259,7 @@ pub fn resolve_duplicates(items: Vec<MarkedItem>) -> (Vec<MarkedItem>, Vec<(Stri
 }
 
 #[cfg(test)]
+#[expect(clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use serde_json::json;

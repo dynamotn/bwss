@@ -1,5 +1,7 @@
 //! The write path end to end, against an in-process fake Bitwarden server.
 
+#![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
@@ -665,9 +667,13 @@ async fn an_accepted_create_leaves_the_queue_even_when_the_keyring_locks() {
     // to log out.
     let backend = v.backend.clone();
     let locking = tokio::spawn(async move { backend.lock().await });
-    while v.backend.state.lock().await.is_some() {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while v.backend.state.lock().await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("lock drops the keys");
     release.send(()).unwrap();
     let _ = flush.await.unwrap();
     locking.await.unwrap();

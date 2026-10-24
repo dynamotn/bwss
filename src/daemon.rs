@@ -16,6 +16,7 @@ use crate::keyring::{Diff, Keyring};
 use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, escape_segment, now, unescape_segment};
 use crate::prompter::{Confirm, Prompter};
 use crate::session::Session;
+use crate::sync::lock;
 
 pub const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 pub const DEFAULT_ALIAS_PATH: &str = "/org/freedesktop/secrets/aliases/default";
@@ -28,6 +29,7 @@ pub fn item_path(collection: &str, id: &str) -> String {
     format!("{SERVICE_PATH}/collection/{}/{}", escape_segment(collection), escape_segment(id))
 }
 
+#[expect(clippy::expect_used, reason = "callers pass only paths built from constants and escaped segments")]
 pub fn op(path: &str) -> OwnedObjectPath {
     OwnedObjectPath::try_from(path.to_owned()).expect("valid object path")
 }
@@ -226,6 +228,7 @@ impl Daemon {
         let _ = self.conn.set(conn);
     }
 
+    #[expect(clippy::expect_used, reason = "set_connection runs before the first request is served")]
     pub fn conn(&self) -> &Connection {
         self.conn.get().expect("connection set at startup")
     }
@@ -235,15 +238,15 @@ impl Daemon {
     }
 
     pub fn touch(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        *lock(&self.last_activity) = Instant::now();
     }
 
     pub fn idle_for(&self) -> Duration {
-        self.last_activity.lock().unwrap().elapsed()
+        lock(&self.last_activity).elapsed()
     }
 
     pub fn session(&self, path: &str, caller: Option<&str>) -> SResult<Arc<OpenSession>> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = lock(&self.sessions);
         let s = sessions.get(path).ok_or_else(|| SecretError::NoSession(format!("no session {path}")))?;
         if caller.is_some_and(|c| c != s.owner) {
             return Err(SecretError::NoSession("the session belongs to another client".into()));
@@ -360,7 +363,7 @@ impl Daemon {
     /// oldest session of the client holding the most. Returns the paths of the
     /// sessions that were dropped and whether the new one was added.
     pub fn admit_session(&self, open: Arc<OpenSession>, path: &str, force: bool) -> (Vec<String>, bool) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         let mut dropped = Vec::new();
         let mut drop_oldest_of = |sessions: &mut HashMap<String, Arc<OpenSession>>, owner: &str, cap: usize| {
             let mine = sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, s)| (s.seq, p.clone()));
@@ -387,8 +390,8 @@ impl Daemon {
 
     /// Unique bus names that hold sessions or prompts.
     pub fn known_owners(&self) -> BTreeSet<String> {
-        let sessions = self.sessions.lock().unwrap();
-        let prompts = self.prompts.lock().unwrap();
+        let sessions = lock(&self.sessions);
+        let prompts = lock(&self.prompts);
         sessions.values().map(|s| s.owner.clone()).chain(prompts.iter().map(|p| p.owner.clone())).collect()
     }
 
@@ -396,7 +399,7 @@ impl Daemon {
     /// have not started drop their pending secret with their object.
     pub async fn drop_owner(&self, owner: &str) {
         let sessions: Vec<String> = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = lock(&self.sessions);
             let paths: Vec<String> =
                 sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, _)| p.clone()).collect();
             for p in &paths {
@@ -405,7 +408,7 @@ impl Daemon {
             paths
         };
         let prompts: Vec<String> = {
-            let mut prompts = self.prompts.lock().unwrap();
+            let mut prompts = lock(&self.prompts);
             let paths = prompts.iter().filter(|p| p.owner == owner).map(|p| p.path.clone()).collect();
             prompts.retain(|p| p.owner != owner);
             paths
@@ -706,6 +709,7 @@ mod path_tests {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

@@ -130,7 +130,7 @@ pub(super) fn merge_patches(first: &Patch, mut later: Patch, server: Option<Base
         }
     }
     let value = merged_value(&first.value, std::mem::replace(&mut later.value, ValueChange::Keep), server);
-    let cipher_id = first.cipher_id.clone().or(later.cipher_id.take());
+    let cipher_id = first.cipher_id.clone().or_else(|| later.cipher_id.take());
     Patch { id: first.id.clone(), base_revision: first.base_revision.clone(), set, remove, acl_add, value, cipher_id }
 }
 
@@ -177,18 +177,14 @@ pub(super) fn push_op(queue: &mut Vec<Op>, op: Op, server: Option<Base>) -> Undo
         queue.push(op);
         return Undo::Pushed;
     };
-    match queue.iter().rposition(|o| target(o) == Some(later.id.as_str())) {
-        Some(i) if matches!(queue[i], Op::Patch(_)) => {
-            let Op::Patch(first) = &mut queue[i] else { unreachable!("matched a patch") };
-            let before = Op::Patch(first.clone());
-            *first = merge_patches(first, later, server);
-            Undo::Merged(i, Box::new(before))
-        }
-        _ => {
-            queue.push(Op::Patch(later));
-            Undo::Pushed
-        }
+    let last = queue.iter().rposition(|o| target(o) == Some(later.id.as_str()));
+    if let Some((i, Op::Patch(first))) = last.and_then(|i| queue.get_mut(i).map(|o| (i, o))) {
+        let before = Op::Patch(first.clone());
+        *first = merge_patches(first, later, server);
+        return Undo::Merged(i, Box::new(before));
     }
+    queue.push(Op::Patch(later));
+    Undo::Pushed
 }
 
 /// How to take back a `push_op`, without copying the whole queue.
@@ -205,7 +201,11 @@ impl Undo {
             Self::Pushed => {
                 queue.pop();
             }
-            Self::Merged(i, before) => queue[i] = *before,
+            Self::Merged(i, before) => {
+                if let Some(slot) = queue.get_mut(i) {
+                    *slot = *before;
+                }
+            }
         }
     }
 }
@@ -312,8 +312,8 @@ enum Target {
 /// `cipher_id` is the cipher the op was read from, when the op records it.
 fn locate(state: &Unlocked, id: &str, cipher_id: Option<&str>) -> Target {
     let list = ciphers(&state.sync);
-    if let Some(i) = find_marked(list, id, &state.keys, &state.built.unmarked) {
-        return Target::Found(list[i].clone());
+    if let Some(cipher) = find_marked(list, id, &state.keys, &state.built.unmarked).and_then(|i| list.get(i)) {
+        return Target::Found(cipher.clone());
     }
     // An item held as last read (§3.4) is still there.
     let held = state
@@ -740,8 +740,8 @@ impl BitwardenBackend {
                 if let Op::Create { id, collection, item: queued } = op
                     && *id == new.id
                 {
-                    *collection = new.collection.clone();
-                    *queued = new.clone();
+                    collection.clone_from(&new.collection);
+                    queued.clone_from(&new);
                 }
             }
             return self.queue_changed(queue).await;
@@ -867,7 +867,9 @@ impl BitwardenBackend {
                              the item's other queued changes are kept"
                         );
                         let rest = Patch { value: ValueChange::Keep, ..p.clone() };
-                        queue[0] = Op::Patch(rest);
+                        if let Some(first) = queue.first_mut() {
+                            *first = Op::Patch(rest);
+                        }
                         let _ = self.save_queue(queue, &seal_key);
                         continue;
                     }
@@ -911,23 +913,27 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
         Op::Patch(p) => {
             let list =
                 with_queue(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), &state.built.unmarked);
-            let Some(i) = find_marked(&list, &p.id, &state.keys, &state.built.unmarked) else { return Ok(()) };
+            let Some(cipher) = find_marked(&list, &p.id, &state.keys, &state.built.unmarked).and_then(|i| list.get(i))
+            else {
+                return Ok(());
+            };
             // Only the sizes are checked here: compare the value against the
             // copy it is applied to.
             let mut trial = p.clone();
             if let (ValueChange::Set { source, base_mark, .. }, Scan::Marked(m)) =
-                (&mut trial.value, scan(&list[i], &state.keys))
+                (&mut trial.value, scan(cipher, &state.keys))
             {
                 *source = m.source;
                 *base_mark = m.mark;
             }
-            apply(&list[i], &trial, &state.keys).map(|_| ()).or_else(refused)
+            apply(cipher, &trial, &state.keys).map(|_| ()).or_else(refused)
         }
         Op::Delete { .. } | Op::Registry { .. } => Ok(()),
     }
 }
 
 #[cfg(test)]
+#[expect(clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -1020,7 +1026,7 @@ mod tests {
 
         // Back to the defaults: the fields go away.
         let mut moved = old.clone();
-        moved.item = new.clone();
+        moved.item.clone_from(&new);
         let mut back = new;
         back.collection = "default".into();
         back.content_type = "text/plain".into();

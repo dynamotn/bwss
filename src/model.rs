@@ -1,6 +1,7 @@
 //! Backend-independent data model of the keyring.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use zeroize::Zeroizing;
 
@@ -77,7 +78,7 @@ pub fn escape_segment(raw: &str) -> String {
         if b.is_ascii_alphanumeric() {
             out.push(b as char);
         } else {
-            out.push_str(&format!("_{b:02x}"));
+            let _ = write!(out, "_{b:02x}");
         }
     }
     out
@@ -91,8 +92,8 @@ pub fn unescape_segment(seg: &str) -> Option<String> {
     let bytes = seg.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    while let Some(&c) = bytes.get(i) {
+        match c {
             b'_' => {
                 let hex = seg.get(i + 1..i + 3)?;
                 if !hex.bytes().all(|h| h.is_ascii_digit() || (b'a'..=b'f').contains(&h)) {

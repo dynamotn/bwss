@@ -50,16 +50,19 @@ fn unescape(s: &str) -> Zeroizing<String> {
     let bytes = s.as_bytes();
     let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
+    while let Some(&c) = bytes.get(i) {
+        if c == b'%'
             && i + 2 < bytes.len()
-            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let Some(b) = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(b);
             i += 3;
             continue;
         }
-        out.push(bytes[i]);
+        out.push(c);
         i += 1;
     }
     Zeroizing::new(String::from_utf8_lossy(&out).into_owned())

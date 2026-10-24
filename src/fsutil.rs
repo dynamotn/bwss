@@ -41,6 +41,7 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

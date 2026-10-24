@@ -1,6 +1,8 @@
 //! Performance budgets, run with `cargo test --release perf -- --ignored --nocapture`.
 //! They catch order-of-magnitude regressions; the timings are printed.
 
+#![expect(clippy::unwrap_used, reason = "tests")]
+
 use std::time::Instant;
 
 use zeroize::Zeroizing;

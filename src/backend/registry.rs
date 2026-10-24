@@ -32,6 +32,7 @@ impl Registry {
     }
 
     /// Deterministic JSON, so equal registries give equal notes.
+    #[expect(clippy::expect_used, reason = "a map keyed by strings always serializes")]
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.0).expect("a string-keyed map always serializes")
     }
@@ -65,6 +66,7 @@ fn rank(a: &Entry, b: &Entry) -> Ordering {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
 

@@ -93,7 +93,7 @@ impl Keyring {
         });
         let mut collections = builtin_collections();
         for c in &index.collections {
-            collections.entry(c.id.clone()).or_insert(CollectionData {
+            collections.entry(c.id.clone()).or_insert_with(|| CollectionData {
                 id: c.id.clone(),
                 label: c.label.clone(),
                 created: 0,
@@ -300,6 +300,7 @@ impl Keyring {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use zeroize::Zeroizing;

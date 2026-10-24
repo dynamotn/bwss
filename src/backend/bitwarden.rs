@@ -349,15 +349,18 @@ pub(super) fn with_queue<'a>(
             Op::Patch(patch) => {
                 let map = positions.get_or_insert_with(|| marked_positions(&list, keys, unmarked));
                 let Some(&i) = map.get(&patch.id) else { continue };
-                match apply(&list[i], patch, keys) {
+                let Some(current) = list.get(i) else { continue };
+                match apply(current, patch, keys) {
                     Ok(mut body) => {
                         body.remove("lastKnownRevisionDate");
                         for k in ["id", "revisionDate", "creationDate"] {
-                            if let Some(v) = list[i].get(k) {
+                            if let Some(v) = current.get(k) {
                                 body.insert(k.into(), v.clone());
                             }
                         }
-                        list[i] = Cow::Owned(Value::Object(body));
+                        if let Some(slot) = list.get_mut(i) {
+                            *slot = Cow::Owned(Value::Object(body));
+                        }
                     }
                     Err(e) => {
                         if first_report(("unshown", &patch.id, &patch.base_revision)) {
@@ -741,6 +744,7 @@ impl Backend for BitwardenBackend {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
 

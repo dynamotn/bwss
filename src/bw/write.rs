@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
     F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, F_PASSWORD, PREFIX,
-    field_names, first_index,
+    field_names,
 };
 use super::items::{MAX_NOTES_ENC, MAX_PASSWORD_ENC, RESPONSE_ONLY, format_date, item_key};
 use super::scan::{Keys, Scan, ValueSource, normalize_collection, scan};
@@ -93,29 +93,28 @@ pub enum WriteError {
     Uninspectable(String),
 }
 
-/// Custom fields being edited: the raw (encrypted) entries with their
-/// decrypted names. Entries bwss does not change are kept byte for byte.
+/// Custom fields being edited: each raw (encrypted) entry paired with its
+/// decrypted name. Entries bwss does not change are kept byte for byte.
 struct Fields<'k> {
     key: &'k SymmetricKey,
-    raw: Vec<Value>,
-    names: Vec<Option<String>>,
+    entries: Vec<(Value, Option<String>)>,
 }
 
 impl<'k> Fields<'k> {
     fn read(cipher: &Value, key: &'k SymmetricKey) -> Result<Self, CryptoError> {
         let names = field_names(cipher, key)?;
         let raw = cipher.get("fields").and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(Self { key, raw, names })
+        Ok(Self { key, entries: raw.into_iter().zip(names).collect() })
     }
 
     fn empty(key: &'k SymmetricKey) -> Self {
-        Self { key, raw: Vec::new(), names: Vec::new() }
+        Self { key, entries: Vec::new() }
     }
 
     /// Decrypted value of the first field called `name`; `""` for null.
     fn value(&self, name: &str) -> Result<Option<Zeroizing<String>>, CryptoError> {
-        let Some(i) = first_index(&self.names, name) else { return Ok(None) };
-        match self.raw[i].get("value").and_then(Value::as_str) {
+        let Some((raw, _)) = self.entries.iter().find(|(_, n)| n.as_deref() == Some(name)) else { return Ok(None) };
+        match raw.get("value").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => self.key.decrypt_str(s).map(Some),
             _ => Ok(Some(Zeroizing::new(String::new()))),
         }
@@ -124,19 +123,16 @@ impl<'k> Fields<'k> {
     /// Sets the first field called `name` to an already encrypted value,
     /// keeping its kind; appends a field when there is none.
     fn set_enc(&mut self, name: &str, enc: String, hidden: bool) {
-        match first_index(&self.names, name) {
-            Some(i) => {
-                if let Some(f) = self.raw[i].as_object_mut() {
+        let replacement = self.new_field(name, enc.clone(), hidden);
+        match self.entries.iter_mut().find(|(_, n)| n.as_deref() == Some(name)) {
+            Some((raw, _)) => {
+                if let Some(f) = raw.as_object_mut() {
                     f.insert("value".into(), Value::String(enc));
                 } else {
-                    self.raw[i] = self.new_field(name, enc, hidden);
+                    *raw = replacement;
                 }
             }
-            None => {
-                let field = self.new_field(name, enc, hidden);
-                self.raw.push(field);
-                self.names.push(Some(name.to_owned()));
-            }
+            None => self.entries.push((replacement, Some(name.to_owned()))),
         }
     }
 
@@ -152,17 +148,11 @@ impl<'k> Fields<'k> {
 
     fn remove_where(&mut self, keep: impl Fn(&str) -> bool, first_only: bool) {
         let mut removed = false;
-        let mut i = 0;
-        while i < self.raw.len() {
-            let hit = !(first_only && removed) && self.names[i].as_deref().is_some_and(|n| !keep(n));
-            if hit {
-                self.raw.remove(i);
-                self.names.remove(i);
-                removed = true;
-            } else {
-                i += 1;
-            }
-        }
+        self.entries.retain(|(_, name)| {
+            let hit = !(first_only && removed) && name.as_deref().is_some_and(|n| !keep(n));
+            removed |= hit;
+            !hit
+        });
     }
 
     fn remove_first(&mut self, name: &str) {
@@ -182,8 +172,10 @@ impl<'k> Fields<'k> {
     /// Fails when a field value is over Bitwarden's limit, so an oversize
     /// label, attribute, ACL or collection never reaches the server.
     fn check_sizes(&self) -> Result<(), WriteError> {
-        let too_large =
-            self.raw.iter().any(|f| f.get("value").and_then(Value::as_str).map_or(0, str::len) > MAX_FIELD_ENC);
+        let too_large = self
+            .entries
+            .iter()
+            .any(|(f, _)| f.get("value").and_then(Value::as_str).map_or(0, str::len) > MAX_FIELD_ENC);
         if too_large { Err(WriteError::TooLarge) } else { Ok(()) }
     }
 }
@@ -367,7 +359,7 @@ fn pass_through(object: &Map<String, Value>) -> Map<String, Value> {
 /// The end of every update body: the edited fields, a `passwordHistory`
 /// that is always an array, and the revision the write is based on.
 fn finish_body(body: &mut Map<String, Value>, fields: Fields, revision: &str) {
-    body.insert("fields".into(), Value::Array(fields.raw));
+    body.insert("fields".into(), Value::Array(fields.entries.into_iter().map(|(raw, _)| raw).collect()));
     if !body.get("passwordHistory").is_some_and(Value::is_array) {
         body.insert("passwordHistory".into(), json!([]));
     }
@@ -474,7 +466,7 @@ pub fn new_note(item: &ItemData, folder_id: Option<&str>, keys: &Keys) -> Result
     body.insert("reprompt".into(), json!(0));
     body.insert("key".into(), Value::Null);
     body.insert("passwordHistory".into(), json!([]));
-    body.insert("fields".into(), Value::Array(fields.raw));
+    body.insert("fields".into(), Value::Array(fields.entries.into_iter().map(|(raw, _)| raw).collect()));
     Ok(body)
 }
 
@@ -503,11 +495,12 @@ pub fn new_registry_note(
     body.insert("reprompt".into(), json!(0));
     body.insert("key".into(), Value::Null);
     body.insert("passwordHistory".into(), json!([]));
-    body.insert("fields".into(), Value::Array(fields.raw));
+    body.insert("fields".into(), Value::Array(fields.entries.into_iter().map(|(raw, _)| raw).collect()));
     Ok(body)
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
 

@@ -142,6 +142,7 @@ impl From<SealedOp> for Op {
 /// Known limitation: while `serde_json` serializes (here) and parses (in
 /// `unseal`), its `Vec<u8>` growth can leave partial unwiped copies of the
 /// queued secrets behind.
+#[expect(clippy::expect_used, reason = "a Vec of plain derived-Serialize structs always serializes")]
 pub fn seal(ops: &[Op], key: &SymmetricKey) -> Value {
     let mirror: Vec<SealedOp> = ops.iter().map(SealedOp::from).collect();
     let json = Zeroizing::new(serde_json::to_vec(&mirror).expect("ops serialize to JSON"));
@@ -200,6 +201,7 @@ pub(crate) fn set_aside(path: &Path, suffix: &str) -> Loaded<Value> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

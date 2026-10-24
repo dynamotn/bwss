@@ -13,6 +13,7 @@ use crate::daemon::{
 };
 use crate::model::{Attributes, LOGIN_COLLECTION, SESSION_COLLECTION};
 use crate::session::Session;
+use crate::sync::lock;
 
 const PROP_ITEM_LABEL: &str = "org.freedesktop.Secret.Item.Label";
 const PROP_ITEM_ATTRIBUTES: &str = "org.freedesktop.Secret.Item.Attributes";
@@ -50,6 +51,7 @@ impl From<WireSecret> for SecretStruct {
     }
 }
 
+#[expect(clippy::expect_used, reason = "a string always converts to an owned variant")]
 fn empty_variant() -> OwnedVariant {
     OwnedVariant::try_from(Variant::from("")).expect("string variant")
 }
@@ -87,12 +89,12 @@ impl ServiceObj {
         }
         let server = self.daemon.conn().object_server();
         if let Err(e) = server.at(path.as_str(), SessionObj { daemon: self.daemon.clone(), path: path.clone() }).await {
-            self.daemon.sessions.lock().unwrap().remove(&path);
+            lock(&self.daemon.sessions).remove(&path);
             return Err(SecretError::ZBus(e));
         }
         // Evicted or dropped with its client while the object was being added:
         // it is no longer tracked, so it must not stay on the bus.
-        if !self.daemon.sessions.lock().unwrap().contains_key(&path) {
+        if !lock(&self.daemon.sessions).contains_key(&path) {
             let _ = server.remove::<SessionObj, _>(path.as_str()).await;
             return Err(SecretError::Failed("the session was closed while opening".into()));
         }
@@ -451,7 +453,7 @@ impl SessionObj {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         {
-            let mut sessions = self.daemon.sessions.lock().unwrap();
+            let mut sessions = lock(&self.daemon.sessions);
             // Only the bus name that opened the session may close it.
             if sessions.get(&self.path).is_some_and(|s| Some(s.owner.as_str()) != sender(&header).as_deref()) {
                 return Err(zbus::fdo::Error::AccessDenied("the session belongs to another client".into()));
@@ -481,6 +483,7 @@ impl PromptAction {
     /// The result to report when the prompt is dismissed. It must have the
     /// type the successful result would have (`ao` for an unlock, `o`
     /// otherwise): libsecret rejects anything else and then never completes.
+    #[expect(clippy::expect_used, reason = "plain variants without file descriptors always convert")]
     fn dismissed_result(&self) -> OwnedVariant {
         let v = match self {
             PromptAction::Unlock { .. } => Variant::from(Vec::<OwnedObjectPath>::new()),
@@ -503,7 +506,7 @@ impl PromptObj {
         // so concurrent registrations cannot exceed it. A client that is over
         // the cap loses its oldest prompt that has not started.
         let victim = {
-            let mut prompts = daemon.prompts.lock().unwrap();
+            let mut prompts = lock(&daemon.prompts);
             let held = prompts.iter().filter(|p| p.owner == owner).map(|p| (p.seq, p.pinned()));
             let victim = match prompt_slot(held, PROMPTS_PER_OWNER) {
                 PromptSlot::Free => None,
@@ -521,13 +524,13 @@ impl PromptObj {
         }
         let obj = PromptObj { daemon: daemon.clone(), path: path.clone(), action: std::sync::Mutex::new(Some(action)) };
         if let Err(e) = daemon.conn().object_server().at(path.as_str(), obj).await {
-            daemon.prompts.lock().unwrap().retain(|p| p.seq != seq);
+            lock(&daemon.prompts).retain(|p| p.seq != seq);
             return Err(SecretError::ZBus(e));
         }
         // Dropped with its client while the object was being added: no longer
         // tracked, so remove it again (dropping what it holds).
         let tracked = {
-            let mut prompts = daemon.prompts.lock().unwrap();
+            let mut prompts = lock(&daemon.prompts);
             prompts.iter_mut().find(|p| p.seq == seq).map(|e| e.registered = true).is_some()
         };
         if !tracked {
@@ -542,14 +545,14 @@ impl PromptObj {
     async fn dismiss_pending(daemon: &Arc<Daemon>, path: &str) {
         // Already gone (finished or removed concurrently): nothing to signal.
         let Ok(iface) = daemon.conn().object_server().interface::<_, PromptObj>(path).await else { return };
-        let taken = iface.get().await.action.lock().unwrap().take();
+        let taken = lock(&iface.get().await.action).take();
         if let Some(action) = taken {
             PromptObj::finish(daemon.clone(), path.to_owned(), true, action.dismissed_result()).await;
         }
     }
 
     async fn finish(daemon: Arc<Daemon>, path: String, dismissed: bool, result: OwnedVariant) {
-        daemon.prompts.lock().unwrap().retain(|p| p.path != path);
+        lock(&daemon.prompts).retain(|p| p.path != path);
         if let Ok(e) = SignalEmitter::new(daemon.conn(), path.clone()) {
             let _ = PromptObj::completed(&e, dismissed, result).await;
         }
@@ -561,14 +564,14 @@ impl PromptObj {
 impl PromptObj {
     async fn prompt(&self, _window_id: &str) -> Result<(), SecretError> {
         {
-            let mut prompts = self.daemon.prompts.lock().unwrap();
+            let mut prompts = lock(&self.daemon.prompts);
             // An evicted prompt is no longer tracked and cannot start.
             let Some(entry) = prompts.iter_mut().find(|p| p.path == self.path) else {
                 return Err(SecretError::Failed("the prompt was dismissed".into()));
             };
             entry.started = true;
         }
-        let Some(action) = self.action.lock().unwrap().take() else {
+        let Some(action) = lock(&self.action).take() else {
             return Err(SecretError::Failed("the prompt was already used".into()));
         };
         let daemon = self.daemon.clone();
@@ -608,7 +611,7 @@ impl PromptObj {
     }
 
     async fn dismiss(&self) -> Result<(), SecretError> {
-        if let Some(action) = self.action.lock().unwrap().take() {
+        if let Some(action) = lock(&self.action).take() {
             tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, action.dismissed_result()));
         }
         Ok(())

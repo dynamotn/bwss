@@ -35,6 +35,7 @@ pub enum Session {
     Aes(Zeroizing<[u8; 16]>),
 }
 
+#[expect(clippy::expect_used, reason = "PRIME_HEX is a valid hexadecimal constant")]
 fn prime() -> BigUint {
     BigUint::parse_bytes(PRIME_HEX.as_bytes(), 16).expect("valid prime")
 }
@@ -52,6 +53,7 @@ fn to_fixed(n: &BigUint) -> Zeroizing<Vec<u8>> {
 
 impl Session {
     /// Negotiates a session; returns it with the output to send back.
+    #[expect(clippy::expect_used, reason = "16 is a valid HKDF output length")]
     pub fn open(algorithm: &str, input: &[u8]) -> Result<(Session, Vec<u8>), SessionError> {
         match algorithm {
             PLAIN => Ok((Session::Plain, Vec::new())),
@@ -104,6 +106,7 @@ impl Session {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

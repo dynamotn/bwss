@@ -13,6 +13,7 @@ mod model;
 mod perf;
 mod prompter;
 mod session;
+mod sync;
 
 use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;

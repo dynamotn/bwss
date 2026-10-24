@@ -57,6 +57,7 @@ pub fn first_index(names: &[Option<String>], name: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
     use serde_json::json;

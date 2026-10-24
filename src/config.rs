@@ -119,6 +119,7 @@ pub fn load_credentials(paths: &Paths) -> anyhow::Result<Credentials> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 

@@ -13,6 +13,7 @@ type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
+/// Why a key could not be derived, or a value could not be opened.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
     #[error("MAC verification failed (wrong password or tampered data)")]
@@ -31,6 +32,7 @@ pub enum CryptoError {
     Kdf(String),
 }
 
+/// The KDF a Bitwarden account derives its master key with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum KdfParams {
@@ -60,6 +62,7 @@ impl KdfParams {
     }
 }
 
+/// The 32-byte key derived from the master password, wiped on drop.
 pub type MasterKey = Zeroizing<[u8; 32]>;
 
 /// Derives the 32-byte master key from the master password.
@@ -91,6 +94,7 @@ pub fn hash_master_password(master_key: &MasterKey, password: &str) -> String {
     B64.encode(out)
 }
 
+#[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     for p in parts {
@@ -128,21 +132,23 @@ impl std::fmt::Debug for SymmetricKey {
 }
 
 impl SymmetricKey {
+    /// Builds a key from its 64-byte form (AES key, then HMAC key); any other
+    /// length is [`CryptoError::KeyLength`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len() != 64 {
-            return Err(CryptoError::KeyLength(bytes.len()));
-        }
+        let bytes: &[u8; 64] = bytes.try_into().map_err(|_| CryptoError::KeyLength(bytes.len()))?;
+        let (enc, mac) = bytes.split_at(32);
         let mut key = SymmetricKey { enc: [0; 32], mac: [0; 32] };
-        key.enc.copy_from_slice(&bytes[..32]);
-        key.mac.copy_from_slice(&bytes[32..]);
+        key.enc.copy_from_slice(enc);
+        key.mac.copy_from_slice(mac);
         Ok(key)
     }
 
     #[cfg(test)]
     pub fn generate() -> Self {
-        let mut bytes = Zeroizing::new([0u8; 64]);
-        rand::fill(bytes.as_mut_slice());
-        Self::from_bytes(bytes.as_ref()).expect("64 bytes")
+        let mut key = SymmetricKey { enc: [0; 32], mac: [0; 32] };
+        rand::fill(key.enc.as_mut_slice());
+        rand::fill(key.mac.as_mut_slice());
+        key
     }
 
     #[cfg(test)]
@@ -167,8 +173,9 @@ impl SymmetricKey {
     /// nothing encrypted with this key can pass for data of that purpose.
     pub fn derive(&self, purpose: &str) -> Self {
         let mut prk = Zeroizing::new([0u8; 64]);
-        prk[..32].copy_from_slice(&self.enc);
-        prk[32..].copy_from_slice(&self.mac);
+        let (prk_enc, prk_mac) = prk.split_at_mut(32);
+        prk_enc.copy_from_slice(&self.enc);
+        prk_mac.copy_from_slice(&self.mac);
         let enc = hkdf_expand32(prk.as_ref(), format!("bwss {purpose} enc").as_bytes());
         let mac = hkdf_expand32(prk.as_ref(), format!("bwss {purpose} mac").as_bytes());
         let mut key = SymmetricKey { enc: [0; 32], mac: [0; 32] };
@@ -177,6 +184,9 @@ impl SymmetricKey {
         key
     }
 
+    /// Encrypts `plain` into a Bitwarden type-2 string
+    /// (`2.iv|ciphertext|mac`, AES-256-CBC with an HMAC-SHA256 tag) under a
+    /// fresh random IV.
     pub fn encrypt(&self, plain: &[u8]) -> String {
         let mut iv = [0u8; 16];
         rand::fill(&mut iv);
@@ -189,10 +199,14 @@ impl SymmetricKey {
         format!("2.{}|{}|{}", B64.encode(iv), B64.encode(&ct), B64.encode(mac))
     }
 
+    /// [`encrypt`](Self::encrypt) for text.
     pub fn encrypt_str(&self, plain: &str) -> String {
         self.encrypt(plain.as_bytes())
     }
 
+    #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length")]
+    /// Decrypts a type-2 string. The MAC is checked in constant time before
+    /// anything is decrypted; a bad one is [`CryptoError::BadMac`].
     pub fn decrypt(&self, value: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         let (iv, ct, mac) = parse_enc_string(value)?;
         let mut m = HmacSha256::new_from_slice(&self.mac).expect("any key length");
@@ -208,6 +222,8 @@ impl SymmetricKey {
             .map_err(|_| CryptoError::Decrypt)
     }
 
+    /// [`decrypt`](Self::decrypt) for text; non-UTF-8 plaintext is
+    /// [`CryptoError::Decrypt`].
     pub fn decrypt_str(&self, value: &str) -> Result<Zeroizing<String>, CryptoError> {
         let bytes = self.decrypt(value)?;
         // Validate in place: a failed `from_utf8` on an owned copy would leave
@@ -215,6 +231,7 @@ impl SymmetricKey {
         std::str::from_utf8(&bytes).map(|s| Zeroizing::new(s.to_owned())).map_err(|_| CryptoError::Decrypt)
     }
 
+    /// Decrypts a wrapped key (a user key or an item key) held in a type-2 string.
     pub fn decrypt_key(&self, value: &str) -> Result<SymmetricKey, CryptoError> {
         SymmetricKey::from_bytes(&self.decrypt(value)?)
     }
@@ -243,6 +260,7 @@ fn parse_enc_string(value: &str) -> Result<EncParts, CryptoError> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
     use serde_json::Value;

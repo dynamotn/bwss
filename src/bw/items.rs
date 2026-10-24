@@ -47,6 +47,7 @@ pub(crate) const RESPONSE_ONLY: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
