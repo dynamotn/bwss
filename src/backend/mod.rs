@@ -36,7 +36,9 @@ pub trait Backend: Send + Sync {
     /// Pulls remote changes and flushes queued writes; `None` when nothing changed.
     async fn refresh(&self) -> Result<Option<Snapshot>, BackendError>;
     async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError>;
-    async fn delete_collection(&self, id: &str) -> Result<(), BackendError>;
+    /// Deletes a collection and its items. `items` are the ones the caller
+    /// authorized; a backend never deletes any other item.
+    async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError>;
     /// Stores a new or changed item.
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError>;
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError>;

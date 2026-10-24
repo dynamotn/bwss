@@ -60,9 +60,12 @@ impl Backend for MemoryBackend {
         Ok(c)
     }
 
-    async fn delete_collection(&self, id: &str) -> Result<(), BackendError> {
+    async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
         self.check()?;
         let mut data = self.data.lock().unwrap();
+        if data.items.iter().any(|i| i.collection == id && !items.contains(&i.id)) {
+            return Err(BackendError::Rejected("the collection changed meanwhile; try again".into()));
+        }
         data.collections.retain(|c| c.id != id);
         data.items.retain(|i| i.collection != id);
         Ok(())

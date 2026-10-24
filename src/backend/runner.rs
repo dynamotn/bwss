@@ -83,7 +83,7 @@ pub(crate) fn plan_put(old: Option<&MarkedItem>, new: &ItemData) -> Op {
     let value = if new.secret == old.item.secret {
         ValueChange::Keep
     } else {
-        ValueChange::Set { source: old.source, secret: new.secret.to_vec(), base_mark: old.mark }
+        ValueChange::Set { source: old.source, secret: new.secret.to_vec(), base_mark: old.mark, owned: false }
     };
     Op::Patch(Patch { id: old.item.id.clone(), base_revision: old.revision_date.clone(), set, remove, acl_add, value })
 }
@@ -92,34 +92,62 @@ pub(super) fn is_empty(p: &Patch) -> bool {
     p.set.is_empty() && p.remove.is_empty() && p.acl_add.is_empty() && matches!(p.value, ValueChange::Keep)
 }
 
+/// The value source and mark of the cached server copy of an item.
+pub(super) type Base = (ValueSource, [u8; 32]);
+
 /// One patch with the changes of `first` and then `later`, for the same
-/// item. It keeps the base of `first` (the server's copy), so the value
+/// item. `server` is the cached server copy's base: a later value change
+/// read from it (the first one could not be shown, for example because the
+/// value changed elsewhere) replaces the first one; a later change read
+/// from the first one's result keeps the first one's base, so the value
 /// check still compares against what the server holds.
-pub(super) fn merge_patches(first: &Patch, later: Patch) -> Patch {
-    let replaces_attributes = later.remove.iter().any(|n| n == F_ATTR);
+pub(super) fn merge_patches(first: &Patch, mut later: Patch, server: Option<Base>) -> Patch {
+    let later_set = std::mem::take(&mut later.set);
+    let later_remove = std::mem::take(&mut later.remove);
+    let replaces_attributes = later_remove.iter().any(|n| n == F_ATTR);
     let touched = |name: &str| {
         (replaces_attributes && name.starts_with(F_ATTR))
-            || later.set.iter().any(|(n, _, _)| n == name)
-            || later.remove.iter().any(|n| n == name)
+            || later_set.iter().any(|(n, _, _)| n == name)
+            || later_remove.iter().any(|n| n == name)
     };
     let mut remove: Vec<String> = first.remove.iter().filter(|n| !touched(n)).cloned().collect();
     let mut set: Vec<(String, String, bool)> = first.set.iter().filter(|(n, _, _)| !touched(n)).cloned().collect();
-    remove.extend(later.remove);
-    set.extend(later.set);
+    remove.extend(later_remove);
+    set.extend(later_set);
     let mut acl_add = first.acl_add.clone();
-    for line in later.acl_add {
+    for line in std::mem::take(&mut later.acl_add) {
         if !acl_add.contains(&line) {
             acl_add.push(line);
         }
     }
-    let value = match (&first.value, later.value) {
-        (first_value, ValueChange::Keep) => first_value.clone(),
-        (ValueChange::Keep, later_value) => later_value,
-        (ValueChange::Set { source, base_mark, .. }, ValueChange::Set { secret, .. }) => {
-            ValueChange::Set { source: *source, secret, base_mark: *base_mark }
-        }
-    };
+    let value = merged_value(&first.value, std::mem::replace(&mut later.value, ValueChange::Keep), server);
     Patch { id: first.id.clone(), base_revision: first.base_revision.clone(), set, remove, acl_add, value }
+}
+
+fn merged_value(first: &ValueChange, mut later: ValueChange, server: Option<Base>) -> ValueChange {
+    let ValueChange::Set { source: later_source, secret, base_mark: later_mark, owned: later_owned } = &mut later
+    else {
+        return first.clone();
+    };
+    if server == Some((*later_source, *later_mark)) {
+        return later;
+    }
+    match first {
+        ValueChange::Keep => later,
+        ValueChange::Set { source, base_mark, secret: first_secret, owned } => {
+            // A binary first change to a value the user owns adds
+            // `bwss:password` (§5.2): the later change was read from that
+            // field and must go there, never into the user's value.
+            let added_field = matches!(source, ValueSource::LoginPassword | ValueSource::NoteBody)
+                && std::str::from_utf8(first_secret).is_err();
+            ValueChange::Set {
+                source: *source,
+                secret: std::mem::take(secret),
+                base_mark: *base_mark,
+                owned: *owned || *later_owned || added_field,
+            }
+        }
+    }
 }
 
 fn target(op: &Op) -> Option<&str> {
@@ -132,14 +160,15 @@ fn target(op: &Op) -> Option<&str> {
 
 /// Queues `op`. A patch for an item whose last queued op is a patch merges
 /// into it: two queued patches of one value could not both pass the value
-/// check, since the first changes what the second was read from.
-pub(super) fn push_op(queue: &mut Vec<Op>, op: Op) {
+/// check, since the first changes what the second was read from. `server`
+/// is the base of the cached server copy of the patched item.
+pub(super) fn push_op(queue: &mut Vec<Op>, op: Op, server: Option<Base>) {
     let Op::Patch(later) = op else {
         queue.push(op);
         return;
     };
     match queue.iter_mut().rev().find(|o| target(o) == Some(later.id.as_str())) {
-        Some(Op::Patch(first)) => *first = merge_patches(first, later),
+        Some(Op::Patch(first)) => *first = merge_patches(first, later, server),
         _ => queue.push(Op::Patch(later)),
     }
 }
@@ -203,6 +232,9 @@ pub(super) enum Failure {
     Transient(String),
     /// The target cannot be read now: the op must never be dropped (R12a).
     Wait(String),
+    /// Out of date on every attempt: the app is told to try again; a queued
+    /// op stays queued.
+    Busy(String),
     /// The value source changed on the server (§5.6).
     Conflict,
     /// The target was trashed, deleted or unmarked elsewhere.
@@ -262,6 +294,15 @@ fn locate(state: &Unlocked, id: &str) -> Target {
         })
     };
     if held || maybe() { Target::Held } else { Target::Gone }
+}
+
+/// The base of the cached server copy of item `id`, when it can be read.
+fn server_base(state: &Unlocked, id: &str) -> Option<Base> {
+    let Target::Found(cipher) = locate(state, id) else { return None };
+    match scan(&cipher, &state.keys) {
+        Scan::Marked(m) => Some((m.source, m.mark)),
+        _ => None,
+    }
 }
 
 /// The registry note to write to: the one with the lowest cipher id.
@@ -389,7 +430,7 @@ impl BitwardenBackend {
                 Err(e) => return Err(self.api_failure(e, Some(&cid)).await),
             }
         }
-        Err(Failure::Transient("the item keeps changing elsewhere".into()))
+        Err(Failure::Busy("the item keeps changing elsewhere".into()))
     }
 
     /// Design §5.4: strip, save, then trash only what the server's answer
@@ -456,7 +497,7 @@ impl BitwardenBackend {
                 }
             };
         }
-        Err(Failure::Transient("the item keeps changing elsewhere".into()))
+        Err(Failure::Busy("the item keeps changing elsewhere".into()))
     }
 
     /// Read, merge, put, write (§4): the registry note is merged with the
@@ -496,7 +537,12 @@ impl BitwardenBackend {
                         set: Vec::new(),
                         remove: Vec::new(),
                         acl_add: Vec::new(),
-                        value: ValueChange::Set { source, secret: merged.to_json().into_bytes(), base_mark: mark },
+                        value: ValueChange::Set {
+                            source,
+                            secret: merged.to_json().into_bytes(),
+                            base_mark: mark,
+                            owned: false,
+                        },
                     };
                     let body = apply(&note, &patch, &state.keys).map_err(|e| write_failure(e, &cid))?;
                     Ok(RegistryPlan::Update(cid, body))
@@ -517,7 +563,7 @@ impl BitwardenBackend {
                 Err(e) => return Err(self.api_failure(e, Some(&cid)).await),
             }
         }
-        Err(Failure::Transient("the collection registry keeps changing elsewhere".into()))
+        Err(Failure::Busy("the collection registry keeps changing elsewhere".into()))
     }
 
     async fn create_registry(&self, collection: &str, entry: &Entry) -> Result<Effect, Failure> {
@@ -573,6 +619,7 @@ impl BitwardenBackend {
             Failure::Locked => BackendError::Locked,
             Failure::Transient(why) => BackendError::Unavailable(why),
             Failure::Wait(why) => BackendError::Unavailable(format!("{why}; try again later")),
+            Failure::Busy(why) => BackendError::Unavailable(format!("{why}; try again")),
             Failure::Conflict => BackendError::Conflict("the secret was changed elsewhere".into()),
             Failure::Gone => BackendError::Rejected("the item was deleted elsewhere".into()),
             Failure::Permanent { why, cid } => {
@@ -615,7 +662,11 @@ impl BitwardenBackend {
         // Locked meanwhile: the op, and its secret, is never kept (R12b).
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
         check_queueable(state, queue, &op)?;
-        push_op(queue, op);
+        let server = match &op {
+            Op::Patch(p) => server_base(state, &p.id),
+            _ => None,
+        };
+        push_op(queue, op, server);
         self.save_queue(queue, &state.keys.user);
         Self::rebuild(state, queue);
         Ok(())
@@ -693,9 +744,16 @@ impl BitwardenBackend {
         Ok(CollectionData { id, label: label.to_owned(), created, modified: created })
     }
 
-    /// Applies the delete rule to every item of the collection (the caller
-    /// has authorized each), then leaves a tombstone in the registry (§4).
-    pub(super) async fn delete_collection_locked(&self, queue: &mut Vec<Op>, id: &str) -> Result<(), BackendError> {
+    /// Applies the delete rule to every item of the collection, then leaves
+    /// a tombstone in the registry (§4). `authorized` are the items the
+    /// caller authorized: an item that joined the collection since is never
+    /// deleted, and the whole delete is refused instead.
+    pub(super) async fn delete_collection_locked(
+        &self,
+        queue: &mut Vec<Op>,
+        id: &str,
+        authorized: &[String],
+    ) -> Result<(), BackendError> {
         let (items, tombstone) = {
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
@@ -704,6 +762,9 @@ impl BitwardenBackend {
             }
             let mut items: Vec<String> =
                 state.built.marked.values().filter(|m| m.item.collection == id).map(|m| m.item.id.clone()).collect();
+            if items.iter().any(|i| !authorized.contains(i)) {
+                return Err(BackendError::Rejected("the collection changed meanwhile; try again".into()));
+            }
             items.sort();
             let shown = registry_with_queue(&state.built.registry, queue);
             let tombstone = shown.0.get(id).filter(|e| !e.deleted).map(|e| Entry { deleted: true, ..e.clone() });
@@ -745,7 +806,7 @@ impl BitwardenBackend {
                 Ok(effect) => (effect, None),
                 Err(Failure::Locked) => return Err(BackendError::Locked),
                 Err(Failure::Transient(why)) => return Err(BackendError::Unavailable(why)),
-                Err(Failure::Wait(why)) => {
+                Err(Failure::Wait(why) | Failure::Busy(why)) => {
                     tracing::warn!("a queued change waits: {why}");
                     return Err(BackendError::Unavailable(format!("a queued change waits: {why}")));
                 }
@@ -863,9 +924,13 @@ mod tests {
         new.secret = Zeroizing::new(b"new".to_vec());
         let p = patch(plan_put(Some(&old), &new));
         assert!(p.set.is_empty() && p.remove.is_empty());
-        match p.value {
-            ValueChange::Set { source, secret, base_mark } => {
-                assert_eq!((source, secret.as_slice(), base_mark), (ValueSource::LoginPassword, &b"new"[..], [9; 32]));
+        match &p.value {
+            ValueChange::Set { source, secret, base_mark, owned } => {
+                assert_eq!(
+                    (*source, secret.as_slice(), *base_mark),
+                    (ValueSource::LoginPassword, &b"new"[..], [9; 32])
+                );
+                assert!(!owned);
             }
             ValueChange::Keep => panic!("the secret changed"),
         }
@@ -946,7 +1011,7 @@ mod tests {
             set: vec![("bwss:label".into(), "One".into(), false), ("bwss:collection".into(), "work".into(), false)],
             remove: vec![],
             acl_add: vec!["/bin/a".into()],
-            value: ValueChange::Set { source: ValueSource::LoginPassword, secret: b"1".to_vec(), base_mark: [1; 32] },
+            value: set(ValueSource::LoginPassword, b"1", 1),
         };
         let later = Patch {
             id: "a".into(),
@@ -954,10 +1019,11 @@ mod tests {
             set: vec![("bwss:label".into(), "Two".into(), false), ("bwss:attr:k".into(), "v".into(), false)],
             remove: vec!["bwss:attr:".into(), "bwss:collection".into()],
             acl_add: vec!["/bin/a".into(), "/bin/b".into()],
-            value: ValueChange::Set { source: ValueSource::Field, secret: b"2".to_vec(), base_mark: [2; 32] },
+            value: set(ValueSource::Field, b"2", 2),
         };
         let mut queue = vec![Op::Patch(first), Op::Delete { id: "other".into(), base_revision: "r".into() }];
-        push_op(&mut queue, Op::Patch(later));
+        // The server still holds what the first change was based on.
+        push_op(&mut queue, Op::Patch(later), Some((ValueSource::LoginPassword, [1; 32])));
         assert_eq!(queue.len(), 2);
         let m = patch(queue.remove(0));
         assert_eq!(m.base_revision, "r1");
@@ -967,17 +1033,51 @@ mod tests {
             vec![("bwss:label".to_owned(), "Two".to_owned(), false), ("bwss:attr:k".to_owned(), "v".to_owned(), false)]
         );
         assert_eq!(m.acl_add, vec!["/bin/a".to_owned(), "/bin/b".to_owned()]);
-        match m.value {
-            ValueChange::Set { source, secret, base_mark } => {
-                assert_eq!((source, secret.as_slice(), base_mark), (ValueSource::LoginPassword, &b"2"[..], [1; 32]));
-            }
-            ValueChange::Keep => panic!("the value was set"),
-        }
+        assert_eq!(value(&m.value), (ValueSource::LoginPassword, b"2".to_vec(), [1; 32], false));
 
         // Behind a delete of the same item, a patch is not merged.
         let mut queue = vec![Op::Delete { id: "a".into(), base_revision: "r".into() }];
-        push_op(&mut queue, Op::Patch(patch(plan_put(Some(&old()), &old().item))));
+        push_op(&mut queue, Op::Patch(patch(plan_put(Some(&old()), &old().item))), None);
         assert_eq!(queue.len(), 2);
+    }
+
+    fn set(source: ValueSource, secret: &[u8], mark: u8) -> ValueChange {
+        ValueChange::Set { source, secret: secret.to_vec(), base_mark: [mark; 32], owned: false }
+    }
+
+    fn value(v: &ValueChange) -> (ValueSource, Vec<u8>, [u8; 32], bool) {
+        match v {
+            ValueChange::Set { source, secret, base_mark, owned } => (*source, secret.clone(), *base_mark, *owned),
+            ValueChange::Keep => panic!("the value was set"),
+        }
+    }
+
+    fn value_patch(v: ValueChange) -> Patch {
+        Patch { id: "a".into(), base_revision: "r".into(), set: vec![], remove: vec![], acl_add: vec![], value: v }
+    }
+
+    #[test]
+    fn a_change_read_from_the_server_replaces_a_queued_one() {
+        // Queued against M0; the server now holds M1 and the app wrote again
+        // from it: only the later change is based on what the server holds.
+        let first = value_patch(set(ValueSource::LoginPassword, b"one", 0));
+        let later = value_patch(set(ValueSource::LoginPassword, b"two", 1));
+        let m = merge_patches(&first, later, Some((ValueSource::LoginPassword, [1; 32])));
+        assert_eq!(value(&m.value), (ValueSource::LoginPassword, b"two".to_vec(), [1; 32], false));
+    }
+
+    #[test]
+    fn text_after_a_queued_binary_write_goes_to_the_added_field() {
+        // The binary write adds bwss:password, which the text was read from.
+        let first = value_patch(set(ValueSource::LoginPassword, &[0xff, 0], 0));
+        let later = value_patch(set(ValueSource::Field, b"text", 7));
+        let m = merge_patches(&first, later, Some((ValueSource::LoginPassword, [0; 32])));
+        assert_eq!(value(&m.value), (ValueSource::LoginPassword, b"text".to_vec(), [0; 32], true));
+        // A text write first: no field was added.
+        let first = value_patch(set(ValueSource::LoginPassword, b"t", 0));
+        let later = value_patch(set(ValueSource::LoginPassword, b"u", 7));
+        let m = merge_patches(&first, later, Some((ValueSource::LoginPassword, [0; 32])));
+        assert!(!value(&m.value).3);
     }
 
     #[test]

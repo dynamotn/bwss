@@ -234,10 +234,11 @@ impl CollectionObj {
         // permission it would need to delete each one of them.
         let caller = caller_executable(self.daemon.conn(), &header).await;
         let ids = self.daemon.keyring.lock().await.items_in(&self.id);
-        for id in ids {
-            self.daemon.authorize(&caller, &id, "delete").await?;
+        for id in &ids {
+            self.daemon.authorize(&caller, id, "delete").await?;
         }
-        self.daemon.delete_collection(&self.id).await?;
+        // Only these may go: an item that joins meanwhile was not authorized.
+        self.daemon.delete_collection(&self.id, &ids).await?;
         Ok(no_prompt())
     }
 

@@ -7,7 +7,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
@@ -46,7 +46,27 @@ pub struct Patch {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ValueChange {
     Keep,
-    Set { source: ValueSource, secret: Vec<u8>, base_mark: [u8; 32] },
+    /// Writes `secret` back to the value source. `source` and `base_mark`
+    /// are what the change was based on, checked against the copy written
+    /// over. With `owned`, the secret goes into bwss's own storage even when
+    /// the source is the user's: an earlier binary write already added
+    /// `bwss:password`, which is the source from then on (design §5.2).
+    Set {
+        source: ValueSource,
+        secret: Vec<u8>,
+        base_mark: [u8; 32],
+        #[serde(default)]
+        owned: bool,
+    },
+}
+
+/// Queued and planned secrets are wiped when they are dropped or replaced.
+impl Drop for ValueChange {
+    fn drop(&mut self) {
+        if let ValueChange::Set { secret, .. } = self {
+            secret.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -236,17 +256,20 @@ fn write_login_password(body: &mut Map<String, Value>, key: &SymmetricKey, text:
     Ok(())
 }
 
-/// Writes `secret` back to `source` (design §5.2, ADR 0005).
+/// Writes `secret` back to `source` (design §5.2, ADR 0005); with `owned`,
+/// into bwss's own storage instead of a value the user owns.
 fn write_value(
     body: &mut Map<String, Value>,
     fields: &mut Fields,
     source: ValueSource,
     secret: &[u8],
+    owned: bool,
 ) -> Result<(), WriteError> {
     let key = fields.key;
     if let Ok(text) = std::str::from_utf8(secret) {
         fields.remove_all(F_ENCODING);
         return match source {
+            ValueSource::LoginPassword | ValueSource::NoteBody if owned => write_owned_field(body, fields, text),
             ValueSource::Field => write_owned_field(body, fields, text),
             ValueSource::BwssNotes | ValueSource::NoteBody => write_notes(body, key, text),
             ValueSource::LoginPassword => write_login_password(body, key, text),
@@ -290,8 +313,8 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
     let mut fields = Fields::read(cipher, &key)?;
 
     // 3. The value goes back to its source.
-    if let ValueChange::Set { secret, .. } = &patch.value {
-        write_value(&mut body, &mut fields, fresh.source, secret)?;
+    if let ValueChange::Set { secret, owned, .. } = &patch.value {
+        write_value(&mut body, &mut fields, fresh.source, secret, *owned)?;
     }
 
     // 4. bwss's own fields.
@@ -418,7 +441,7 @@ pub fn new_note(item: &ItemData, folder_id: Option<&str>, keys: &Keys) -> Result
     let mut body = Map::new();
     let mut fields = Fields::empty(key);
     fields.set(F_ID, &item.id, false);
-    write_value(&mut body, &mut fields, ValueSource::Field, &item.secret)?;
+    write_value(&mut body, &mut fields, ValueSource::Field, &item.secret, false)?;
     // Derived attributes (and anything else in bwss's namespace) are never
     // stored as attributes.
     for (name, value) in item.attributes.iter().filter(|(n, _)| !n.starts_with(PREFIX)) {
@@ -567,7 +590,8 @@ mod tests {
 
     fn set_secret(c: &Value, k: &Keys, secret: &[u8]) -> Patch {
         let m = marked(c, k);
-        Patch { value: ValueChange::Set { source: m.source, secret: secret.to_vec(), base_mark: m.mark }, ..keep(c, k) }
+        let value = ValueChange::Set { source: m.source, secret: secret.to_vec(), base_mark: m.mark, owned: false };
+        Patch { value, ..keep(c, k) }
     }
 
     fn dec_with(key: &SymmetricKey, v: &Value) -> String {

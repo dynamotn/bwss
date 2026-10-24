@@ -490,14 +490,16 @@ impl Daemon {
         Ok(op(&collection_path(&id)))
     }
 
-    pub async fn delete_collection(self: &Arc<Self>, id: &str) -> SResult<()> {
+    /// Deletes a collection and the items in `authorized`, the ones the
+    /// caller was allowed to delete.
+    pub async fn delete_collection(self: &Arc<Self>, id: &str, authorized: &[String]) -> SResult<()> {
         if id == LOGIN_COLLECTION || id == SESSION_COLLECTION {
             return Err(SecretError::NotSupported("built-in collections cannot be deleted".into()));
         }
         if !self.keyring.lock().await.is_unlocked() {
             return Err(SecretError::IsLocked("the keyring is locked".into()));
         }
-        self.backend.delete_collection(id).await?;
+        self.backend.delete_collection(id, authorized).await?;
         let gone = self.keyring.lock().await.remove_collection(id);
         self.publish(Diff {
             deleted: gone.into_iter().map(|i| (id.to_owned(), i)).collect(),

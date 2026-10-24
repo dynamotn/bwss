@@ -29,6 +29,10 @@ struct Server {
     sync: Value,
     rev: u64,
     down: bool,
+    /// Every item update fails with 503.
+    fail_puts: bool,
+    /// The next this many item updates find the cipher changed elsewhere.
+    stale_puts: usize,
     requests: Vec<(String, String)>,
     /// Run on the stored cipher right before the next PUT to it is handled:
     /// an edit made on another device.
@@ -103,6 +107,17 @@ impl Server {
                 match method {
                     "GET" => self.find(rest).map_or((404, None), |c| (200, Some(c.clone()))),
                     "PUT" => {
+                        if self.fail_puts {
+                            return (503, None);
+                        }
+                        if self.stale_puts > 0 {
+                            self.stale_puts -= 1;
+                            self.rev += 1;
+                            let rev = self.revision();
+                            if let Some(c) = self.find(rest) {
+                                c["revisionDate"] = json!(rev);
+                            }
+                        }
                         if let Some(hook) = self.before_put.take() {
                             self.rev += 1;
                             let rev = self.revision();
@@ -140,6 +155,8 @@ impl Fake {
             sync,
             rev: 1,
             down: false,
+            fail_puts: false,
+            stale_puts: 0,
             requests: Vec::new(),
             before_put: None,
             pause: None,
@@ -572,7 +589,14 @@ async fn collections_live_in_the_registry_note() {
 
     v.backend.put_item(&new_item("n1", "work")).await.unwrap();
     v.snapshot().await;
-    v.backend.delete_collection("work").await.unwrap();
+    // An item that joined after the caller authorized the others is never
+    // deleted: the whole delete is refused.
+    assert!(matches!(v.backend.delete_collection("work", &[]).await, Err(BackendError::Rejected(_))));
+    let n1 = v.fake.with(|s| s.sync["ciphers"].as_array().unwrap().last().unwrap().clone());
+    let n1 = n1["id"].as_str().unwrap().to_owned();
+    assert!(v.fake.cipher(&n1)["deletedDate"].is_null());
+    assert_eq!(v.marked(&n1).item.id, "n1");
+    v.backend.delete_collection("work", &["n1".to_owned()]).await.unwrap();
     let registry = Registry::try_parse(&v.dec(&v.fake.cipher(&cid)["notes"])).unwrap();
     assert!(registry.0["work"].deleted);
     let snap = v.snapshot().await;
@@ -588,7 +612,7 @@ async fn an_unreadable_registry_is_never_written() {
     let writes = || v.fake.count("PUT", "/api/") + v.fake.count("POST", "/api/");
     let before = writes();
     assert!(matches!(v.backend.create_collection("Work").await, Err(BackendError::Rejected(_))));
-    assert!(matches!(v.backend.delete_collection("home").await, Err(BackendError::Rejected(_))));
+    assert!(matches!(v.backend.delete_collection("home", &[]).await, Err(BackendError::Rejected(_))));
     assert_eq!(writes(), before);
     assert!(v.backend.describe().await.contains("collection registry cannot be read"));
 }
@@ -603,4 +627,117 @@ async fn status_lists_duplicates() {
     let status = v.backend.describe().await;
     assert!(status.contains("duplicate id gh: 1 items ignored"), "{status}");
     assert!(status.contains("possible duplicates: GitHub (gh), GitHub (twin)"), "{status}");
+}
+
+#[tokio::test]
+async fn a_write_read_from_the_server_replaces_a_queued_one() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k.clone()).await;
+    // A delete that cannot be sent keeps the queue blocked, so the change
+    // below stays queued across refreshes.
+    v.fake.with(|s| s.fail_puts = true);
+    let x = v.item_offline("x").await;
+    v.backend.delete_item(&x).await.unwrap();
+    let mut item = v.item_offline("gh").await;
+    item.secret = Zeroizing::new(b"one".to_vec());
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queued().await, 2);
+
+    // Another device changes the password; the refresh shows it, since the
+    // queued change cannot be applied to it.
+    let theirs = k.encrypt_str("theirs");
+    v.fake.with(|s| {
+        s.rev += 1;
+        let rev = s.revision();
+        let c = s.find("c1").unwrap();
+        c["login"]["password"] = json!(theirs);
+        c["revisionDate"] = json!(rev);
+    });
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 2);
+    let mut item = v.item_offline("gh").await;
+    assert_eq!(&*item.secret, b"theirs");
+
+    // The app writes again, from what the server holds: that write lands.
+    item.secret = Zeroizing::new(b"two".to_vec());
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.fail_puts = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "two");
+}
+
+#[tokio::test]
+async fn text_after_a_queued_binary_write_never_reaches_the_login_password() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.fake.with(|s| s.down = true);
+    let mut item = v.item_offline("gh").await;
+    item.secret = Zeroizing::new(vec![0xff, 0]);
+    v.backend.put_item(&item).await.unwrap();
+    let mut item = v.item_offline("gh").await;
+    item.secret = Zeroizing::new(b"text".to_vec());
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queued().await, 1);
+
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    let c = v.fake.cipher("c1");
+    assert_eq!(v.dec(&c["login"]["password"]), "pw", "the user's password is untouched");
+    assert!(c["passwordHistory"].as_array().is_none_or(Vec::is_empty));
+    assert!(!v.names("c1").iter().any(|n| n == "bwss:encoding"));
+    let m = v.marked("c1");
+    assert_eq!((m.source, m.item.secret.as_slice()), (crate::bw::scan::ValueSource::Field, &b"text"[..]));
+}
+
+#[tokio::test]
+async fn a_write_out_of_date_on_every_attempt_is_retried_never_lost() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+
+    // Live: the app is told to try again, and nothing is queued.
+    v.fake.with(|s| s.stale_puts = 3);
+    let mut item = v.item("gh").await;
+    item.label = "Mine".into();
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.ends_with("try again")), "{err}");
+    assert_eq!(v.queued().await, 0);
+    assert!(!v.names("c1").iter().any(|n| n == "bwss:label"));
+
+    // Queued: it stays queued, and goes through later.
+    v.fake.with(|s| s.down = true);
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| {
+        s.down = false;
+        s.stale_puts = 6;
+    });
+    v.backend.refresh().await.unwrap();
+    assert_eq!((v.queued().await, v.queue_file()), (1, 1));
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    assert_eq!(v.marked("c1").item.label, "Queued");
+}
+
+#[tokio::test]
+async fn a_delete_keeps_an_item_that_gained_foreign_content_meanwhile() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![], k.clone()).await;
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    let cid = v.fake.with(|s| s.sync["ciphers"][0]["id"].as_str().unwrap().to_owned());
+    let item = v.item("n1").await;
+
+    // While bwss saves the stripped item, another device adds a note field:
+    // the save is out of date, and the retry keeps that field.
+    let (name, value) = (k.encrypt_str("note"), k.encrypt_str("mine"));
+    v.fake.with(|s| {
+        s.before_put = Some(Box::new(move |c: &mut Value| {
+            c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": name, "value": value }));
+        }))
+    });
+    v.backend.delete_item(&item).await.unwrap();
+    assert!(v.fake.cipher(&cid)["deletedDate"].is_null(), "an item with foreign content is never trashed");
+    assert_eq!(v.names(&cid), ["note"]);
+    assert_eq!(v.fake.count("PUT", &format!("/api/ciphers/{cid}/delete")), 0);
 }

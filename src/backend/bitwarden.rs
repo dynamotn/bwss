@@ -614,9 +614,9 @@ impl Backend for BitwardenBackend {
         result
     }
 
-    async fn delete_collection(&self, id: &str) -> Result<(), BackendError> {
+    async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
-        let result = self.delete_collection_locked(&mut queue, id).await;
+        let result = self.delete_collection_locked(&mut queue, id, items).await;
         self.forget_if_locked(&mut queue).await;
         result
     }

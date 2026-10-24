@@ -303,7 +303,12 @@ mod tests {
             set: vec![("bwss:label".into(), "l".into(), false)],
             remove: vec!["bwss:attr:".into()],
             acl_add: vec!["/bin/a".into()],
-            value: ValueChange::Set { source: ValueSource::Field, secret: b"pw".to_vec(), base_mark: [7; 32] },
+            value: ValueChange::Set {
+                source: ValueSource::Field,
+                secret: b"pw".to_vec(),
+                base_mark: [7; 32],
+                owned: false,
+            },
         };
         let back = unseal(&seal(&[Op::Patch(patch)], &key), &key).unwrap();
         match &back[0] {
