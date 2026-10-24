@@ -75,11 +75,20 @@ impl From<BackendError> for SecretError {
 
 pub type SResult<T> = Result<T, SecretError>;
 
-/// Items of the `vault` collection belong to the user's Bitwarden vault, not
-/// to the keyring: apps may read them but never change them.
+/// Nothing can be added to the `vault` collection: it only shows the user's
+/// Bitwarden vault.
 pub fn ensure_writable(collection: &str) -> SResult<()> {
     if collection == VAULT_COLLECTION {
-        return Err(SecretError::NotSupported("items of the vault collection are read-only".into()));
+        return Err(SecretError::NotSupported("the vault collection is read-only".into()));
+    }
+    Ok(())
+}
+
+/// Vault items belong to the user's Bitwarden vault, not to the keyring, in
+/// whatever collection they show up: apps may read them but never change them.
+fn ensure_item_writable(item: &ItemData) -> SResult<()> {
+    if item.read_only {
+        return Err(SecretError::NotSupported(format!("\"{}\" is a read-only vault item", item.label)));
     }
     Ok(())
 }
@@ -319,11 +328,11 @@ impl Daemon {
         let (label, acl, collection) = {
             let k = self.keyring.lock().await;
             let item = k.item(item_id).ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
+            if action != "read" {
+                ensure_item_writable(item)?;
+            }
             (item.label.clone(), item.acl.clone(), item.collection.clone())
         };
-        if action != "read" {
-            ensure_writable(&collection)?;
-        }
         if self.config.acl == AclMode::Off || collection == SESSION_COLLECTION || acl.iter().any(|a| a == caller) {
             return Ok(());
         }
@@ -392,7 +401,8 @@ impl Daemon {
                     .0
                     .into_iter()
                     .map(|(_, id)| id)
-                    .find(|id| k.item(id).is_some_and(|i| i.attributes == attributes))
+                    // A read-only vault item is never replaced: the new item is stored beside it.
+                    .find(|id| k.item(id).is_some_and(|i| i.attributes == attributes && !i.read_only))
             } else {
                 None
             }
@@ -424,6 +434,7 @@ impl Daemon {
                 created: t,
                 modified: t,
                 acl: if caller == crate::acl::UNKNOWN { vec![] } else { vec![caller.to_owned()] },
+                read_only: false,
             },
         };
         let is_new = self.keyring.lock().await.item(&item.id).is_none();
@@ -447,7 +458,7 @@ impl Daemon {
         let item = {
             let k = self.keyring.lock().await;
             let mut item = k.item(id).cloned().ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
-            ensure_writable(&item.collection)?;
+            ensure_item_writable(&item)?;
             f(&mut item);
             item.modified = now();
             item
@@ -470,7 +481,7 @@ impl Daemon {
             .item(id)
             .cloned()
             .ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
-        ensure_writable(&item.collection)?;
+        ensure_item_writable(&item)?;
         if item.collection != SESSION_COLLECTION {
             self.backend.delete_item(&item).await?;
         }

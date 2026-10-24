@@ -27,6 +27,8 @@ pub struct ItemData {
     pub modified: u64,
     /// Executables allowed to use the item without asking.
     pub acl: Vec<String>,
+    /// A vault item outside the keyring folders: apps may read it, never change it.
+    pub read_only: bool,
 }
 
 impl std::fmt::Debug for ItemData {

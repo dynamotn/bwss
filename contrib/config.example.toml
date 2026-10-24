@@ -6,7 +6,9 @@ email = "you@example.com"
 folder = "secret-service"
 # Also show every other item of the vault (logins and secure notes, any folder)
 # in a read-only "vault" collection, searchable by bwss:name, bwss:username, bwss:uri
-# and bwss:folder.
+# and bwss:folder. A custom field bwss:collection = "Work" on an item puts it in
+# that collection instead ("login" for the default one). Any local app can list
+# the names, usernames and URIs of these items; reading a secret needs consent.
 whole_vault = false
 # Any pinentry: pinentry-gnome3, pinentry-qt, pinentry-gtk-2 ...
 prompter = "pinentry"

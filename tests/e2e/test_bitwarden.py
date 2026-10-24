@@ -198,3 +198,26 @@ def test_always_allow_on_vault_items_is_kept_locally(account):
         assert not any(name.startswith("bwss:") for name in account.items("Personal")["Shared"]["fields"])
     finally:
         d.stop()
+
+
+def test_vault_items_can_choose_their_collection(account):
+    account.add_login("Personal", "Placed", "pl4ced", {"bwss:collection": "Projects"})
+    account.add_login(None, "Defaulted", "d3fault", {"bwss:collection": "login"})
+    d = bitwarden_daemon(account, whole_vault=True).start()
+    try:
+        unlock(d, account)
+        bus = secretstorage.dbus_init()
+        projects = secretstorage.Collection(bus, "/org/freedesktop/secrets/collection/projects")
+        placed = next(projects.search_items({"bwss:name": "Placed"}))
+        assert placed.get_secret() == b"pl4ced"
+        with pytest.raises(Exception):
+            placed.set_secret(b"changed")
+        # What an app adds there is an ordinary keyring item, in a new sub-folder.
+        projects.create_item("fresh", {"svc": "fresh"}, b"new")
+        login = secretstorage.get_default_collection(bus)
+        assert next(login.search_items({"bwss:name": "Defaulted"})).get_secret() == b"d3fault"
+        bus.close()
+        assert account.items("Personal")["Placed"]["password"] == "pl4ced"
+        assert account.items(f"{FOLDER}/projects")["fresh"]["password"] == "new"
+    finally:
+        d.stop()

@@ -300,6 +300,7 @@ mod tests {
             created: 1,
             modified: 1,
             acl: vec![],
+            read_only: false,
         }
     }
 

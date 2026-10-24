@@ -34,6 +34,7 @@ fn item(i: usize) -> ItemData {
         created: 1,
         modified: 1,
         acl: vec!["/usr/bin/app".into()],
+        read_only: false,
     }
 }
 

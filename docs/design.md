@@ -105,6 +105,7 @@ flowchart TB
 | Attributes | text fields `bwss:attr:<name>` |
 | Bookkeeping | `bwss:id` (stable id shared by all devices), `bwss:content-type`, `bwss:acl` (hidden field), `bwss:created` |
 | Collection `vault` (`whole_vault = true`) | every other personal login and secure note, in any folder or none; read-only |
+| Field `bwss:collection` (set by the user on such an item) | the collection it shows up in instead of `vault` |
 
 Notes:
 
@@ -123,8 +124,16 @@ Notes:
     `bwss:username`, `bwss:uri` (the first URI) and `bwss:folder`, each
     left out when empty. The `bwss:` prefix keeps an app's ordinary query
     (`service=…`, `username=…`) from matching them by accident.
-  - they are read-only: creating, changing or deleting them, and deleting
-    the collection, fail with `NotSupported`, before any access prompt.
+  - a custom field `bwss:collection` moves one into another collection,
+    matched like collection ids (case-insensitive, `login` or `default` for
+    the default one). A collection no folder backs yet is added; items an
+    app creates there go to a new folder `<root>/<id>` as usual. `session`
+    is refused and the item stays in `vault`.
+  - they are read-only wherever they show up (`ItemData::read_only`):
+    changing or deleting them, adding to `vault`, and deleting `vault` or a
+    collection holding them, fail with `NotSupported`, before any access
+    prompt. `CreateItem` with `replace` never replaces one; it stores a new
+    item beside it.
   - their "Always allow" rules are not written into the item (it is not
     ours) but into `~/.local/state/bwss/vault-acl`, encrypted with a key
     derived from the user key (HKDF, purpose `vault-acl`). Another process

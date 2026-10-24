@@ -22,7 +22,9 @@ use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key}
 use crate::bw::items::{self, MapError};
 use crate::config::{Config, Credentials, Paths};
 use crate::fsutil::write_private;
-use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, VAULT_COLLECTION, now, path_segment};
+use crate::model::{
+    CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, VAULT_COLLECTION, now, path_segment,
+};
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
@@ -81,7 +83,7 @@ fn map_api(e: ApiError) -> BackendError {
 const VAULT_ACL_PURPOSE: &str = "vault-acl";
 
 fn read_only() -> BackendError {
-    BackendError::Rejected("items of the vault collection are read-only".into())
+    BackendError::Rejected("vault items are read-only".into())
 }
 
 fn map_err(e: MapError) -> BackendError {
@@ -226,22 +228,25 @@ impl BitwardenBackend {
         let mut ciphers = HashMap::new();
         for c in sync.get("ciphers").and_then(Value::as_array).into_iter().flatten() {
             let folder_id = c.get("folderId").and_then(Value::as_str);
-            let collection = match folder_id.and_then(|f| folders.get(f)) {
-                Some(collection) => collection.as_str(),
-                None if self.whole_vault => VAULT_COLLECTION,
-                None => continue,
-            };
+            let keyring_collection = folder_id.and_then(|f| folders.get(f));
+            if keyring_collection.is_none() && !self.whole_vault {
+                continue;
+            }
             if !c.get("deletedDate").is_none_or(Value::is_null) || !c.get("organizationId").is_none_or(Value::is_null) {
                 continue;
             }
-            let decoded = items::decode(c, key, collection).and_then(|mut item| {
-                if collection == VAULT_COLLECTION {
+            let decoded = match keyring_collection {
+                Some(collection) => items::decode(c, key, collection),
+                None => items::requested_collection(c, key).and_then(|wanted| {
+                    let collection = Self::place(wanted.as_deref(), &mut collections);
+                    let mut item = items::decode(c, key, &collection)?;
                     let folder = folder_id.and_then(|f| names.get(f)).map(String::as_str);
                     item.attributes.extend(items::vault_attributes(c, key, folder)?);
                     item.acl = vault_acl.get(&item.id).cloned().unwrap_or_default();
-                }
-                Ok(item)
-            });
+                    item.read_only = true;
+                    Ok(item)
+                }),
+            };
             match decoded {
                 Ok(item) => {
                     if let Some(cid) = c.get("id").and_then(Value::as_str) {
@@ -257,6 +262,32 @@ impl BitwardenBackend {
             }
         }
         (Snapshot { collections, items }, folders, ciphers)
+    }
+
+    /// The collection a vault item shows up in: the one its `bwss:collection`
+    /// names (added when no folder backs it yet), or `vault`.
+    fn place(wanted: Option<&str>, collections: &mut Vec<CollectionData>) -> String {
+        let Some(label) = wanted else { return VAULT_COLLECTION.to_owned() };
+        let id = path_segment(&label.to_lowercase());
+        match id.as_str() {
+            LOGIN_COLLECTION | "default" => LOGIN_COLLECTION.to_owned(),
+            VAULT_COLLECTION => id,
+            SESSION_COLLECTION => {
+                tracing::warn!("a vault item cannot go to the session collection; it stays in vault");
+                VAULT_COLLECTION.to_owned()
+            }
+            _ => {
+                if !collections.iter().any(|c| c.id == id) {
+                    collections.push(CollectionData {
+                        id: id.clone(),
+                        label: label.to_owned(),
+                        created: 0,
+                        modified: 0,
+                    });
+                }
+                id
+            }
+        }
     }
 
     fn folder_for<'a>(state: &'a Unlocked, collection: &str) -> Option<&'a str> {
@@ -522,7 +553,7 @@ impl Backend for BitwardenBackend {
     }
 
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        if item.collection == VAULT_COLLECTION {
+        if item.read_only {
             // The daemon only lets the access rules of a vault item change.
             let mut guard = self.state.lock().await;
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
@@ -541,7 +572,7 @@ impl Backend for BitwardenBackend {
     }
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        if item.collection == VAULT_COLLECTION {
+        if item.read_only {
             return Err(read_only());
         }
         let cipher_id = {
@@ -568,5 +599,24 @@ impl Backend for BitwardenBackend {
             "Bitwarden {} ({}), folder \"{}\"{scope}, {queued} queued change(s)",
             self.email, urls.identity, self.root
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_items_are_placed_by_their_collection_field() {
+        let mut collections = vec![CollectionData { id: "work".into(), label: "Work".into(), created: 0, modified: 0 }];
+        assert_eq!(BitwardenBackend::place(None, &mut collections), VAULT_COLLECTION);
+        assert_eq!(BitwardenBackend::place(Some("Default"), &mut collections), LOGIN_COLLECTION);
+        assert_eq!(BitwardenBackend::place(Some("session"), &mut collections), VAULT_COLLECTION);
+        assert_eq!(BitwardenBackend::place(Some("WORK"), &mut collections), "work");
+        assert_eq!(collections.len(), 1);
+        assert_eq!(BitwardenBackend::place(Some("My Stuff"), &mut collections), "my_stuff");
+        assert_eq!(BitwardenBackend::place(Some("my stuff"), &mut collections), "my_stuff");
+        assert_eq!(collections.len(), 2);
+        assert_eq!(collections[1].label, "My Stuff");
     }
 }

@@ -20,6 +20,9 @@ pub const F_ENCODING: &str = "bwss:encoding";
 pub const F_LOCATION: &str = "bwss:location";
 pub const F_ACL: &str = "bwss:acl";
 pub const F_CREATED: &str = "bwss:created";
+/// Set by the user on a vault item outside the keyring folders: the
+/// collection it shows up in, instead of `vault`.
+pub const F_COLLECTION: &str = "bwss:collection";
 
 /// Searchable attributes of items outside the keyring folders (`whole_vault`).
 pub const A_NAME: &str = "bwss:name";
@@ -123,6 +126,7 @@ pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Resu
         created: get(F_CREATED).and_then(|s| s.parse().ok()).unwrap_or(modified),
         modified,
         acl: get(F_ACL).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+        read_only: false,
     })
 }
 
@@ -141,6 +145,16 @@ pub fn vault_attributes(cipher: &Value, user_key: &SymmetricKey, folder: Option<
     put(A_URI, dec(cipher.pointer("/login/uris/0/uri"), &key)?.map(|s| s.to_string()));
     put(A_FOLDER, folder.map(str::to_owned));
     Ok(out)
+}
+
+/// The collection a vault item asks for in its `bwss:collection` field, if any.
+pub fn requested_collection(cipher: &Value, user_key: &SymmetricKey) -> Result<Option<String>, MapError> {
+    let key = item_key(cipher, user_key)?;
+    Ok(fields(cipher, &key)?
+        .into_iter()
+        .find(|(n, _)| n == F_COLLECTION)
+        .map(|(_, v)| v.trim().to_owned())
+        .filter(|v| !v.is_empty()))
 }
 
 /// Response-only properties that must not be echoed back in a write.
@@ -287,6 +301,7 @@ mod tests {
             created: 1_700_000_000,
             modified: 0,
             acl: vec!["/usr/bin/git".into()],
+            read_only: false,
         }
     }
 
@@ -384,6 +399,10 @@ mod tests {
         let note = json!({ "id": "n", "type": 2, "name": key.encrypt_str("Note"), "notes": key.encrypt_str("x") });
         let attrs = vault_attributes(&note, &key, None).unwrap();
         assert_eq!(attrs.keys().collect::<Vec<_>>(), vec![A_NAME]);
+        assert_eq!(requested_collection(&note, &key).unwrap(), None);
+        let field = json!({ "type": 0, "name": key.encrypt_str(F_COLLECTION), "value": key.encrypt_str(" Work ") });
+        let placed = json!({ "id": "p", "type": 2, "name": key.encrypt_str("N"), "fields": [field] });
+        assert_eq!(requested_collection(&placed, &key).unwrap().as_deref(), Some("Work"));
     }
 
     #[test]

@@ -58,7 +58,9 @@ keyring of every other machine running bwss.
   every other login and secure note of your vault shows up in a read-only
   `vault` collection, searchable by `bwss:name`, `bwss:username`, `bwss:uri`
   and `bwss:folder`:
-  `secret-tool lookup bwss:name "Bank"`.
+  `secret-tool lookup bwss:name "Bank"`. Give an item a custom field
+  `bwss:collection` (say `Work`, or `login` for the default collection) to
+  show it in that collection instead.
 - **Your Bitwarden data stays intact.** Editing an item keeps its username,
   URIs, custom fields, attachments and history, and the previous secret
   goes into password history.
