@@ -498,7 +498,8 @@ fn map_api(e: ApiError) -> BackendError {
 impl BitwardenBackend {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
         let urls = resolve_server_urls(&config.server_url).map_err(anyhow::Error::msg)?;
-        let device_path = paths.state.join("device-id");
+        let profile = config.profile.as_deref().ok_or_else(|| anyhow::anyhow!("no profile to serve"))?;
+        let device_path = paths.device_id(profile);
         let device_id = match std::fs::read_to_string(&device_path) {
             Ok(s) if !s.trim().is_empty() => s.trim().to_owned(),
             _ => {
@@ -511,7 +512,11 @@ impl BitwardenBackend {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
             api: Mutex::new(Api::new(urls, device_id)?),
-            key: ApiKey { client_id: creds.client_id, client_secret: creds.client_secret },
+            key: ApiKey {
+                origin: creds.identity_origin,
+                client_id: creds.client_id,
+                client_secret: creds.client_secret,
+            },
             state: Mutex::new(None),
             cache_path: paths.cache.join("sync.json"),
             queue_path: paths.state.join("queue.json"),

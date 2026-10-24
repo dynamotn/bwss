@@ -407,7 +407,8 @@ changing are never clobbered. Then:
     exits, with a warning in the log.
   - The memory backend's items never leave the daemon, so its lines count
     without confirmation.
-- `acl = "off"` disables checks (gnome-keyring behaviour). The `session`
+- `bwss acl off` disables checks on this device (gnome-keyring
+  behaviour); it is device state, never a config key (§10). The `session`
   collection is exempt.
 - Labels and attributes of marked items are readable by any process on the
   bus while unlocked; that is how the Secret Service API works. This is why
@@ -435,7 +436,7 @@ Unchanged from `legacy`:
   close it. When a client leaves the bus its sessions and prompts are freed; at
   the global limit, departed clients are reaped first, then the oldest session
   of the client holding the most is closed.
-- Lock on request, after `idle_lock_minutes`, and on SIGTERM: keys and
+- Lock on request, after `lock_timeout_minutes` (default 60), and on SIGTERM: keys and
   decrypted items are zeroized, the API session is dropped.
 - The locked index (`~/.cache/bwss/locked-index.json`) keeps, per marked
   item, its id, its collection and SHA-256(salt ‖ name ‖ 0 ‖ value) of each
@@ -671,25 +672,83 @@ ptrace it.
 
 ## 10. Configuration and CLI
 
+bwss reads the file every dybw tool shares, `$XDG_CONFIG_HOME/dybw/config.toml`
+(dybw ADR 0008, profiles §1). It has no file of its own.
+
 ```toml
-backend = "bitwarden"            # or "memory" for tests and demos
+default = "personal"
+
+lock_timeout_minutes = 60        # shared by every profile
+sync_interval_seconds = 300
+pinentry = "pinentry-gnome3"
+
+[profiles.personal]
 server_url = "https://vault.bitwarden.com"
 email = "you@example.com"
+
+[bwss]
+profile = "personal"             # default: `default`
 folder = "secret-service"        # where new items are created
-prompter = "pinentry"
-acl = "prompt"                   # or "off"
-idle_lock_minutes = 0
-sync_interval_seconds = 300
+backend = "bitwarden"            # or "memory" (with memory_password) for tests and demos
 ```
 
-`whole_vault` is gone: the marker replaces it. `deny_unknown_fields` stays,
-so an old config with `whole_vault` fails loudly at start.
+- **One profile.** bwss serves `[bwss] profile`, or the file's `default`.
+  The account (`server_url`, `email`) comes from that profile.
+  `lock_timeout_minutes`, `sync_interval_seconds` and `pinentry` resolve
+  from the profile, then the top level, then the built-in default (60,
+  300, `pinentry`). `auth` must resolve to `"api-key"`, the only login bwss
+  has. The memory backend needs no profile.
+- **Validation.** bwss checks the top level and the profile it serves
+  against the key registry of profiles §1, and `[bwss]` against its four
+  keys (`profile`, `folder`, `backend`, `memory_password`). An unknown key
+  there is an error, and so is a shared key (`default`,
+  `clipboard_clear_seconds`) inside a profile. Every other table
+  (`[ssh_agent]`, `[obsidian]`, other profiles, a newer tool's section) is
+  ignored. The registry is a test fixture
+  (`tests/fixtures/config-registry.toml`) that mirrors the table in dybw.
+- **Nothing in the file weakens a check**, because it may be synced:
+  - an `acl` key anywhere is an error. Turning the ACL off is device
+    state: `bwss acl off` (asked on the terminal, refused when stdin is not
+    one) creates `$XDG_STATE_HOME/dybw/tools/bwss/acl-off`, and `bwss acl
+    on` removes it. The daemon reads it at start.
+  - `pinentry` is resolved to an absolute path (a bare name through
+    `PATH`). The daemon refuses to start unless that path is in `/usr/bin`,
+    `/usr/local/bin`, `/opt/homebrew/bin` or `/run/current-system/sw/bin`,
+    and neither the program (after links) nor that directory is writable by
+    the user: owned by them, writable by a group they are in or by anyone,
+    or the user is root.
+- **The API key** lives in `$XDG_STATE_HOME/dybw/profiles/<profile>/credentials`
+  (TOML: `identity_origin`, `client_id`, `client_secret`), mode 0600,
+  shared with the dybw CLI. It must be a regular file owned by the user,
+  not a link. `identity_origin` is the `scheme://host[:port]` of the
+  identity URL it was entered for. When the profile's server resolves to
+  another origin, the daemon refuses to start and asks for `bwss login`;
+  the stored key is kept, not cleared. `Api::login` checks the same binding
+  before every token request.
+- **Device id:** `$XDG_STATE_HOME/dybw/profiles/<profile>/devices/bwss`.
+  The cache (`$XDG_CACHE_HOME/bwss`), the queue (`$XDG_STATE_HOME/bwss`) and
+  the locked index keep their paths. The daemon creates these directories,
+  or tightens them, to 0700.
+- **Migration.** When `~/.config/bwss/config.toml` exists and the dybw file
+  has no `[bwss]`, every command that reads the config stops and names
+  `bwss config migrate`. That command reuses a profile with the same server
+  and email or adds `[profiles.bwss]`; moves `folder` and `backend` (and
+  `memory_password` for the memory backend) into `[bwss]`; turns a non-zero
+  `idle_lock_minutes` into a `lock_timeout_minutes` override and a
+  `prompter` into a `pinentry` override, after checking it as above;
+  makes `acl = "off"` device state only if the user confirms it on the
+  terminal; moves the API key (bound to the profile's origin) and the
+  device id. It edits the dybw file as text, so comments survive, and
+  writes nothing unless the result passes validation. Old files are renamed
+  `*.migrated`, never deleted.
 
 ```
 bwss daemon [--replace]
 bwss unlock [--password-stdin]
 bwss lock | sync | status
-bwss login --email E [--server URL] --client-id ID [--client-secret-stdin]
+bwss login --client-id ID [--client-secret-stdin]
+bwss acl off | on
+bwss config migrate
 ```
 
 `bwss unlock` calls `UnlockInteractive`: the daemon shows the pinentry and
@@ -728,7 +787,8 @@ boundary for `--password-stdin`.
 | Secrets | ACL plus fail-closed confirmation; DH-AES sessions on the bus |
 | User data in marked items | Writes touch bwss fields and the value source only; a new secret never goes into the user's password or notes; trash only when no foreign content (other tools' fields included) is left |
 | Master password, user key | Local only, zeroized, dropped on lock |
-| API key | 0600 file, https only except loopback, redirects disabled |
+| API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
+| Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a system program the user cannot replace (§10) |
 | Disk | Bitwarden ciphertext only (cache, queue, ACL confirmations); hashed locked index |
 | Server input | KDF bounds, MAC checked before decrypt, error text clipped |
 
@@ -791,7 +851,8 @@ config, fsutil), since none of those change in substance.
 | `model.rs` | No `read_only`; reversible path escape |
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
-| `keyring.rs`, `session.rs`, `prompter.rs`, `config.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault` |
+| `config.rs`, `migrate.rs` | The shared dybw file (§10): registry validation, profile resolution, the `pinentry` rule, origin-bound credentials, `bwss config migrate` |
+| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl` and `bwss config migrate` |
 
 ## 14. Compatibility with `legacy`
 
@@ -806,7 +867,8 @@ files that the folder-based bwss (branch `legacy`) wrote:
   start delete those items, or their bwss fields, by hand.
 - Collections `legacy` built from sub-folders are not recognised; their
   items show up in `login` until they get `bwss:collection`.
-- `whole_vault` is an unknown config key and stops the daemon at start.
+- `whole_vault` is an unknown key of the old `~/.config/bwss/config.toml`,
+  so `bwss config migrate` refuses that file until the key is removed.
 - The cache, queue and locked index keep their paths but carry
   `"format": 2`. A file without it (left by `legacy`) is not read: the
   cache and the index are rebuilt, and a queue is renamed

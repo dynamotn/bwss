@@ -19,12 +19,28 @@ from jeepney.bus_messages import message_bus
 
 HERE = Path(__file__).parent
 BWSS = os.environ.get("BWSS_BIN", str(HERE.parents[1] / "target" / "release" / "bwss"))
-PINENTRY = str(HERE / "fake_pinentry.py")
+# bwss only runs a pinentry from a system directory the user cannot write
+# (ADR 0008), so the test image installs the fake one there.
+PINENTRY = os.environ.get("BWSS_E2E_PINENTRY", "/usr/local/bin/fake-pinentry")
 SQUATTER = str(HERE / "squatter.py")
+PROFILE = "e2e"
+
+
+def toml_lines(table: dict) -> list[str]:
+    # JSON strings, numbers and booleans are valid TOML values.
+    return [f"{k} = {json.dumps(v)}" for k, v in table.items()]
 
 
 class Daemon:
-    def __init__(self, config: dict, home: Path | None = None):
+    """A bwss home: the shared dybw config file, device state, and a daemon.
+
+    `bwss` is the [bwss] section; `profile`, when given, becomes
+    [profiles.e2e], the profile bwss serves; `top` adds top-level keys.
+    `acl_off` writes the device state that `bwss acl off` would.
+    """
+
+    def __init__(self, bwss: dict, profile: dict | None = None, top: dict | None = None, acl_off: bool = False,
+                 home: Path | None = None):
         self.home = home or Path(tempfile.mkdtemp(prefix="bwss-e2e-"))
         self.ctl = self.home / "pinentry.json"
         self.log = self.home / "pinentry.log"
@@ -37,11 +53,23 @@ class Daemon:
             FAKE_PINENTRY_LOG=str(self.log),
             BWSS_LOG="debug",
         )
-        (self.home / "config" / "bwss").mkdir(parents=True, exist_ok=True)
-        lines = [f'prompter = "{PINENTRY}"'] + [f"{k} = {json.dumps(v)}" for k, v in config.items()]
-        (self.home / "config" / "bwss" / "config.toml").write_text("\n".join(lines) + "\n")
+        self.config = self.home / "config" / "dybw" / "config.toml"
+        self.state = self.home / "state" / "dybw"
+        self.write_config(bwss, profile, top)
+        if acl_off:
+            (self.state / "tools" / "bwss").mkdir(parents=True, exist_ok=True)
+            (self.state / "tools" / "bwss" / "acl-off").write_text("off\n")
         self.pinentry(pins=[], confirm="deny")
         self.proc = None
+
+    def write_config(self, bwss: dict, profile: dict | None = None, top: dict | None = None):
+        lines = toml_lines({"pinentry": PINENTRY, **(top or {})})
+        if profile is not None:
+            lines += ["", f"[profiles.{PROFILE}]"] + toml_lines(profile)
+            bwss = {"profile": PROFILE, **bwss}
+        lines += ["", "[bwss]"] + toml_lines(bwss)
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text("\n".join(lines) + "\n")
 
     def pinentry(self, **ctl):
         self.ctl.write_text(json.dumps(ctl))
@@ -126,7 +154,7 @@ def squatters():
 
 @pytest.fixture
 def memory_daemon():
-    d = Daemon({"backend": "memory", "memory_password": "open sesame", "acl": "prompt"}).start()
+    d = Daemon({"backend": "memory", "memory_password": "open sesame"}).start()
     yield d
     d.stop()
 

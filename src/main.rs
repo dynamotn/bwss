@@ -9,6 +9,7 @@ mod daemon;
 mod dbus;
 mod fsutil;
 mod keyring;
+mod migrate;
 mod model;
 #[cfg(test)]
 mod perf;
@@ -16,18 +17,19 @@ mod prompter;
 mod session;
 mod sync;
 
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 use zeroize::Zeroizing;
 
 use crate::backend::{Backend, bitwarden::BitwardenBackend, memory::MemoryBackend};
-use crate::config::{BackendKind, Credentials, Paths, load_config};
+use crate::bw::api::identity_origin;
+use crate::config::{BackendKind, Credentials, Paths, Trust};
 use crate::daemon::Daemon;
 use crate::dbus::{CONTROL_NAME, CONTROL_PATH};
 use crate::keyring::Keyring;
@@ -65,18 +67,56 @@ enum Command {
     Sync,
     /// Show whether the keyring is unlocked.
     Status,
-    /// Save the Bitwarden account and API key.
+    /// Save the API key of the profile bwss serves, bound to its server.
     Login {
-        #[arg(long)]
-        email: String,
-        #[arg(long, default_value = "https://vault.bitwarden.com")]
-        server: String,
         #[arg(long)]
         client_id: String,
         /// Read the client secret from the first line of stdin instead of asking.
         #[arg(long)]
         client_secret_stdin: bool,
     },
+    /// Turn per-application access control off or on, on this device.
+    Acl {
+        #[arg(value_enum)]
+        mode: AclSwitch,
+    },
+    /// Manage the configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AclSwitch {
+    Off,
+    On,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Move ~/.config/bwss/config.toml into the shared dybw file.
+    Migrate,
+}
+
+const ACL_OFF_QUESTION: &str = "Turn off per-application access control on this device?\n\
+    Every program running as you could then use every keyring item without being asked.\n\
+    Type \"yes\" to turn it off: ";
+
+/// Asks `question` on the terminal; only "yes" confirms.
+fn confirm(question: &str, tty: bool, input: &mut dyn BufRead, out: &mut dyn Write) -> anyhow::Result<bool> {
+    if !tty {
+        bail!("this needs a confirmation on a terminal, and stdin is not one");
+    }
+    write!(out, "{question}")?;
+    out.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn confirm_on_terminal(question: &str) -> anyhow::Result<bool> {
+    confirm(question, std::io::stdin().is_terminal(), &mut std::io::stdin().lock(), &mut std::io::stderr())
 }
 
 fn read_line_secret(prompt: &str, from_stdin: bool) -> anyhow::Result<Zeroizing<String>> {
@@ -194,19 +234,25 @@ async fn claim_names(conn: &zbus::Connection, replace: bool) -> anyhow::Result<(
 
 async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     let paths = Paths::from_env();
-    let config = load_config(&paths)?;
+    let trust = Trust::system()?;
+    let config = config::load(&paths, &trust)?;
+    for dir in [&paths.cache, &paths.state, &paths.tool_state] {
+        fsutil::ensure_private_dir(dir).with_context(|| format!("{}", dir.display()))?;
+    }
     let (backend, index): (Arc<dyn Backend>, _) = match config.backend {
         BackendKind::Memory => (Arc::new(MemoryBackend::new(config.memory_password.clone())), None),
         BackendKind::Bitwarden => {
-            if config.email.is_empty() {
-                bail!("set `email` in {} (or run `bwss login`)", paths.config.display());
+            let profile = config.profile.as_deref().context("bwss serves no profile")?;
+            for dir in [paths.profile_dir(profile), paths.devices(profile)] {
+                fsutil::ensure_private_dir(&dir).with_context(|| format!("{}", dir.display()))?;
             }
-            let creds = config::load_credentials(&paths)?;
+            let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
+            let creds = config::load_credentials(&paths.credentials(profile), &trust.user, &origin)?;
             let b = BitwardenBackend::new(&config, creds, &paths)?;
             (Arc::new(b), Some(paths.cache.join("locked-index.json")))
         }
     };
-    let prompter = Prompter::new(config.prompter.clone(), Duration::from_secs(120));
+    let prompter = Prompter::new(config.pinentry.clone(), Duration::from_secs(120));
     let daemon = Daemon::new(Keyring::new(index), backend, prompter, config.clone());
     daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
 
@@ -228,9 +274,9 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
         }
     });
     // Idle lock.
-    if config.idle_lock_minutes > 0 {
+    if config.lock_timeout_minutes > 0 {
         let d = daemon.clone();
-        let limit = Duration::from_secs(config.idle_lock_minutes * 60);
+        let limit = Duration::from_secs(config.lock_timeout_minutes.saturating_mul(60));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -289,18 +335,47 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Login { email, server, client_id, client_secret_stdin } => {
-            crate::bw::api::resolve_server_urls(&server).map_err(anyhow::Error::msg)?;
-            let secret = read_line_secret("API key client_secret: ", client_secret_stdin)?;
+        Command::Login { client_id, client_secret_stdin } => {
             let paths = Paths::from_env();
-            let mut config = load_config(&paths)?;
-            config.email = email;
-            config.server_url = server;
-            config.backend = BackendKind::Bitwarden;
-            fsutil::write_private(&paths.config, toml::to_string_pretty(&config)?.as_bytes())?;
-            let creds = Credentials { client_id, client_secret: secret };
-            fsutil::write_private(&paths.credentials, Zeroizing::new(toml::to_string(&creds)?).as_bytes())?;
-            println!("saved {} and {}", paths.config.display(), paths.credentials.display());
+            let account = config::load_settings(&paths)?.account.with_context(|| {
+                format!("bwss serves no profile: set `default` or `[bwss] profile` in {}", paths.config.display())
+            })?;
+            let origin = identity_origin(&account.server_url).map_err(anyhow::Error::msg)?;
+            let client_secret = read_line_secret("API key client_secret: ", client_secret_stdin)?;
+            let path = paths.credentials(&account.profile);
+            config::save_credentials(
+                &path,
+                &Credentials { identity_origin: origin.clone(), client_id, client_secret },
+            )?;
+            println!(
+                "saved the API key of profile {} ({}, {origin}) in {}",
+                account.profile,
+                account.email,
+                path.display()
+            );
+            Ok(())
+        }
+        Command::Acl { mode } => {
+            let paths = Paths::from_env();
+            let off = matches!(mode, AclSwitch::Off);
+            if off && !confirm_on_terminal(ACL_OFF_QUESTION)? {
+                bail!("not confirmed; access control stays on");
+            }
+            config::set_acl_off(&paths, off).with_context(|| format!("{}", paths.acl_off().display()))?;
+            println!(
+                "access control is {} on this device; restart the bwss daemon to apply it",
+                if off { "off" } else { "on" }
+            );
+            Ok(())
+        }
+        Command::Config { command: ConfigCommand::Migrate } => {
+            let paths = Paths::from_env();
+            let mut ask = || {
+                if std::io::stdin().is_terminal() { confirm_on_terminal(ACL_OFF_QUESTION) } else { Ok(false) }
+            };
+            for line in migrate::migrate(&paths, &Trust::system()?, &mut ask)? {
+                println!("{line}");
+            }
             Ok(())
         }
     }
@@ -324,6 +399,22 @@ async fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_yes_on_a_terminal_confirms() {
+        let ask = |tty: bool, answer: &str| {
+            let mut out = Vec::new();
+            let r = confirm("Sure? ", tty, &mut answer.as_bytes(), &mut out);
+            (r.map_err(|e| e.to_string()), String::from_utf8_lossy(&out).into_owned())
+        };
+        assert_eq!(ask(true, "yes\n"), (Ok(true), "Sure? ".to_owned()));
+        assert_eq!(ask(true, " YES \n").0, Ok(true));
+        assert_eq!(ask(true, "y\n").0, Ok(false));
+        assert_eq!(ask(true, "").0, Ok(false));
+        let (refused, said) = ask(false, "yes\n");
+        assert!(refused.is_err_and(|e| e.contains("terminal")));
+        assert!(said.is_empty(), "nothing is asked without a terminal");
+    }
 
     #[test]
     fn a_taken_name_says_who_holds_it_and_what_to_do() {

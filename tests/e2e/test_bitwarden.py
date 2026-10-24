@@ -8,7 +8,10 @@ import base64
 import json
 import os
 import shutil
+import socket
+import threading
 import time
+import urllib.parse
 
 import pytest
 import secretstorage
@@ -27,10 +30,10 @@ def account():
 
 
 def bitwarden_daemon(account, server=None, acl="off"):
-    d = Daemon({"backend": "bitwarden", "folder": FOLDER, "acl": acl})
-    # `bwss login` keeps the other settings and stores the API key with mode 0600.
-    d.cli("login", "--email", account.email, "--server", server or URL, "--client-id", account.client_id,
-          "--client-secret-stdin", input=account.client_secret + "\n")
+    d = Daemon({"backend": "bitwarden", "folder": FOLDER}, profile={"server_url": server or URL, "email": account.email},
+               acl_off=acl == "off")
+    # `bwss login` stores the profile's API key, bound to its server.
+    d.cli("login", "--client-id", account.client_id, "--client-secret-stdin", input=account.client_secret + "\n")
     return d
 
 
@@ -97,30 +100,87 @@ def test_restart_finds_locked_items_and_unlocks_on_demand(account):
         d.stop()
 
 
-def test_offline_unlock_reads_and_queues_writes(account):
-    online = bitwarden_daemon(account).start()
-    unlock(online, account)
-    online.tool("store", "--label=offline-read", "off", "read", input="cached")
-    online.stop()
+class Relay:
+    """A TCP relay to Vaultwarden that can be cut: the server goes offline
+    while its URL, and so the origin the API key is bound to, stays the same."""
 
-    # Same home, unreachable server: unlock from the cache, write into the queue.
-    cfg = online.home / "config" / "bwss" / "config.toml"
-    original = cfg.read_text()
-    assert f'server_url = "{URL}"' in original
-    cfg.write_text(original.replace(f'server_url = "{URL}"', 'server_url = "http://127.0.0.1:9"'))
-    online.start()
+    def __init__(self, target_url):
+        u = urllib.parse.urlsplit(target_url)
+        self.target = (u.hostname, u.port or 80)
+        self.up = True
+        self.conns = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            if not self.up:
+                client.close()
+                continue
+            server = socket.create_connection(self.target)
+            self.conns += [client, server]
+            for a, b in ((client, server), (server, client)):
+                threading.Thread(target=self._pipe, args=(a, b), daemon=True).start()
+
+    @staticmethod
+    def _pipe(a, b):
+        try:
+            while data := a.recv(65536):
+                b.sendall(data)
+        except OSError:
+            pass
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def cut(self):
+        self.up = False
+        for s in self.conns:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.conns = []
+
+    def restore(self):
+        self.up = True
+
+    def close(self):
+        self.cut()
+        self.sock.close()
+
+
+def test_offline_unlock_reads_and_queues_writes(account):
+    relay = Relay(URL)
+    online = bitwarden_daemon(account, server=relay.url).start()
     try:
         unlock(online, account)
-        assert online.tool("lookup", "off", "read").stdout == "cached"
-        online.tool("store", "--label=offline-write", "off", "write", input="queued")
-        assert "1 queued" in online.cli("status").stdout
-        assert "offline-write" not in account.items(FOLDER)
-    finally:
+        online.tool("store", "--label=offline-read", "off", "read", input="cached")
         online.stop()
 
-    cfg.write_text(original)
-    online.start()
-    try:
+        # Same home, unreachable server: unlock from the cache, write into the queue.
+        relay.cut()
+        online.start()
+        try:
+            unlock(online, account)
+            assert online.tool("lookup", "off", "read").stdout == "cached"
+            online.tool("store", "--label=offline-write", "off", "write", input="queued")
+            assert "1 queued" in online.cli("status").stdout
+            assert "offline-write" not in account.items(FOLDER)
+        finally:
+            online.stop()
+
+        relay.restore()
+        online.start()
         unlock(online, account)
         deadline = time.time() + 10
         while "offline-write" not in account.items(FOLDER) and time.time() < deadline:
@@ -129,6 +189,7 @@ def test_offline_unlock_reads_and_queues_writes(account):
         assert "0 queued" in online.cli("status").stdout
     finally:
         online.stop()
+        relay.close()
 
 
 def test_collections_come_from_the_field(account):

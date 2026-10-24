@@ -94,6 +94,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dbus dbus-daemon libsecret-tools \
             python3-pytest python3-secretstorage python3-cryptography python3-jeepney
+          # bwss runs a pinentry only from a system directory the user cannot write.
+          sudo install -o root -g root -m 755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
       - run: cargo build --locked --release
       - name: Wait for Vaultwarden
         run: |

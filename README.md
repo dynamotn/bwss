@@ -77,8 +77,9 @@ keychain-bitwarden.
 
 **Coming from the old folder-based bwss?** There is no migration: start over.
 Items it created carry `bwss:id`, so they show up as marked items, but its
-folder-based collections are not recognised, and an old config with a key
-this version no longer has stops the daemon at start (remove that key).
+folder-based collections are not recognised, and `bwss config migrate`
+refuses an old config with a key this version no longer has (remove that
+key, such as `whole_vault`, first).
 The old cache and locked index are rebuilt, and an
 old offline queue is renamed `queue.json.legacy` and never replayed, so flush
 offline writes before upgrading. See
@@ -165,18 +166,27 @@ git clone <this repository> && cd bwss
 cargo install --path .            # puts bwss in ~/.cargo/bin
 ```
 
-**2. Connect your account.** Get a personal API key from the Bitwarden web
-vault: *Settings → Security → Keys → View API key*.
+**2. Connect your account.** bwss shares one config file with the other
+dybw tools, `~/.config/dybw/config.toml`: your account is a profile there,
+and bwss's own settings go in `[bwss]`. Start from
+[`contrib/config.example.toml`](contrib/config.example.toml) (server, email,
+folder for new items, pinentry program, lock timeout, sync interval).
+Then get a personal API key from the Bitwarden web vault (*Settings →
+Security → Keys → View API key*) and store it:
 
 ```sh
-bwss login --email you@example.com --client-id user.xxxxxxxx   # asks for client_secret
-# Self-hosted? add: --server https://vault.example.org
+install -Dm644 contrib/config.example.toml ~/.config/dybw/config.toml   # then edit it
+bwss login --client-id user.xxxxxxxx      # asks for client_secret
 ```
 
-This writes `~/.config/bwss/config.toml` and `~/.config/bwss/credentials.toml`,
-both with mode `0600`. See
-[`contrib/config.example.toml`](contrib/config.example.toml) for the options
-(folder for new items, pinentry program, access control, idle lock, sync interval).
+The key goes to `~/.local/state/dybw/profiles/<profile>/credentials` (mode
+`0600`), bound to your server: if the profile's server changes, bwss refuses
+to send the key there until you run `bwss login` again.
+
+Coming from an older bwss with `~/.config/bwss/config.toml`? bwss stops and
+asks you to run `bwss config migrate`, which moves the account, settings,
+API key and device id into the shared file and state directory, and renames
+the old files to `*.migrated`.
 
 **3. Take over the keyring.** Stop gnome-keyring's secrets component (or
 KWallet's or KeePassXC's integration) first, then:
@@ -224,6 +234,14 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
   trade-off gnome-keyring makes.
 - Only the `bwss` CLI itself may send the master password to the daemon
   (`Control1.UnlockWithPassword`); any other executable is refused.
+- The config file may be synced with your dotfiles, so nothing in it can
+  weaken a check. Per-app access control is turned off only on the device,
+  with `bwss acl off` (confirmed on the terminal; `bwss acl on` undoes it).
+  The pinentry must be a program in a system directory (`/usr/bin`,
+  `/usr/local/bin`, `/opt/homebrew/bin`, `/run/current-system/sw/bin`) that
+  you cannot write to, or the daemon refuses to start.
+- The API key is bound to the identity server it was entered for and is
+  never sent to another one.
 - Access grants (`bwss:acl`) sync, but a device honours one only after it
   granted or confirmed it. Its decisions live in
   `~/.local/state/dybw/tools/bwss/acl-confirmed`, sealed with your vault
@@ -245,8 +263,8 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control) | 165 pass, 1 ignored (perf) |
-| End-to-end against Vaultwarden 1.37.4 | 44 pass (17 Bitwarden, 19 Secret Service, 8 bus names) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 210 pass, 1 ignored (perf) |
+| End-to-end against Vaultwarden 1.37.4 | 54 pass (17 Bitwarden, 19 Secret Service, 8 bus names, 10 config) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
 **Not tested yet**: bitwarden.com itself (all server tests used
@@ -267,8 +285,10 @@ session, and end-to-end tests on x86_64.
 cargo test                                            # unit tests
 cargo test --release perf -- --ignored --nocapture    # performance budgets
 
-# End-to-end on Linux: dbus, secret-tool, python-secretstorage
-docker build -t bwss-e2e tests/e2e
+# End-to-end on Linux: dbus, secret-tool, python-secretstorage. The image
+# installs the fake pinentry in /usr/local/bin and runs the tests as a
+# non-root user, since bwss trusts no pinentry for root.
+docker build -t bwss-e2e -f tests/e2e/Dockerfile .
 docker run --rm -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
 
 # …and against a throwaway Vaultwarden (the test container joins its network)

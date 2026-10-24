@@ -1,12 +1,30 @@
-# ~/.config/bwss/config.toml
-backend = "bitwarden"
-server_url = "https://vault.bitwarden.com"
+# $XDG_CONFIG_HOME/dybw/config.toml (usually ~/.config/dybw/config.toml)
+#
+# One file for every dybw tool (dybw ADR 0008). bwss reads the top level, the
+# profile it serves and [bwss]; it ignores the other tools' sections. An
+# unknown key in those three places stops bwss, so typos fail loudly.
+# Nothing here can switch a protection off: `acl` is refused, and per-app
+# access control is turned off on the device itself with `bwss acl off`.
+
+default = "personal"             # the profile bwss serves unless [bwss] says otherwise
+
+# Shared by every profile; a profile may override them.
+lock_timeout_minutes = 60        # lock after this long without use (0 = never)
+sync_interval_seconds = 300      # pull changes from Bitwarden this often
+# The program that asks for the master password: pinentry-gnome3,
+# pinentry-qt, pinentry-gtk-2, ... It must live in /usr/bin, /usr/local/bin,
+# /opt/homebrew/bin or /run/current-system/sw/bin, and neither it nor its
+# directory may be writable by you; otherwise bwss refuses to start.
+pinentry = "pinentry"
+
+[profiles.personal]
+server_url = "https://vault.bitwarden.com"   # self-hosted: https://vault.example.org
 email = "you@example.com"
-# Folder where new items are created. Items you mark with a bwss:id field in any folder are used too.
+# lock_timeout_minutes = 15                  # an override for this profile only
+
+[bwss]
+profile = "personal"
+# Folder where new items are created. Items you mark with a bwss:id field in
+# any folder are used too.
 folder = "secret-service"
-# Any pinentry: pinentry-gnome3, pinentry-qt, pinentry-gtk-2 ...
-prompter = "pinentry"
-# "prompt": ask before an app reads an item it did not create. "off": gnome-keyring behaviour.
-acl = "prompt"
-idle_lock_minutes = 0
-sync_interval_seconds = 300
+backend = "bitwarden"            # or "memory" for tests and demos (with memory_password)

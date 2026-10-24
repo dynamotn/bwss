@@ -86,7 +86,13 @@ e2e:
     - socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:vaultwarden:80 &
     - cargo build --locked --release
     - for _ in $(seq 60); do curl -fsS "$BW_E2E_URL/alive" && break; sleep 2; done
-    - dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
+    # bwss runs a pinentry only from a system directory the user cannot
+    # write, and trusts none as root: install the fake one, run as a user.
+    - install -o root -g root -m 755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
+    - useradd --create-home tester
+    - >-
+      setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester
+      dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
   timeout: 20 minutes
 
 # Fully static musl binaries, built without any cache.

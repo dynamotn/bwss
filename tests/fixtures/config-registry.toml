@@ -1,0 +1,43 @@
+# The key registry of the shared dybw config file, copied from dybw
+# docs/profiles.md §1 ("The key registry", dybw b0d8dc9). It is normative
+# there; this copy is a test fixture, and `config.rs` must agree with it.
+# When the table changes upstream, change this file first.
+#
+# `where`: "top" (top level) and/or "profile" ([profiles.<name>]).
+# `default`: the built-in default, when the table gives one.
+
+[keys.default]
+where = ["top"]
+
+[keys.auth]
+where = ["top", "profile"]
+default = "api-key"
+
+[keys.lock_timeout_minutes]
+where = ["top", "profile"]
+default = 60
+
+[keys.sync_interval_seconds]
+where = ["top", "profile"]
+default = 300
+
+[keys.pinentry]
+where = ["top", "profile"]
+default = "pinentry"
+
+[keys.clipboard_clear_seconds]
+where = ["top"]
+default = 30
+
+[keys.server_url]
+where = ["profile"]
+required = true
+
+[keys.email]
+where = ["profile"]
+required = true
+
+# Top-level tables: `[ssh_agent]` belongs to the agent and `[<namespace>]`
+# to that tool. bwss owns `[bwss]` and ignores every other table.
+[tables]
+ignored_examples = ["ssh_agent", "obsidian", "some_future_tool"]

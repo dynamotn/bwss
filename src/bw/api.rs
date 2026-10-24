@@ -93,15 +93,31 @@ pub fn normalize_keys(value: Value) -> Value {
     }
 }
 
+/// `scheme://host[:port]` of `url`, the unit an API key is bound to.
+pub fn origin_of(url: &str) -> Result<String, String> {
+    Url::parse(url).map(|u| u.origin().ascii_serialization()).map_err(|e| format!("invalid URL {url:?}: {e}"))
+}
+
+/// The identity origin of a vault URL: where its API key may go.
+pub fn identity_origin(server_url: &str) -> Result<String, String> {
+    origin_of(&resolve_server_urls(server_url)?.identity)
+}
+
 #[derive(Clone)]
 pub struct ApiKey {
+    /// The only identity origin this key may be sent to.
+    pub origin: String,
     pub client_id: String,
     pub client_secret: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApiKey").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
+        f.debug_struct("ApiKey")
+            .field("origin", &self.origin)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
     }
 }
 
@@ -181,6 +197,14 @@ impl Api {
     /// the access token (Authorization header) into its own buffers, which
     /// bwss cannot wipe.
     pub async fn login(&mut self, key: &ApiKey) -> Result<(), ApiError> {
+        // The key is bound to the identity origin it was entered for (TM-007).
+        let here = origin_of(&self.urls.identity).map_err(ApiError::Protocol)?;
+        if key.origin != here {
+            return Err(ApiError::Protocol(format!(
+                "the API key was saved for {}, not {here}; run `bwss login` again",
+                key.origin
+            )));
+        }
         let form = [
             ("grant_type", "client_credentials"),
             ("scope", "api"),
@@ -326,7 +350,11 @@ mod tests {
 
     #[test]
     fn api_key_debug_is_redacted() {
-        let k = ApiKey { client_id: "the-id".into(), client_secret: Zeroizing::new("hunter2-secret".into()) };
+        let k = ApiKey {
+            origin: "https://identity.example.org".into(),
+            client_id: "the-id".into(),
+            client_secret: Zeroizing::new("hunter2-secret".into()),
+        };
         let out = format!("{k:?}");
         assert!(!out.contains("hunter2-secret"));
         assert!(out.contains("<redacted>"));
@@ -347,6 +375,46 @@ mod tests {
         assert_eq!(resolve_server_urls("http://127.0.0.1:8080").unwrap().identity, "http://127.0.0.1:8080/identity");
         assert!(resolve_server_urls("http://bw.example.org").is_err());
         assert!(resolve_server_urls("https://u:p@bw.example.org").is_err());
+    }
+
+    #[test]
+    fn origins_are_scheme_host_and_port() {
+        assert_eq!(origin_of("https://identity.bitwarden.com").unwrap(), "https://identity.bitwarden.com");
+        assert_eq!(origin_of("https://bw.example.org/vault/identity").unwrap(), "https://bw.example.org");
+        assert_eq!(origin_of("http://127.0.0.1:80/identity").unwrap(), "http://127.0.0.1");
+        assert_eq!(origin_of("http://127.0.0.1:8080/identity").unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(origin_of("HTTPS://BW.Example.org:443/x").unwrap(), "https://bw.example.org");
+        assert!(origin_of("not a url").is_err());
+    }
+
+    #[test]
+    fn identity_origins_follow_the_server() {
+        assert_eq!(identity_origin("https://vault.bitwarden.com").unwrap(), "https://identity.bitwarden.com");
+        assert_eq!(identity_origin("https://vault.bitwarden.eu/").unwrap(), "https://identity.bitwarden.eu");
+        assert_eq!(identity_origin("https://bw.example.org:8443/vault").unwrap(), "https://bw.example.org:8443");
+        assert!(identity_origin("http://bw.example.org").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_api_key_is_never_sent_to_another_origin() {
+        // Nothing listens on port 1: a refusal that is not a network error
+        // was decided before any request went out.
+        let mut api = Api::new(resolve_server_urls("http://127.0.0.1:1").unwrap(), "d".into()).unwrap();
+        let key = ApiKey {
+            origin: "https://identity.bitwarden.com".into(),
+            client_id: "id".into(),
+            client_secret: Zeroizing::new("secret".into()),
+        };
+        let e = api.login(&key).await.unwrap_err();
+        assert!(
+            matches!(&e, ApiError::Protocol(m) if m.contains("https://identity.bitwarden.com")
+            && m.contains("http://127.0.0.1:1") && m.contains("bwss login")),
+            "{e}"
+        );
+        assert!(!e.is_transient());
+
+        let bound = ApiKey { origin: "http://127.0.0.1:1".into(), ..key };
+        assert!(matches!(api.login(&bound).await.unwrap_err(), ApiError::Network(_)), "the right origin is tried");
     }
 
     #[test]

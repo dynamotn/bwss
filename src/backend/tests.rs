@@ -289,15 +289,18 @@ async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
     let sync = json!({ "profile": { "id": "user1", "key": protected }, "folders": [], "ciphers": ciphers });
     let (fake, url) = Fake::start(sync);
     let dir = tempfile::tempdir().unwrap();
-    let config = Config { server_url: url, email: EMAIL.into(), ..Config::default() };
+    let identity_origin = crate::bw::api::origin_of(&url).unwrap();
+    let config = Config { server_url: url, email: EMAIL.into(), profile: Some("p".into()), ..Config::default() };
     let paths = Paths {
         config: dir.path().join("config.toml"),
-        credentials: dir.path().join("credentials.toml"),
+        legacy_config: dir.path().join("legacy.toml"),
+        legacy_credentials: dir.path().join("legacy-credentials.toml"),
         cache: dir.path().join("cache"),
         state: dir.path().join("state"),
+        profiles: dir.path().join("profiles"),
         tool_state: dir.path().join("tool-state"),
     };
-    let creds = Credentials { client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
+    let creds = Credentials { identity_origin, client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
     let backend = Arc::new(BitwardenBackend::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
     let keys = Keys { mark: user.derive("value-mark"), user };
@@ -547,6 +550,7 @@ async fn a_change_that_cannot_be_kept_on_disk_is_refused() {
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.fake.with(|s| s.down = true);
     let state = v.dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
     if std::fs::File::create(state.join("probe")).is_ok() {
         return; // permissions not enforced (running as root)
