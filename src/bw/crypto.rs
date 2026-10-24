@@ -99,6 +99,13 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
+/// A mark of `stored` (an encrypted string as kept in the vault): HMAC-SHA256
+/// under the MAC half of `mark_key`. Equal marks mean the stored text is unchanged.
+#[allow(dead_code)]
+pub fn value_mark(mark_key: &SymmetricKey, stored: &str) -> [u8; 32] {
+    hmac(&mark_key.mac, &[stored.as_bytes()])
+}
+
 /// HKDF-Expand (RFC 5869) for one 32-byte block.
 fn hkdf_expand32(prk: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(hmac(prk, &[info, &[1u8]]))
@@ -321,5 +328,14 @@ mod tests {
         // Text the user key encrypted (an item name, say) does not open with the derived key.
         assert!(acl.decrypt_str(&user.encrypt_str("{}")).is_err());
         assert_eq!(&*acl.decrypt_str(&acl.encrypt_str("{}")).unwrap(), "{}");
+    }
+
+    #[test]
+    fn value_mark_depends_on_key_and_value() {
+        let user = SymmetricKey::generate();
+        let mark_key = user.derive("marks");
+        assert_eq!(value_mark(&mark_key, "a"), value_mark(&mark_key, "a"));
+        assert_ne!(value_mark(&mark_key, "a"), value_mark(&mark_key, "b"));
+        assert_ne!(value_mark(&mark_key, "a"), value_mark(&user.derive("other"), "a"));
     }
 }
