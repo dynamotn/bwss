@@ -337,6 +337,10 @@ changing are never clobbered. Then:
   `reap_departed` sweeps any left behind. Without a pidfd, a pid reused
   between the client's connect and the daemon handling that signal is
   still taken for the new process: a window of one bus round trip.
+- **Non-dumpable clients.** A client that is not dumpable (gpg-agent,
+  sandboxed browsers, anything that called `PR_SET_DUMPABLE 0`) has an
+  unreadable `/proc/<pid>/exe`. It is an `(unknown application)`: asked every
+  time and never offered Always. This is intended.
 - **Identity.** The executable (`/proc/<pid>/exe`, a ` (deleted)` suffix
   dropped), unless it is an interpreter: an executable whose basename is
   `python*`, `perl*`, `ruby*`, `node`, `nodejs`, `deno`, `bun`, `sh`,
@@ -438,6 +442,14 @@ Unchanged from `legacy`:
   of the client holding the most is closed.
 - Lock on request, after `lock_timeout_minutes` (default 60), and on SIGTERM: keys and
   decrypted items are zeroized, the API session is dropped.
+  `lock_timeout_minutes = 0` turns off the idle lock only.
+- Lock when the machine sleeps or the screen locks (TM-013). bwss listens on
+  the system bus to systemd-logind for `Manager.PrepareForSleep(true)` and
+  for the `Lock` signal of its own session (found by process id, then by
+  `XDG_SESSION_ID`); either one locks the keyring. Waking up does not
+  unlock. Without a system bus or without logind, bwss logs a warning and
+  goes on (without a session, sleep still locks). The listener is not tied
+  to `lock_timeout_minutes`.
 - The locked index (`~/.cache/bwss/locked-index.json`) keeps, per marked
   item, its id, its collection and SHA-256(salt ‖ name ‖ 0 ‖ value) of each
   attribute (derived ones included), with a random per-install salt, so
@@ -725,7 +737,7 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
       it is not the user's either. Checking every ancestor is stricter than
       the ADR (controller ruling R14); or
     - the install-prefix rule (the Homebrew case; controller ruling R15,
-      stricter than the ADR) applies, which needs all of:
+      which matches ADR 0008) applies, which needs all of:
       - bwss's own resolved executable is writable by the user, so a
         pinentry beside it adds nothing an attacker could not already do
         by replacing bwss (a root-owned `/usr/bin/bwss` never needs this
@@ -784,17 +796,31 @@ bwss config migrate
 `bwss unlock` calls `UnlockInteractive`: the daemon shows the pinentry and
 no password crosses the bus. This is the safe way to unlock.
 
-`--password-stdin` is for login hooks that accept the risk below. Before
-sending the password it resolves the owner of `io.github.dynamotn.bwss`
-(`GetNameOwner`, `GetConnectionUnixProcessID`, `/proc/<pid>/exe`) and
-refuses, naming that executable, unless it is the CLI's own `current_exe()`
-(canonical paths; a ` (deleted)` suffix from an upgrade is ignored) and
-`/proc/<pid>/cmdline` is `<bwss> daemon [--replace]`. The call then goes to
-that unique name, so the owner cannot change in between. The command line
-matters because the bus reports the pid of whoever opened the connection: a
-squatter can fork, keep the connection in the child and exec a blocking
-`bwss unlock` in the parent. Without `/proc` (non-Linux), `--password-stdin`
-is refused. The CLI and the daemon must be the same installed file.
+`--password-stdin` is for login hooks that accept the risk below: the
+password crosses the session bus, and the owner check is best effort. Plain
+`bwss unlock` stays the default and documented path. Before sending the
+password the CLI resolves the owner of `io.github.dynamotn.bwss`
+(`GetNameOwner`, `GetConnectionUnixProcessID`) and refuses, naming what
+failed, unless all of these hold:
+
+- the real uid in `/proc/<pid>/status` is the CLI's own;
+- `argv[0]` of `/proc/<pid>/cmdline` canonicalizes to the CLI's own
+  `current_exe()` (a bare name is looked up in `PATH`; a ` (deleted)` suffix
+  from an upgrade is ignored) and the command line is
+  `<bwss> daemon [--replace]`;
+- the start time in `/proc/<pid>/stat` is the same before and after those
+  checks, so a pid reused in between is caught.
+
+The daemon is not dumpable (§11), so `/proc/<pid>/exe` is unreadable for
+other processes and the check uses the command line instead. That is weaker
+against `argv[0]` spoofing, and it is accepted: a same-uid process that
+forks and execs the real binary defeats any pid check anyway (R13). The call
+then goes to that unique name, so the owner cannot change in between. The
+command line matters because the bus reports the pid of whoever opened the
+connection: a squatter can fork, keep the connection in the child and exec a
+blocking `bwss unlock` in the parent. Without `/proc` (non-Linux),
+`--password-stdin` is refused. The CLI and the daemon must be the same
+installed file.
 
 What the owner check stops: a squatter that is not running bwss, and the
 fork form that execs `bwss unlock`. What it cannot stop: a process of the
@@ -828,6 +854,14 @@ Notes:
   a personal item on its own. (For organization items it could, through
   any member with write access; see §12.)
 - bwss holds the security invariants of spec §11 as written there.
+- Process hardening (Linux, at daemon start): no core dump
+  (`RLIMIT_CORE` 0) and not dumpable (`prctl(PR_SET_DUMPABLE, 0)`), so a
+  crash or an unprivileged attach does not write keys to disk. A failure is
+  logged and does not stop the daemon. `mlock` is not used: the keys are
+  zeroized on lock rather than pinned, locking memory needs an
+  `RLIMIT_MEMLOCK` that desktop users usually do not have, and it would not
+  stop a same-user attacker who can already read the process (controller
+  ruling, TM-013).
 - The bus names are never replaceable. Plain `bwss unlock` keeps the
   password inside the daemon and is the safe path. `bwss unlock
   --password-stdin` sends it only to a `bwss daemon` process running the

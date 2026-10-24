@@ -8,7 +8,9 @@ mod config;
 mod daemon;
 mod dbus;
 mod fsutil;
+mod hardening;
 mod keyring;
+mod logind;
 mod migrate;
 mod model;
 #[cfg(test)]
@@ -57,7 +59,9 @@ enum Command {
     /// master password comes from stdin.
     Unlock {
         /// Read the password from the first line of stdin and send it to the
-        /// daemon, after checking that the daemon is this same bwss binary.
+        /// daemon over the session bus. The check that the daemon is this
+        /// same bwss binary is best effort; plain `bwss unlock` asks through
+        /// the daemon's own pinentry and sends no password.
         #[arg(long)]
         password_stdin: bool,
     },
@@ -153,23 +157,18 @@ async fn verified_control() -> anyhow::Result<zbus::Proxy<'static>> {
         .with_context(|| format!("{CONTROL_NAME} is not on the bus; is the bwss daemon running?"))?;
     let pid = bus.get_connection_unix_process_id(BusName::Unique(owner.as_ref())).await?;
     let me = std::env::current_exe().context("cannot find this executable")?;
-    // A speed bump against processes of the same user, like the item ACL:
-    // it holds as long as the CLI and the daemon are the same installed file.
-    match acl::executable_of(pid) {
-        Some(exe) if acl::same_executable(&exe, &me) => {}
-        found => bail!(
-            "refusing to send the password: {CONTROL_NAME} is owned by {} (pid {pid}), not {}",
-            found.as_deref().unwrap_or(acl::UNKNOWN),
-            me.display()
-        ),
-    }
-    if !acl::runs_daemon(pid) {
-        bail!("refusing to send the password: {CONTROL_NAME} is owned by pid {pid}, which is not a `bwss daemon`");
+    // A best-effort speed bump against processes of the same user. The
+    // daemon is not dumpable, so its /proc/<pid>/exe is unreadable: the check
+    // uses its user, command line and start time instead (TM-013).
+    let my_uid = fsutil::User::current().context("cannot tell which user this is")?.uid;
+    if let Err(why) = acl::check_daemon_owner(pid, &me, my_uid) {
+        let who = acl::executable_of(pid).unwrap_or_else(|| acl::UNKNOWN.to_owned());
+        bail!("refusing to send the password: {CONTROL_NAME} is owned by {who} (pid {pid}), {why}");
     }
     Ok(zbus::Proxy::new(&conn, owner.into_inner(), CONTROL_PATH, CONTROL_IFACE).await?)
 }
 
-/// The owner check reads `/proc/<pid>/exe`, which only Linux has.
+/// The owner check reads `/proc/<pid>/{status,cmdline,stat}`, which only Linux has.
 #[cfg(target_os = "linux")]
 fn require_proc() -> anyhow::Result<()> {
     Ok(())
@@ -233,6 +232,9 @@ async fn claim_names(conn: &zbus::Connection, replace: bool) -> anyhow::Result<(
 }
 
 async fn run_daemon(replace: bool) -> anyhow::Result<()> {
+    for failure in hardening::harden() {
+        tracing::warn!("process hardening incomplete: {failure}");
+    }
     let paths = Paths::from_env();
     let trust = Trust::system()?;
     let config = config::load(&paths, &trust)?;
@@ -295,6 +297,13 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             }
         });
     }
+
+    // Sleep and screen lock, from logind on the system bus.
+    let d = daemon.clone();
+    tokio::spawn(logind::run(move || {
+        let d = d.clone();
+        async move { d.lock().await }
+    }));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {

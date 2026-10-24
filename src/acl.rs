@@ -17,6 +17,7 @@
 //! another binary) is an unknown application.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
@@ -309,17 +310,58 @@ fn strip_deleted(path: &str) -> &str {
     path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
-/// Whether process `pid` was started as `<bwss> daemon [--replace]`, from
-/// `/proc/<pid>/cmdline`. The executable alone is not enough: a squatter can
-/// fork (the child keeps the bus connection) and exec bwss in the parent,
-/// whose pid is the one the bus reports.
-pub fn runs_daemon(pid: u32) -> bool {
-    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| is_daemon_cmdline(&raw))
-}
-
+/// Whether a `/proc/<pid>/cmdline` reads `<bwss> daemon [--replace]`. The
+/// executable alone is not enough: a squatter can fork (the child keeps the
+/// bus connection) and exec bwss in the parent, whose pid the bus reports.
 fn is_daemon_cmdline(raw: &[u8]) -> bool {
     let mut args = raw.strip_suffix(b"\0").unwrap_or(raw).split(|&b| b == 0).skip(1);
     args.next() == Some(b"daemon".as_slice()) && args.all(|a| a == b"--replace")
+}
+
+/// Checks that `pid` is a `bwss daemon` of this user running this binary,
+/// without `/proc/<pid>/exe`: the daemon is not dumpable (TM-013), so only
+/// its command line, status and start time are readable. Weaker than the
+/// executable against `argv[0]` spoofing; a same-user fork and exec of the
+/// real binary beats any pid check anyway. The start time is read before
+/// and after, so a pid reused meanwhile is caught. `Err` says what failed.
+pub fn check_daemon_owner(pid: u32, me: &Path, my_uid: u32) -> Result<(), String> {
+    let first = start_time(pid).ok_or("whose start time cannot be read")?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    judge_daemon(parse_uid(&status), &cmdline, me, my_uid, &path)?;
+    if start_time(pid) != Some(first) {
+        return Err("whose start time changed during the check (the pid was reused?)".into());
+    }
+    Ok(())
+}
+
+fn judge_daemon(uid: Option<u32>, cmdline: &[u8], me: &Path, my_uid: u32, path_env: &OsStr) -> Result<(), String> {
+    if uid != Some(my_uid) {
+        let who = uid.map_or_else(|| "unknown".to_owned(), |u| u.to_string());
+        return Err(format!("which belongs to another user (uid {who}, not {my_uid})"));
+    }
+    let argv0 = cmdline.split(|&b| b == 0).next().map(|a| String::from_utf8_lossy(a).into_owned()).unwrap_or_default();
+    let resolved = if argv0.contains('/') {
+        argv0.clone()
+    } else {
+        std::env::split_paths(path_env)
+            .map(|dir| dir.join(&argv0))
+            .find(|candidate| !argv0.is_empty() && candidate.is_file())
+            .map_or_else(|| argv0.clone(), |found| found.to_string_lossy().into_owned())
+    };
+    if !same_executable(&resolved, me) {
+        return Err(format!("which runs `{argv0}`, not this bwss ({})", me.display()));
+    }
+    if !is_daemon_cmdline(cmdline) {
+        return Err("which is not a `bwss daemon`".into());
+    }
+    Ok(())
+}
+
+/// The real user id from the text of `/proc/<pid>/status`.
+fn parse_uid(status: &str) -> Option<u32> {
+    status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
 }
 
 /// Whether `owner` (a path from `executable_of`) is the same binary as `me`
@@ -367,7 +409,42 @@ mod tests {
         assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0--replace\0daemon\0"));
         assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0"));
         assert!(!is_daemon_cmdline(b""));
-        assert!(!runs_daemon(u32::MAX), "no such process");
+    }
+
+    #[test]
+    fn the_daemon_owner_is_judged_by_user_and_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwss");
+        std::fs::write(&bin, b"").unwrap();
+        let other = dir.path().join("python3");
+        std::fs::write(&other, b"").unwrap();
+        let bin_s = bin.to_str().unwrap();
+        let judge = |uid, cmd: &[u8], path: &OsStr| judge_daemon(uid, cmd, &bin, 1000, path);
+        let cmd = |argv0: &str, rest: &str| format!("{argv0}\0{rest}").into_bytes();
+        let none = OsStr::new("");
+
+        assert_eq!(judge(Some(1000), &cmd(bin_s, "daemon\0--replace\0"), none), Ok(()));
+        let err = judge(Some(1001), &cmd(bin_s, "daemon\0"), none).unwrap_err();
+        assert!(err.contains("another user") && err.contains("1001"), "{err}");
+        assert!(judge(None, &cmd(bin_s, "daemon\0"), none).unwrap_err().contains("unknown"));
+        let err = judge(Some(1000), &cmd(other.to_str().unwrap(), "daemon\0"), none).unwrap_err();
+        assert!(err.contains("not this bwss") && err.contains("python3"), "{err}");
+        let err = judge(Some(1000), &cmd("bwss-fake", "daemon\0"), none).unwrap_err();
+        assert!(err.contains("not this bwss"), "a bare name that resolves nowhere: {err}");
+        assert!(judge(Some(1000), b"", none).unwrap_err().contains("not this bwss"));
+        let err = judge(Some(1000), &cmd(bin_s, "unlock\0"), none).unwrap_err();
+        assert!(err.contains("not a `bwss daemon`"), "{err}");
+        // A bare argv[0] is looked up in PATH, the way the daemon was started.
+        assert_eq!(judge(Some(1000), &cmd("bwss", "daemon\0"), dir.path().as_os_str()), Ok(()));
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(judge(Some(1000), &cmd("bwss", "daemon\0"), elsewhere.path().as_os_str()).is_err());
+    }
+
+    #[test]
+    fn the_real_user_comes_from_proc_status() {
+        assert_eq!(parse_uid("Name:\tbwss\nUid:\t1000\t1000\t1000\t1000\nGid:\t1\n"), Some(1000));
+        assert_eq!(parse_uid("Name:\tbwss\n"), None);
+        assert_eq!(parse_uid("Uid:\tx\n"), None);
     }
 
     #[test]

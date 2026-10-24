@@ -112,3 +112,22 @@ def test_plain_unlock_prompts_through_the_daemon(memory_daemon):
     getpins = [p for p in d.prompts() if p.startswith("GETPIN")]
     assert len(getpins) == 3  # cancelled once, then wrong, then right
     assert any(p.startswith("SETERROR Wrong password") for p in d.prompts())
+
+
+def test_password_stdin_refuses_a_real_bwss_with_another_argv0(squatters):
+    # The real bwss binary (a blocking `unlock`), but argv[0] is not bwss: the
+    # owner check goes by the command line, so this is refused.
+    home = memory_home()
+    squatter = squatters(CONTROL, exec_argv=["/bin/bash", "-c", f"exec -a notbwss {BWSS} unlock"], env=home.env)
+    assert squatter.reply == 1
+    cmdline = f"/proc/{squatter.proc.pid}/cmdline"
+    for _ in range(100):
+        if open(cmdline, "rb").read().startswith(b"notbwss\0"):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the squatter did not exec bwss under another name")
+    r = home.cli("unlock", "--password-stdin", input=PASSWORD + "\n", check=False, timeout=10)
+    assert r.returncode != 0
+    assert "refusing to send the password" in r.stderr and "`notbwss`, not this bwss" in r.stderr, r.stderr
+    assert not any("UnlockWithPassword" in c or PASSWORD in c for c in squatter.calls()), squatter.calls()

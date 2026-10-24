@@ -213,6 +213,16 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 
 - The master password is used only locally, to derive keys. Key material is
   zeroized when the keyring locks.
+- The keyring locks on `bwss lock`, after `lock_timeout_minutes` of idleness
+  (default 60; 0 turns the idle lock off), when the machine goes to sleep
+  and when the session locks (systemd-logind on the system bus; without it
+  bwss logs a warning and goes on).
+- On Linux the daemon disables core dumps and ptrace-style attach. It does
+  not `mlock` memory. Because the daemon is not dumpable, other programs
+  cannot read its `/proc/<pid>/exe`: `--password-stdin` checks its owner by
+  user, command line and start time instead, which is best effort. Clients
+  that are themselves not dumpable (gpg-agent, sandboxed browsers) are
+  unknown applications and are asked every time.
 - HTTPS is required (plain http is accepted only for `localhost`), and
   redirects are not followed, so the API key cannot be bounced to another
   host.

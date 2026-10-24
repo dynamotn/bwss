@@ -207,6 +207,7 @@ dependencies = [
  "pbkdf2",
  "rand",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
