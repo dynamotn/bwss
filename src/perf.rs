@@ -7,8 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::backend::bitwarden::build;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
-use crate::bw::items;
-use crate::bw::scan::Keys;
+use crate::bw::scan::{Keys, Scan, scan};
+use crate::bw::write::new_note;
 use crate::keyring::Keyring;
 use crate::model::{Attributes, ItemData, Snapshot};
 use crate::session::{DH_AES, Session};
@@ -48,19 +48,23 @@ fn perf_budgets() {
     });
 
     let key = SymmetricKey::generate();
-    let ciphers: Vec<_> = time("encode-10000-items", 5_000, || {
+    let keys = Keys { mark: key.derive("value-mark"), user: key };
+    let ciphers: Vec<_> = time("new-note-10000-items", 5_000, || {
         (0..10_000)
             .map(|i| {
-                let mut body = items::encode(&item(i), None, &key, "f").unwrap();
+                let mut body = new_note(&item(i), Some("f"), &keys).unwrap();
                 body.insert("id".into(), format!("c{i}").into());
                 body.insert("revisionDate".into(), "2026-10-23T00:00:00Z".into());
                 serde_json::Value::Object(body)
             })
             .collect()
     });
-    let keys = Keys { mark: key.derive("value-mark"), user: key };
+    let marked = time("scan-10000-items", 5_000, || {
+        ciphers.iter().filter(|c| matches!(scan(c, &keys), Scan::Marked(_))).count()
+    });
+    assert_eq!(marked, 10_000);
     let sync = serde_json::json!({ "ciphers": ciphers });
-    let built = time("scan-10000-items", 5_000, || build(&sync, &keys, None));
+    let built = time("build-10000-items", 5_000, || build(&sync, &keys, None));
     assert_eq!(built.snapshot.items.len(), 10_000);
     time("rescan-10000-unchanged", 5_000, || build(&sync, &keys, Some(&built)));
     let decoded = built.snapshot.items;

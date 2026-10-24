@@ -71,12 +71,21 @@ impl From<BackendError> for SecretError {
     fn from(e: BackendError) -> Self {
         match e {
             BackendError::Locked => SecretError::IsLocked(e.to_string()),
+            BackendError::Conflict(why) => {
+                tracing::info!("write refused: {why}");
+                SecretError::Failed("the secret was changed elsewhere; try again".into())
+            }
             other => SecretError::Failed(other.to_string()),
         }
     }
 }
 
 pub type SResult<T> = Result<T, SecretError>;
+
+/// The attributes an app set: derived ones (`bwss:*`, design §3.2) left out.
+fn own_attributes(a: &Attributes) -> Attributes {
+    a.iter().filter(|(k, _)| !k.starts_with("bwss:")).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
 
 /// What a secret looks like on the wire: (session, parameters, value, content type).
 pub type WireSecret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
@@ -202,10 +211,11 @@ impl Daemon {
 
     /// Updates exported objects and tells clients what changed.
     pub async fn publish(self: &Arc<Self>, diff: Diff) {
+        // No bus yet (tests): nothing to export or signal.
+        let Some(conn) = self.conn.get() else { return };
         if let Err(e) = self.sync_objects().await {
             tracing::warn!("could not update D-Bus objects: {e}");
         }
-        let conn = self.conn();
         let service = SignalEmitter::new(conn, SERVICE_PATH).ok();
         for c in &diff.collections_created {
             if let Some(s) = &service {
@@ -378,11 +388,13 @@ impl Daemon {
                 return Err(SecretError::IsLocked("the collection is locked".into()));
             }
             if replace {
-                k.search(&attributes, Some(collection))
+                // Same app attributes; derived ones (`bwss:*`) do not count (§5.1).
+                let wanted = own_attributes(&attributes);
+                k.search(&wanted, Some(collection))
                     .0
                     .into_iter()
                     .map(|(_, id)| id)
-                    .find(|id| k.item(id).is_some_and(|i| i.attributes == attributes))
+                    .find(|id| k.item(id).is_some_and(|i| own_attributes(&i.attributes) == wanted))
             } else {
                 None
             }
@@ -505,5 +517,61 @@ mod path_tests {
     fn parse_path_unescapes_ids() {
         assert_eq!(parse_path(&item_path("work/keys", "a b")), Some(("work/keys".into(), Some("a b".into()))));
         assert_eq!(parse_path(&format!("{SERVICE_PATH}/collection/_zz")), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::backend::memory::MemoryBackend;
+
+    #[tokio::test]
+    async fn replace_ignores_derived_attributes() {
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        backend.unlock("pw").await.unwrap();
+        let stored = ItemData {
+            id: "x".into(),
+            collection: LOGIN_COLLECTION.into(),
+            label: "GitHub".into(),
+            attributes: Attributes::from([
+                ("service".to_owned(), "git".to_owned()),
+                ("bwss:id".to_owned(), "x".to_owned()),
+                ("bwss:name".to_owned(), "GitHub".to_owned()),
+            ]),
+            secret: Zeroizing::new(b"old".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 1,
+            acl: vec!["/usr/bin/git".into()],
+        };
+        backend.put_item(&stored).await.unwrap();
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None), backend, prompter, Config::default());
+        d.unlock_with_password("pw").await.unwrap();
+
+        let new = NewItem {
+            label: "GitHub token".into(),
+            attributes: Attributes::from([("service".to_owned(), "git".to_owned())]),
+            secret: Zeroizing::new(b"new".to_vec()),
+            content_type: "text/plain".into(),
+            replace: true,
+        };
+        let path = d.create_item(LOGIN_COLLECTION, new, "/usr/bin/git").await.unwrap();
+        assert_eq!(path.as_str(), item_path(LOGIN_COLLECTION, "x"));
+        let k = d.keyring.lock().await;
+        assert_eq!(k.item_refs(), [(LOGIN_COLLECTION.to_owned(), "x".to_owned())]);
+        let item = k.item("x").unwrap();
+        assert_eq!(&*item.secret, b"new");
+        assert_eq!(own_attributes(&item.attributes), Attributes::from([("service".to_owned(), "git".to_owned())]));
+    }
+
+    #[test]
+    fn conflict_maps_to_a_retry_message() {
+        match SecretError::from(BackendError::Conflict("the secret was changed elsewhere".into())) {
+            SecretError::Failed(m) => assert_eq!(m, "the secret was changed elsewhere; try again"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(SecretError::from(BackendError::Rejected("no".into())), SecretError::Failed(_)));
     }
 }

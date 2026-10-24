@@ -29,7 +29,6 @@ impl Registry {
     }
 
     /// Deterministic JSON, so equal registries give equal notes.
-    #[allow(dead_code)] // Task 11 writes the registry note.
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.0).expect("a string-keyed map always serializes")
     }
@@ -48,7 +47,6 @@ impl Registry {
     }
 
     /// Sets an entry unconditionally; the caller decides.
-    #[allow(dead_code)] // Task 11 creates and deletes collections.
     pub fn put(&mut self, id: &str, entry: Entry) {
         self.0.insert(id.to_string(), entry);
     }

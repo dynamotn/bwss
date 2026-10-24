@@ -281,7 +281,8 @@ impl CollectionObj {
 
     #[zbus(property)]
     async fn set_label(&mut self, value: String) -> zbus::fdo::Result<()> {
-        // Labels are kept locally; the Bitwarden folder name is the collection id.
+        // Kept locally until the next refresh: the registry keeps the label a
+        // collection was created with.
         self.daemon.keyring.lock().await.set_collection_label(&self.id, &value);
         Ok(())
     }

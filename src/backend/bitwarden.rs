@@ -6,30 +6,26 @@
 //!   so the keyring unlocks and reads without a network; writes are queued,
 //!   shown at once, and replayed in order on the next successful refresh.
 //!
-//! The read path follows the marker model. The write path is an interim one
-//! (new items go to the keyring folder through `items::encode`) until the
-//! marker write path replaces it.
+//! Writes go through the op runner (`runner.rs`): bwss changes only its own
+//! fields and the value source of an item (design §5).
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::ops::{Loaded, Op, read_versioned, seal, set_aside, unseal};
 use super::registry::{REGISTRY_ID, Registry};
+use super::runner::{Effect, status_lines};
 use super::{Backend, BackendError};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
-use crate::bw::fields::{
-    A_NAME, F_ACL, F_ATTR, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, PREFIX, field_names,
-    field_value, first_index,
-};
-use crate::bw::items::{self, item_key};
-use crate::bw::scan::{Keys, MarkedItem, Scan, ValueSource, normalize_collection, resolve_duplicates, scan};
+use crate::bw::fields::{F_KIND, field_names, field_value, first_index};
+use crate::bw::items::item_key;
+use crate::bw::scan::{Keys, MarkedItem, Scan, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
 use crate::config::{Config, Credentials, Paths};
 use crate::fsutil::write_private;
@@ -38,9 +34,9 @@ use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTIO
 const FORMAT: u64 = 2;
 const TYPE_SECURE_NOTE: u64 = 2;
 /// `bwss:kind` of the collection registry note.
-const KIND_COLLECTIONS: &str = "collections";
+pub(super) const KIND_COLLECTIONS: &str = "collections";
 /// Cipher id of an item created by a queued op: it is not on the server yet.
-const QUEUED: &str = "";
+pub(super) const QUEUED: &str = "";
 
 /// `sync.json`: the last `/sync` response, still ciphertext.
 #[derive(Serialize, Deserialize)]
@@ -64,32 +60,29 @@ pub(crate) struct Built {
     /// Cipher ids of the registry notes.
     pub registry_ciphers: Vec<String>,
     /// A registry note could not be read: it must never be written over.
-    #[allow(dead_code)] // Task 11 refuses registry writes on it.
     pub registry_unreadable: bool,
     /// `(bwss:id, losing cipher ids)`.
-    #[allow(dead_code)] // Task 11 lists them in `bwss status`.
     pub duplicates: Vec<(String, Vec<String>)>,
     /// `(cipher id, reason)` of marked items that are not supported.
-    #[allow(dead_code)] // Task 11 lists them in `bwss status`.
     pub skipped: Vec<(String, String)>,
     /// Scan cache: `(cipher id, raw revisionDate)` of unmarked ciphers.
     pub unmarked: HashSet<(String, String)>,
 }
 
 /// Scan-cache key of a cipher; `None` when it has no revision to compare.
-fn cache_key(cipher: &Value) -> Option<(String, String)> {
+pub(super) fn cache_key(cipher: &Value) -> Option<(String, String)> {
     let id = cipher.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
     let rev = cipher.get("revisionDate").filter(|r| !r.is_null())?;
     Some((id.to_owned(), rev.to_string()))
 }
 
-fn ciphers(sync: &Value) -> &[Value] {
+pub(super) fn ciphers(sync: &Value) -> &[Value] {
     sync.get("ciphers").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
 /// A marked item with the registry id: `Ok(Some)` for a registry note,
 /// `Ok(None)` for anything else, `Err` when its notes cannot be read.
-fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Registry>, ()> {
+pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Registry>, ()> {
     if cipher.get("type").and_then(Value::as_u64) != Some(TYPE_SECURE_NOTE) {
         return Ok(None);
     }
@@ -177,6 +170,24 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
         tracing::warn!(id = %id, losers = ?losers, "several items carry one bwss:id; the oldest is used");
     }
 
+    let mut items: Vec<ItemData> = winners.iter().map(|m| m.item.clone()).collect();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+
+    Built {
+        snapshot: Snapshot { collections: collection_list(&registry, &items), items },
+        marked: winners.into_iter().map(|m| (m.item.id.clone(), m)).collect(),
+        registry,
+        registry_ciphers,
+        registry_unreadable,
+        duplicates,
+        skipped,
+        unmarked,
+    }
+}
+
+/// The collections shown: `login`, the registry's live entries and every
+/// collection an item uses (design §4).
+fn collection_list(registry: &Registry, items: &[ItemData]) -> Vec<CollectionData> {
     let mut collections: BTreeMap<String, CollectionData> = BTreeMap::new();
     collections.insert(
         LOGIN_COLLECTION.into(),
@@ -192,9 +203,7 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
             CollectionData { id, label: entry.label.clone(), created: entry.created, modified: entry.created },
         );
     }
-    let mut items: Vec<ItemData> = winners.iter().map(|m| m.item.clone()).collect();
-    items.sort_by(|a, b| a.id.cmp(&b.id));
-    for item in &items {
+    for item in items {
         collections.entry(item.collection.clone()).or_insert_with(|| CollectionData {
             id: item.collection.clone(),
             label: item.collection.clone(),
@@ -202,21 +211,27 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
             modified: 0,
         });
     }
+    collections.into_values().collect()
+}
 
-    Built {
-        snapshot: Snapshot { collections: collections.into_values().collect(), items },
-        marked: winners.into_iter().map(|m| (m.item.id.clone(), m)).collect(),
-        registry,
-        registry_ciphers,
-        registry_unreadable,
-        duplicates,
-        skipped,
-        unmarked,
+/// The registry with the queued collection changes applied.
+pub(super) fn registry_with_queue(registry: &Registry, queue: &[Op]) -> Registry {
+    let mut shown = registry.clone();
+    for op in queue {
+        if let Op::Registry { collection, entry } = op {
+            shown.put(collection, entry.clone());
+        }
     }
+    shown
 }
 
 /// Index in `list` of the cipher that holds `id` on the server.
-fn find_marked(list: &[Value], id: &str, keys: &Keys, unmarked: &HashSet<(String, String)>) -> Option<usize> {
+pub(super) fn find_marked(
+    list: &[Value],
+    id: &str,
+    keys: &Keys,
+    unmarked: &HashSet<(String, String)>,
+) -> Option<usize> {
     let mut found = Vec::new();
     for c in list {
         if cache_key(c).is_some_and(|k| unmarked.contains(&k)) {
@@ -235,7 +250,7 @@ fn find_marked(list: &[Value], id: &str, keys: &Keys, unmarked: &HashSet<(String
 
 /// The cache with every queued op applied, so pending writes stay visible
 /// (design §8.2 step 3).
-fn with_queue(
+pub(super) fn with_queue(
     sync: &Value,
     queue: &[Op],
     keys: &Keys,
@@ -273,11 +288,29 @@ fn with_queue(
                     list.remove(i);
                 }
             }
-            // Collections are not written yet.
+            // Shown through `build_view`: the registry note is merged, never
+            // rewritten here.
             Op::Registry { .. } => {}
         }
     }
     view
+}
+
+/// Builds the keyring from the cache with the queue applied.
+fn build_view(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>, previous: Option<&Built>) -> Built {
+    let mut built = if queue.is_empty() {
+        build(sync, keys, previous)
+    } else {
+        let none = HashSet::new();
+        let unmarked = previous.map_or(&none, |p| &p.unmarked);
+        build(&with_queue(sync, queue, keys, folder, unmarked), keys, previous)
+    };
+    if queue.iter().any(|op| matches!(op, Op::Registry { .. })) {
+        // `built.registry` stays the server's: only what is shown changes.
+        let shown = registry_with_queue(&built.registry, queue);
+        built.snapshot.collections = collection_list(&shown, &built.snapshot.items);
+    }
+    built
 }
 
 /// Builds the keyring for a freshly loaded cache and queue.
@@ -286,71 +319,7 @@ fn build_fresh(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>) ->
     if queue.is_empty() {
         return base;
     }
-    let view = with_queue(sync, queue, keys, folder, &base.unmarked);
-    build(&view, keys, Some(&base))
-}
-
-/// Whether the interim legacy update `body` of `cipher` changes only what
-/// `item` asks for: the item keeps its id, collection, label and name, and a
-/// login keeps its notes. `items::encode` drops the marker model's own
-/// fields, so anything else is refused until the marker write path lands.
-fn encode_keeps_item(cipher: &Value, body: &Map<String, Value>, item: &ItemData, keys: &Keys) -> bool {
-    if cipher.get("type").and_then(Value::as_u64) == Some(1) && body.get("notes") != cipher.get("notes") {
-        return false;
-    }
-    let mut after = body.clone();
-    for k in ["id", "revisionDate", "creationDate"] {
-        if let Some(v) = cipher.get(k) {
-            after.insert(k.into(), v.clone());
-        }
-    }
-    let name = |m: &MarkedItem| m.item.attributes.get(A_NAME).cloned();
-    match (scan(cipher, keys), scan(&Value::Object(after), keys)) {
-        (Scan::Marked(old), Scan::Marked(new)) => {
-            new.item.id == item.id
-                && new.item.collection == item.collection
-                && new.item.label == item.label
-                && name(&new) == name(&old)
-        }
-        _ => false,
-    }
-}
-
-/// Body of the interim legacy update of `cipher` to `item`, or why it is refused.
-fn legacy_update_body(cipher: &Value, item: &ItemData, keys: &Keys) -> Result<Map<String, Value>, BackendError> {
-    let refused = || BackendError::Rejected("changing this item is not supported yet".into());
-    // `encode` drops every `bwss:` field and rewrites only these (and
-    // `bwss:attr:*`): anything else would be lost (§3.1).
-    let rewritten = [F_ID, F_CONTENT_TYPE, F_ENCODING, F_LOCATION, F_ACL, F_CREATED];
-    let key = item_key(cipher, &keys.user).map_err(|_| refused())?;
-    let names = field_names(cipher, &key).map_err(|_| refused())?;
-    if names
-        .iter()
-        .flatten()
-        .any(|n| n.starts_with(PREFIX) && !n.starts_with(F_ATTR) && !rewritten.contains(&n.as_str()))
-    {
-        return Err(refused());
-    }
-    // Derived attributes come from the item itself; never store them.
-    let mut item = item.clone();
-    item.attributes.retain(|k, _| !k.starts_with(PREFIX));
-    let mut body =
-        items::encode(&item, Some(cipher), &keys.user, "").map_err(|e| BackendError::Rejected(e.to_string()))?;
-    // The item stays in its own folder.
-    body.insert("folderId".into(), cipher.get("folderId").cloned().unwrap_or(Value::Null));
-    if !encode_keeps_item(cipher, &body, &item, keys) {
-        return Err(refused());
-    }
-    Ok(body)
-}
-
-/// Whether the interim delete may trash `cipher` as the item `id`: only an
-/// item bwss can read now, in the keyring folder. Hand-marked items
-/// elsewhere and held ones wait for the marker delete (§5.4).
-fn may_trash(cipher: &Value, id: &str, keys: &Keys, folder: Option<&str>) -> bool {
-    folder.is_some()
-        && cipher.get("folderId").and_then(Value::as_str) == folder
-        && matches!(scan(cipher, keys), Scan::Marked(m) if m.item.id == id)
+    build_view(sync, queue, keys, folder, Some(&base))
 }
 
 /// Id of the keyring folder: the folder named `name`, lowest id first.
@@ -404,29 +373,30 @@ fn load_queue(path: &Path, key: &SymmetricKey) -> Result<Vec<Op>, BackendError> 
     }
 }
 
-struct Unlocked {
-    keys: Keys,
+pub(super) struct Unlocked {
+    pub(super) keys: Keys,
     kdf: KdfParams,
     /// The server's copy of the vault, as cached; queued ops are not in it.
-    sync: Value,
+    pub(super) sync: Value,
     /// Raw account revision date of `sync`, when known.
     revision: Option<String>,
     /// The keyring: `sync` with the queue applied.
-    built: Built,
-    keyring_folder: Option<String>,
+    pub(super) built: Built,
+    pub(super) keyring_folder: Option<String>,
 }
 
 pub struct BitwardenBackend {
     email: String,
-    root: String,
-    api: Mutex<Api>,
+    /// Name of the keyring folder.
+    pub(super) root: String,
+    pub(super) api: Mutex<Api>,
     key: ApiKey,
-    state: Mutex<Option<Unlocked>>,
+    pub(super) state: Mutex<Option<Unlocked>>,
     cache_path: PathBuf,
     queue_path: PathBuf,
     /// Queued ops; loaded at unlock (it is sealed with the user key) and
     /// dropped at lock. Lock order: `queue`, then `state`.
-    queue: Mutex<Vec<Op>>,
+    pub(super) queue: Mutex<Vec<Op>>,
 }
 
 fn unavailable(e: impl std::fmt::Display) -> BackendError {
@@ -435,14 +405,6 @@ fn unavailable(e: impl std::fmt::Display) -> BackendError {
 
 fn map_api(e: ApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
-}
-
-/// What a queued op needs from the server.
-enum Outgoing {
-    Create(Map<String, Value>),
-    Update(String, Map<String, Value>),
-    Trash(String),
-    Drop(String),
 }
 
 impl BitwardenBackend {
@@ -486,7 +448,7 @@ impl BitwardenBackend {
     }
 
     /// Whether writes can go to the server now: logged in and synced.
-    async fn can_write(&self) -> bool {
+    pub(super) async fn can_write(&self) -> bool {
         self.ensure_login().await.is_ok() && self.api.lock().await.has_profile()
     }
 
@@ -503,39 +465,30 @@ impl BitwardenBackend {
         }
     }
 
-    fn save_queue(&self, queue: &[Op], key: &SymmetricKey) {
+    pub(super) fn save_queue(&self, queue: &[Op], key: &SymmetricKey) {
         if let Err(e) = write_private(&self.queue_path, &serde_json::to_vec(&seal(queue, key)).unwrap_or_default()) {
             tracing::warn!("could not write the offline queue: {e}");
         }
     }
 
     /// Rebuilds the keyring after the cache or the queue changed.
-    fn rebuild(state: &mut Unlocked, queue: &[Op]) {
-        let view = if queue.is_empty() {
-            Cow::Borrowed(&state.sync)
-        } else {
-            Cow::Owned(with_queue(
-                &state.sync,
-                queue,
-                &state.keys,
-                state.keyring_folder.as_deref(),
-                &state.built.unmarked,
-            ))
-        };
-        state.built = build(&view, &state.keys, Some(&state.built));
+    pub(super) fn rebuild(state: &mut Unlocked, queue: &[Op]) {
+        state.built = build_view(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), Some(&state.built));
     }
 
-    /// Records the server's answer in the cache, so later edits build on it.
-    fn absorb(&self, state: &mut Unlocked, queue: &[Op], server: Option<Value>, trashed: Option<&str>) {
+    /// Records what the server did in the cache, so later edits build on it.
+    pub(super) fn absorb(&self, state: &mut Unlocked, queue: &[Op], effect: Effect) {
         if let Some(list) = state.sync.get_mut("ciphers").and_then(Value::as_array_mut) {
-            if let Some(gone) = trashed {
-                list.retain(|c| c.get("id").and_then(Value::as_str) != Some(gone));
-            }
-            if let Some(c) = server.map(crate::bw::api::normalize_keys)
-                && let Some(cid) = c.get("id").and_then(Value::as_str).map(str::to_owned)
-            {
-                list.retain(|x| x.get("id").and_then(Value::as_str) != Some(&cid));
-                list.push(c);
+            match effect {
+                Effect::Nothing => {}
+                Effect::Trashed(gone) => list.retain(|c| c.get("id").and_then(Value::as_str) != Some(&gone)),
+                Effect::Saved(server) => {
+                    let c = crate::bw::api::normalize_keys(server);
+                    if let Some(cid) = c.get("id").and_then(Value::as_str).map(str::to_owned) {
+                        list.retain(|x| x.get("id").and_then(Value::as_str) != Some(&cid));
+                        list.push(c);
+                    }
+                }
             }
         }
         // Keep the offline copy current, so that what was written is still
@@ -544,221 +497,13 @@ impl BitwardenBackend {
         Self::rebuild(state, queue);
     }
 
-    /// Queues `op` behind the others, keeps it on disk and shows it.
-    async fn enqueue(&self, queue: &mut Vec<Op>, op: Op) -> Result<(), BackendError> {
-        queue.push(op);
-        self.queue_changed(queue).await
-    }
-
-    async fn queue_changed(&self, queue: &[Op]) -> Result<(), BackendError> {
+    /// Keeps the queue on disk and shows it.
+    pub(super) async fn queue_changed(&self, queue: &[Op]) -> Result<(), BackendError> {
         let mut guard = self.state.lock().await;
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
         self.save_queue(queue, &state.keys.user);
         Self::rebuild(state, queue);
         Ok(())
-    }
-
-    async fn ensure_keyring_folder(&self) -> Result<String, BackendError> {
-        let enc = {
-            let state = self.state.lock().await;
-            let state = state.as_ref().ok_or(BackendError::Locked)?;
-            if let Some(f) = &state.keyring_folder {
-                return Ok(f.clone());
-            }
-            state.keys.user.encrypt_str(&self.root)
-        };
-        self.ensure_login().await.map_err(map_api)?;
-        let folder = self.api.lock().await.create_folder(&enc).await.map_err(map_api)?;
-        let id = folder.get("id").and_then(Value::as_str).ok_or_else(|| unavailable("folder without id"))?.to_owned();
-        if let Some(s) = self.state.lock().await.as_mut() {
-            s.keyring_folder = Some(id.clone());
-        }
-        Ok(id)
-    }
-
-    /// Works out what the first queued op needs from the server.
-    async fn prepare(&self, op: &Op) -> Result<Outgoing, BackendError> {
-        let folder = match op {
-            Op::Create { .. } => Some(self.ensure_keyring_folder().await?),
-            _ => None,
-        };
-        let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
-        let list = ciphers(&state.sync);
-        let find = |id: &str| find_marked(list, id, &state.keys, &state.built.unmarked);
-        Ok(match op {
-            Op::Create { item, .. } => match new_note(item, folder.as_deref(), &state.keys) {
-                Ok(body) => Outgoing::Create(body),
-                Err(e) => Outgoing::Drop(format!("a queued new item cannot be written: {e}")),
-            },
-            Op::Patch(patch) => match find(&patch.id) {
-                None => Outgoing::Drop("a queued change targets an item that is gone".into()),
-                Some(i) => match apply(&list[i], patch, &state.keys) {
-                    Ok(body) => {
-                        let cid = list[i].get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
-                        Outgoing::Update(cid, body)
-                    }
-                    Err(crate::bw::write::WriteError::Uninspectable(why)) => {
-                        return Err(unavailable(format!("a queued change waits: {why}")));
-                    }
-                    Err(e) => Outgoing::Drop(format!("a queued change cannot be applied: {e}")),
-                },
-            },
-            Op::Delete { id, .. } => match find(id) {
-                None => Outgoing::Drop("a queued delete targets an item that is gone".into()),
-                Some(i) if !may_trash(&list[i], id, &state.keys, state.keyring_folder.as_deref()) => {
-                    Outgoing::Drop("a queued delete targets an item outside the keyring folder".into())
-                }
-                Some(i) => Outgoing::Trash(list[i].get("id").and_then(Value::as_str).unwrap_or_default().to_owned()),
-            },
-            Op::Registry { .. } => {
-                return Err(BackendError::Rejected("a queued collection change waits: not supported yet".into()));
-            }
-        })
-    }
-
-    /// Replays queued writes in order. Stops at the first transient failure.
-    async fn flush_queue(&self) -> Result<(), BackendError> {
-        let mut queue = self.queue.lock().await;
-        let result = self.flush_locked(&mut queue).await;
-        if matches!(result, Err(BackendError::Locked)) {
-            // Locked meanwhile: queued secrets leave memory with the keys.
-            queue.clear();
-        }
-        result
-    }
-
-    async fn flush_locked(&self, queue: &mut Vec<Op>) -> Result<(), BackendError> {
-        if queue.is_empty() || !self.can_write().await {
-            return Ok(());
-        }
-        while let Some(op) = queue.first() {
-            let step = self.prepare(op).await?;
-            let sent = {
-                let api = self.api.lock().await;
-                match &step {
-                    Outgoing::Create(body) => api.create_item(body.clone()).await.map(Some),
-                    Outgoing::Update(cid, body) => api.update_item(cid, body.clone()).await.map(Some),
-                    Outgoing::Trash(cid) => api.trash_item(cid).await.map(|()| None),
-                    Outgoing::Drop(why) => {
-                        tracing::warn!("dropping a queued write: {why}");
-                        Ok(None)
-                    }
-                }
-            };
-            let (server, trashed) = match (&step, sent) {
-                (_, Err(e)) if e.is_transient() => return Err(map_api(e)),
-                (_, Err(e)) => {
-                    tracing::warn!("dropping a queued write the server rejected: {e}");
-                    (None, None)
-                }
-                (Outgoing::Trash(cid), Ok(_)) => (None, Some(cid.as_str())),
-                (_, Ok(server)) => (server, None),
-            };
-            queue.remove(0);
-            let mut guard = self.state.lock().await;
-            let state = guard.as_mut().ok_or(BackendError::Locked)?;
-            self.save_queue(queue, &state.keys.user);
-            self.absorb(state, queue, server, trashed);
-        }
-        Ok(())
-    }
-
-    async fn put_once(&self, item: &ItemData) -> Result<(), BackendError> {
-        // `items::encode` would store binary as base64 in a value bwss does
-        // not own, which the marker read path refuses (design §3.2).
-        if std::str::from_utf8(&item.secret).is_err() {
-            return Err(BackendError::Rejected("binary secrets are not supported yet".into()));
-        }
-        let mut queue = self.queue.lock().await;
-        let target = {
-            let guard = self.state.lock().await;
-            let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            state.built.marked.get(&item.id).map(|m| (m.cipher_id.clone(), m.source))
-        };
-        match target {
-            // Not on the server yet: the queued create carries the new version.
-            Some((cid, _)) if cid == QUEUED => {
-                for op in queue.iter_mut() {
-                    if let Op::Create { id, collection, item: queued } = op
-                        && *id == item.id
-                    {
-                        *collection = item.collection.clone();
-                        *queued = item.clone();
-                    }
-                }
-                self.queue_changed(&queue).await
-            }
-            // `items::encode` writes the login password or the note text; a
-            // value kept elsewhere would be left behind and another one
-            // overwritten.
-            Some((_, ValueSource::Field | ValueSource::BwssNotes)) => {
-                Err(BackendError::Rejected("changing this item is not supported yet".into()))
-            }
-            Some((cid, _)) => {
-                // Keep order: while anything is queued, nothing jumps ahead.
-                if !queue.is_empty() || !self.can_write().await {
-                    return Err(unavailable("offline: changes to existing items cannot be queued yet"));
-                }
-                let body = {
-                    let guard = self.state.lock().await;
-                    let state = guard.as_ref().ok_or(BackendError::Locked)?;
-                    let cipher = ciphers(&state.sync)
-                        .iter()
-                        .find(|c| c.get("id").and_then(Value::as_str) == Some(&cid))
-                        .ok_or_else(|| unavailable("the item is not in the cache"))?;
-                    legacy_update_body(cipher, item, &state.keys)?
-                };
-                let server = self.api.lock().await.update_item(&cid, body).await;
-                match server {
-                    Ok(server) => {
-                        let mut guard = self.state.lock().await;
-                        let state = guard.as_mut().ok_or(BackendError::Locked)?;
-                        self.absorb(state, &queue, Some(server), None);
-                        Ok(())
-                    }
-                    Err(e) if e.is_transient() => {
-                        Err(unavailable(format!("offline ({e}): changes to existing items cannot be queued yet")))
-                    }
-                    Err(e) => Err(map_api(e)),
-                }
-            }
-            None => {
-                let create =
-                    Op::Create { id: item.id.clone(), collection: item.collection.clone(), item: item.clone() };
-                if !queue.is_empty() || !self.can_write().await {
-                    return self.enqueue(&mut queue, create).await;
-                }
-                let folder = match self.ensure_keyring_folder().await {
-                    Ok(f) => f,
-                    Err(BackendError::Unavailable(e)) => {
-                        tracing::info!("offline ({e}); the new item is queued");
-                        return self.enqueue(&mut queue, create).await;
-                    }
-                    Err(e) => return Err(e),
-                };
-                let body = {
-                    let guard = self.state.lock().await;
-                    let state = guard.as_ref().ok_or(BackendError::Locked)?;
-                    items::encode(item, None, &state.keys.user, &folder)
-                        .map_err(|e| BackendError::Rejected(e.to_string()))?
-                };
-                let server = self.api.lock().await.create_item(body).await;
-                match server {
-                    Ok(server) => {
-                        let mut guard = self.state.lock().await;
-                        let state = guard.as_mut().ok_or(BackendError::Locked)?;
-                        self.absorb(state, &queue, Some(server), None);
-                        Ok(())
-                    }
-                    Err(e) if e.is_transient() => {
-                        tracing::info!("offline ({e}); the new item is queued");
-                        self.enqueue(&mut queue, create).await
-                    }
-                    Err(e) => Err(map_api(e)),
-                }
-            }
-        }
     }
 }
 
@@ -862,71 +607,48 @@ impl Backend for BitwardenBackend {
         Ok((state.built.snapshot != before).then(|| state.built.snapshot.clone()))
     }
 
-    async fn create_collection(&self, _label: &str) -> Result<CollectionData, BackendError> {
-        Err(BackendError::Rejected("collections are not supported yet".into()))
+    async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+        let mut queue = self.queue.lock().await;
+        let result = self.create_collection_locked(&mut queue, label).await;
+        self.forget_if_locked(&mut queue).await;
+        result
     }
 
-    async fn delete_collection(&self, _id: &str) -> Result<(), BackendError> {
-        Err(BackendError::Rejected("collections are not supported yet".into()))
+    async fn delete_collection(&self, id: &str) -> Result<(), BackendError> {
+        let mut queue = self.queue.lock().await;
+        let result = self.delete_collection_locked(&mut queue, id).await;
+        self.forget_if_locked(&mut queue).await;
+        result
     }
 
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        match self.put_once(item).await {
-            Err(BackendError::Rejected(msg)) if msg.to_lowercase().contains("out of date") => {
-                // Another device changed the item: take its revision, re-apply ours.
-                if let Ok(Some(_)) = self.refresh().await {}
-                self.put_once(item).await
-            }
-            other => other,
-        }
+        let mut queue = self.queue.lock().await;
+        let result = self.put_locked(&mut queue, item).await;
+        self.forget_if_locked(&mut queue).await;
+        result
     }
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
-        let target = {
-            let guard = self.state.lock().await;
-            let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            state.built.marked.get(&item.id).map(|m| {
-                let allowed = ciphers(&state.sync).iter().any(|c| {
-                    c.get("id").and_then(Value::as_str) == Some(&m.cipher_id)
-                        && may_trash(c, &item.id, &state.keys, state.keyring_folder.as_deref())
-                });
-                (m.cipher_id.clone(), m.revision_date.clone(), allowed)
-            })
-        };
-        let Some((cid, base_revision, allowed)) = target else { return Ok(()) };
-        if cid == QUEUED {
-            // Never reached the server: drop it from the queue.
-            queue.retain(|op| !matches!(op, Op::Create { id, .. } if *id == item.id));
-            return self.queue_changed(&queue).await;
-        }
-        if !allowed {
-            return Err(BackendError::Rejected("deleting this item is not supported yet".into()));
-        }
-        let delete = Op::Delete { id: item.id.clone(), base_revision };
-        if !queue.is_empty() || !self.can_write().await {
-            return self.enqueue(&mut queue, delete).await;
-        }
-        let sent = self.api.lock().await.trash_item(&cid).await;
-        match sent {
-            Ok(()) => {
-                let mut guard = self.state.lock().await;
-                let state = guard.as_mut().ok_or(BackendError::Locked)?;
-                self.absorb(state, &queue, None, Some(&cid));
-                Ok(())
-            }
-            Err(e) if e.is_transient() => {
-                tracing::info!("offline ({e}); the change is queued");
-                self.enqueue(&mut queue, delete).await
-            }
-            Err(e) => Err(map_api(e)),
-        }
+        let result = self.delete_locked(&mut queue, &item.id).await;
+        self.forget_if_locked(&mut queue).await;
+        result
     }
 
     async fn describe(&self) -> String {
         let queued = self.queue.lock().await.len();
         let urls = self.api.lock().await.urls().clone();
-        format!("Bitwarden {} ({}), folder \"{}\", {queued} queued change(s)", self.email, urls.identity, self.root)
+        let mut out = format!(
+            "Bitwarden {} ({}), folder \"{}\", {queued} queued change(s)",
+            self.email, urls.identity, self.root
+        );
+        if let Some(state) = self.state.lock().await.as_ref() {
+            for line in status_lines(&state.built) {
+                out.push('\n');
+                out.push_str(&line);
+            }
+        }
+        out
     }
 }
 
@@ -1103,61 +825,6 @@ mod tests {
         assert_eq!(b.marked["n"].cipher_id, QUEUED);
         // The cache itself is untouched.
         assert_eq!(ciphers(&s).len(), 2);
-    }
-
-    #[test]
-    fn legacy_updates_must_keep_the_item() {
-        let k = keys();
-        let plain = login(&k, "c1", &[("bwss:id", "a")]);
-        let mut item = build(&sync(vec![plain.clone()]), &k, None).marked["a"].item.clone();
-        item.secret = zeroize::Zeroizing::new(b"new".to_vec());
-        let body = items::encode(&item, Some(&plain), &k.user, "").unwrap();
-        assert!(encode_keeps_item(&plain, &body, &item, &k));
-
-        // encode drops bwss:collection: the item would leave its collection.
-        let elsewhere = login(&k, "c1", &[("bwss:id", "a"), ("bwss:collection", "work")]);
-        let mut item = build(&sync(vec![elsewhere.clone()]), &k, None).marked["a"].item.clone();
-        let body = items::encode(&item, Some(&elsewhere), &k.user, "").unwrap();
-        assert!(!encode_keeps_item(&elsewhere, &body, &item, &k));
-
-        // A relabel would rename the user's item.
-        item.collection = "login".into();
-        item.label = "renamed".into();
-        let body = items::encode(&item, Some(&plain), &k.user, "").unwrap();
-        assert!(!encode_keeps_item(&plain, &body, &item, &k));
-    }
-
-    #[test]
-    fn legacy_update_drops_derived_attributes_and_refuses_unknown_fields() {
-        let k = keys();
-        let mine = login(&k, "c1", &[("bwss:id", "a"), ("bwss:attr:service", "gh")]);
-        let item = build(&sync(vec![mine.clone()]), &k, None).marked["a"].item.clone();
-        assert!(item.attributes.contains_key("bwss:name"));
-        let body = legacy_update_body(&mine, &item, &k).unwrap();
-        let names = field_names(&Value::Object(body), &k.user).unwrap();
-        assert!(names.iter().flatten().all(|n| !n.starts_with("bwss:attr:bwss:")), "{names:?}");
-        assert!(names.iter().flatten().any(|n| n == "bwss:attr:service"));
-
-        let unknown = login(&k, "c1", &[("bwss:id", "a"), ("bwss:x", "keep me")]);
-        let item = build(&sync(vec![unknown.clone()]), &k, None).marked["a"].item.clone();
-        assert!(matches!(legacy_update_body(&unknown, &item, &k), Err(BackendError::Rejected(_))));
-    }
-
-    #[test]
-    fn interim_delete_trashes_only_readable_items_in_the_keyring_folder() {
-        let k = keys();
-        let mut ours = login(&k, "c1", &[("bwss:id", "a")]);
-        ours["folderId"] = json!("kf");
-        assert!(may_trash(&ours, "a", &k, Some("kf")));
-        assert!(!may_trash(&ours, "a", &k, None));
-        assert!(!may_trash(&ours, "other", &k, Some("kf")));
-        // A hand-marked login elsewhere in the vault.
-        let elsewhere = login(&k, "c2", &[("bwss:id", "b")]);
-        assert!(!may_trash(&elsewhere, "b", &k, Some("kf")));
-        // A held item: its cipher can no longer be read.
-        let mut held = ours.clone();
-        held["key"] = json!("2.AAAA|AAAA|AAAA");
-        assert!(!may_trash(&held, "a", &k, Some("kf")));
     }
 
     #[test]

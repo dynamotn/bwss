@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 
 pub type Attributes = BTreeMap<String, String>;
 
-/// Collection that always exists, maps to the root Bitwarden folder and
+/// Collection that always exists (items without `bwss:collection`) and
 /// carries the `default` alias.
 pub const LOGIN_COLLECTION: &str = "login";
 /// In-memory collection for secrets that must not be persisted.

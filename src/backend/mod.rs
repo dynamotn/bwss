@@ -4,6 +4,9 @@ pub mod bitwarden;
 pub mod memory;
 pub mod ops;
 pub mod registry;
+mod runner;
+#[cfg(test)]
+mod tests;
 
 use async_trait::async_trait;
 
@@ -17,6 +20,9 @@ pub enum BackendError {
     Unavailable(String),
     #[error("{0}")]
     Rejected(String),
+    /// The value source changed on the server since bwss read it (§5.6).
+    #[error("{0}")]
+    Conflict(String),
     #[error("the keyring is locked")]
     Locked,
 }

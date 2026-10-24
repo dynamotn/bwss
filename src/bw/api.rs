@@ -21,7 +21,6 @@ pub enum ApiError {
 
 impl ApiError {
     /// The server rejected an edit because the item changed elsewhere.
-    #[allow(dead_code)] // Task 11 retries out-of-date writes.
     pub fn is_out_of_date(&self) -> bool {
         matches!(self, ApiError::Http { status: 400, message } if message.to_lowercase().contains("out of date"))
     }
@@ -223,7 +222,6 @@ impl Api {
     }
 
     /// One cipher, fresh from the server.
-    #[allow(dead_code)] // Task 11 re-reads an item after an out-of-date rejection.
     pub async fn get_item(&self, id: &str) -> Result<Value, ApiError> {
         let req = self.authed(self.http.get(format!("{}/ciphers/{}", self.urls.api, enc(id))))?;
         self.send(req).await

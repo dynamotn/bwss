@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
-    A_ID, A_NAME, A_URI, A_USERNAME, F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID,
-    F_LOCATION, F_PASSWORD, PREFIX, field_names, first_index,
+    F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, F_PASSWORD, PREFIX,
+    field_names, first_index,
 };
 use super::items::{MAX_NOTES_ENC, MAX_PASSWORD_ENC, RESPONSE_ONLY, format_date, item_key};
 use super::scan::{Keys, Scan, ValueSource, normalize_collection, scan};
@@ -20,7 +20,6 @@ use crate::model::{ItemData, LOGIN_COLLECTION};
 
 /// Bitwarden's limit on the encrypted size of a custom field value.
 const MAX_FIELD_ENC: usize = 5_000;
-#[allow(dead_code)] // Task 11 deletes items through `has_foreign_content`.
 const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
 const FIELD_TEXT: u64 = 0;
@@ -154,6 +153,14 @@ impl<'k> Fields<'k> {
 
     fn remove_prefix(&mut self, prefix: &str) {
         self.remove_where(|n| !n.starts_with(prefix), false);
+    }
+
+    /// Fails when a field value is over Bitwarden's limit, so an oversize
+    /// label, attribute, ACL or collection never reaches the server.
+    fn check_sizes(&self) -> Result<(), WriteError> {
+        let too_large =
+            self.raw.iter().any(|f| f.get("value").and_then(Value::as_str).map_or(0, str::len) > MAX_FIELD_ENC);
+        if too_large { Err(WriteError::TooLarge) } else { Ok(()) }
     }
 }
 
@@ -318,6 +325,7 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
     }
 
     // 6. Everything new was encrypted under the item key above.
+    fields.check_sizes()?;
     let revision = cipher.get("revisionDate").and_then(Value::as_str).unwrap_or(&patch.base_revision);
     finish_body(&mut body, fields, revision);
     Ok(body)
@@ -342,7 +350,6 @@ fn finish_body(body: &mut Map<String, Value>, fields: Fields, revision: &str) {
 /// Body of the update request that removes every bwss field from `cipher`
 /// (design §5.4 step 1). The notes are cleared when they held bwss's secret
 /// (`bwss:location=notes`); everything else passes through as in `apply`.
-#[allow(dead_code)] // Task 11 deletes items with it.
 pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteError> {
     if cipher.get("deletedDate").is_some_and(|d| !d.is_null()) {
         return Err(WriteError::Gone);
@@ -365,7 +372,6 @@ pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteErr
 /// Whether anything in `cipher` is not bwss's (design §5.4, spec §8.2). Only
 /// what the answer needs is decrypted. An item that cannot be read is an
 /// error, never `false`: it must not be trashed.
-#[allow(dead_code)] // Task 11 deletes items with it.
 pub fn has_foreign_content(cipher: &Value, keys: &Keys) -> Result<bool, WriteError> {
     // Card, identity and SSH key data is never inspected: not bare.
     if !matches!(cipher.get("type").and_then(Value::as_u64), Some(TYPE_LOGIN | TYPE_SECURE_NOTE)) {
@@ -413,10 +419,9 @@ pub fn new_note(item: &ItemData, folder_id: Option<&str>, keys: &Keys) -> Result
     let mut fields = Fields::empty(key);
     fields.set(F_ID, &item.id, false);
     write_value(&mut body, &mut fields, ValueSource::Field, &item.secret)?;
-    for (name, value) in &item.attributes {
-        if [A_ID, A_NAME, A_USERNAME, A_URI].contains(&name.as_str()) {
-            continue;
-        }
+    // Derived attributes (and anything else in bwss's namespace) are never
+    // stored as attributes.
+    for (name, value) in item.attributes.iter().filter(|(n, _)| !n.starts_with(PREFIX)) {
         fields.set(&format!("{F_ATTR}{name}"), value, false);
     }
     if normalize_collection(&item.collection) != LOGIN_COLLECTION {
@@ -429,12 +434,42 @@ pub fn new_note(item: &ItemData, folder_id: Option<&str>, keys: &Keys) -> Result
         fields.set(F_ACL, &item.acl.join("\n"), true);
     }
     fields.set(F_CREATED, &item.created.to_string(), false);
+    fields.check_sizes()?;
 
     body.entry("notes").or_insert(Value::Null);
     body.insert("type".into(), json!(TYPE_SECURE_NOTE));
     body.insert("organizationId".into(), Value::Null);
     body.insert("folderId".into(), folder_id.map_or(Value::Null, |f| json!(f)));
     body.insert("name".into(), json!(key.encrypt_str(&item.label)));
+    body.insert("login".into(), Value::Null);
+    body.insert("secureNote".into(), json!({ "type": 0 }));
+    body.insert("favorite".into(), json!(false));
+    body.insert("reprompt".into(), json!(0));
+    body.insert("key".into(), Value::Null);
+    body.insert("passwordHistory".into(), json!([]));
+    body.insert("fields".into(), Value::Array(fields.raw));
+    Ok(body)
+}
+
+/// Body of the create request for a collection registry note (design §4):
+/// a personal secure note marked `id` and `kind`, whose notes hold `json`.
+pub fn new_registry_note(
+    id: &str,
+    kind: &str,
+    json: &str,
+    folder_id: Option<&str>,
+    keys: &Keys,
+) -> Result<Map<String, Value>, WriteError> {
+    let key = &keys.user;
+    let mut body = Map::new();
+    write_notes(&mut body, key, json)?;
+    let mut fields = Fields::empty(key);
+    fields.set(F_ID, id, false);
+    fields.set(F_KIND, kind, false);
+    body.insert("type".into(), json!(TYPE_SECURE_NOTE));
+    body.insert("organizationId".into(), Value::Null);
+    body.insert("folderId".into(), folder_id.map_or(Value::Null, |f| json!(f)));
+    body.insert("name".into(), json!(key.encrypt_str("bwss collections")));
     body.insert("login".into(), Value::Null);
     body.insert("secureNote".into(), json!({ "type": 0 }));
     body.insert("favorite".into(), json!(false));
@@ -998,6 +1033,40 @@ mod tests {
         let m = marked(&as_server(&body), &k);
         assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::BwssNotes, big.as_slice()));
         assert!(matches!(new_note(&item(&[b'x'; 8_000]), None, &k), Err(WriteError::TooLarge)));
+    }
+
+    #[test]
+    fn oversize_bwss_field_values_never_reach_the_server() {
+        let k = keys();
+        let long = "x".repeat(4_000);
+        let c = login(&k, &[("bwss:id", "x", false)], Some("pw"), None);
+        for (name, hidden) in [("bwss:label", false), ("bwss:attr:k", false), ("bwss:collection", false)] {
+            let p = Patch { set: vec![(name.into(), long.clone(), hidden)], ..keep(&c, &k) };
+            assert!(matches!(apply(&c, &p, &k), Err(WriteError::TooLarge)), "{name}");
+        }
+        let p = Patch { acl_add: vec![long.clone()], ..keep(&c, &k) };
+        assert!(matches!(apply(&c, &p, &k), Err(WriteError::TooLarge)));
+        // Just under the limit is fine.
+        let p = Patch { set: vec![("bwss:label".into(), "x".repeat(3_000), false)], ..keep(&c, &k) };
+        assert!(apply(&c, &p, &k).is_ok());
+
+        let mut it = item(b"s");
+        it.attributes.insert("k".into(), long);
+        assert!(matches!(new_note(&it, None, &k), Err(WriteError::TooLarge)));
+    }
+
+    #[test]
+    fn registry_notes_hold_json_in_their_notes() {
+        let k = keys();
+        let body = new_registry_note("_collections", "collections", r#"{"a":1}"#, Some("f1"), &k).unwrap();
+        assert_eq!((body["type"].as_u64(), body["folderId"].as_str()), (Some(2), Some("f1")));
+        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:kind"]);
+        assert_eq!(field(&body, &k.user, "bwss:kind"), Some(("collections".into(), 0)));
+        let m = marked(&as_server(&body), &k);
+        assert_eq!((m.item.id.as_str(), m.source), ("_collections", ValueSource::NoteBody));
+        assert_eq!(m.item.secret.as_slice(), br#"{"a":1}"#);
+        let huge = "x".repeat(9_000);
+        assert!(matches!(new_registry_note("_collections", "collections", &huge, None, &k), Err(WriteError::TooLarge)));
     }
 
     /// A secure note holding nothing but its name, as bwss leaves one after

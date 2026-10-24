@@ -187,7 +187,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Status => {
             let (unlocked, items, backend): (bool, u32, String) = control().await?.call("Status", &()).await?;
-            println!("{}, {items} item(s), {backend}", if unlocked { "unlocked" } else { "locked" });
+            // The first line is the summary; the backend may add lines with
+            // what the user may want to fix (duplicates, skipped items).
+            let (summary, details) = backend.split_once('\n').unwrap_or((backend.as_str(), ""));
+            println!("{}, {items} item(s), {summary}", if unlocked { "unlocked" } else { "locked" });
+            for line in details.lines() {
+                println!("  {line}");
+            }
             Ok(())
         }
         Command::Login { email, server, client_id, client_secret_stdin } => {
