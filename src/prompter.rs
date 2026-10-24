@@ -115,6 +115,7 @@ fn unescape(s: &str) -> Zeroizing<String> {
             && i + 2 < bytes.len()
             && let Some(b) = bytes
                 .get(i + 1..i + 3)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                 .and_then(|h| std::str::from_utf8(h).ok())
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
         {
@@ -363,6 +364,21 @@ mod tests {
         assert_eq!(&*unescape(&escape(s)), s);
         assert_eq!(&*unescape("pa%25ss%"), "pa%ss%");
         assert_eq!(&*unescape("%zz"), "%zz");
+    }
+
+    #[test]
+    fn a_percent_escape_at_the_very_end_is_decoded() {
+        assert_eq!(&*unescape("%41"), "A", "the whole string");
+        assert_eq!(&*unescape("pin%25"), "pin%");
+        assert_eq!(&*unescape("line%0A"), "line\n");
+        assert_eq!(&*unescape("%4"), "%4", "a truncated escape stays as sent");
+    }
+
+    #[test]
+    fn only_hex_digits_form_a_percent_escape() {
+        // from_str_radix would accept a sign.
+        assert_eq!(&*unescape("%+5x"), "%+5x");
+        assert_eq!(&*unescape("%-1"), "%-1");
     }
 
     #[test]
