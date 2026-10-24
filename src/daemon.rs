@@ -107,7 +107,8 @@ pub struct NewItem {
 
 /// Most sessions one bus client may hold; its oldest one goes first.
 pub const SESSIONS_PER_OWNER: usize = 64;
-/// Most sessions held by all clients together. A new one is refused beyond it.
+/// Most sessions held by all clients together; beyond it, departed clients are
+/// reaped and then the busiest client loses its oldest session.
 pub const SESSIONS_TOTAL: usize = 4096;
 /// How long a failed remote password attempt delays the next one.
 pub const FAILED_UNLOCK_DELAY: Duration = Duration::from_secs(2);
@@ -137,8 +138,8 @@ pub enum PromptSlot {
 }
 
 /// Decides about a new prompt for a client holding `held` prompts, each as
-/// (sequence number, already running). Only a prompt that has not started
-/// may be dismissed, the oldest of those first.
+/// (sequence number, cannot be dismissed: running or not yet registered).
+/// Only the others may be dismissed, the oldest of those first.
 pub fn prompt_slot(held: impl IntoIterator<Item = (u64, bool)>, cap: usize) -> PromptSlot {
     let held: Vec<_> = held.into_iter().collect();
     if held.len() < cap {
@@ -166,6 +167,15 @@ pub struct PromptEntry {
     pub owner: String,
     /// `Prompt` was called: the action is running and cannot be dismissed.
     pub started: bool,
+    /// The object is on the bus. Until then the entry only reserves a slot.
+    pub registered: bool,
+}
+
+impl PromptEntry {
+    /// Only a registered prompt that has not started can be dismissed.
+    pub fn pinned(&self) -> bool {
+        self.started || !self.registered
+    }
 }
 
 pub struct OpenSession {
@@ -329,11 +339,16 @@ impl Daemon {
 
     /// Like `unlock_with_password` for remote callers: password attempts take
     /// turns and a failed one makes the next wait 2 s. This is a speed bump
-    /// against processes of the same user, and it does not hold `unlock_gate`,
-    /// so the interactive unlock is never queued behind it.
+    /// against processes of the same user, and the penalty does not hold `unlock_gate`,
+    /// so the interactive unlock is never queued behind the penalty.
     pub async fn unlock_with_password_throttled(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
         let _turn = self.failure_gate.lock().await;
-        let result = self.unlock_with_password(password).await;
+        // The gate is held for the attempt only, never for the penalty, and it
+        // keeps this from running at the same time as the interactive unlock.
+        let result = {
+            let _gate = self.unlock_gate.lock().await;
+            self.unlock_with_password(password).await
+        };
         if result.is_err() {
             tokio::time::sleep(FAILED_UNLOCK_DELAY).await;
         }
@@ -341,9 +356,9 @@ impl Daemon {
     }
 
     /// Adds a session, first making room under the per-client cap. At the
-    /// global cap it refuses (`None`) unless `force`, which then takes the
+    /// global cap it does not add it unless `force`, which then closes the
     /// oldest session of the client holding the most. Returns the paths of the
-    /// sessions that were dropped.
+    /// sessions that were dropped and whether the new one was added.
     pub fn admit_session(&self, open: Arc<OpenSession>, path: &str, force: bool) -> (Vec<String>, bool) {
         let mut sessions = self.sessions.lock().unwrap();
         let mut dropped = Vec::new();
@@ -709,6 +724,36 @@ mod tests {
         assert_eq!(prompt_slot([(1, true), (2, false), (3, false)], 3), PromptSlot::Evict(2));
         assert_eq!(prompt_slot([(4, false), (2, false), (3, true)], 3), PromptSlot::Evict(2));
         assert_eq!(prompt_slot([(1, true), (2, true)], 2), PromptSlot::Full);
+    }
+
+    #[test]
+    fn only_registered_idle_prompts_can_be_dismissed() {
+        let entry = |started, registered| PromptEntry {
+            seq: 1,
+            path: String::new(),
+            owner: String::new(),
+            started,
+            registered,
+        };
+        assert!(!entry(false, true).pinned());
+        assert!(entry(true, true).pinned());
+        assert!(entry(false, false).pinned(), "a placeholder must never be a victim");
+        // A pinned oldest prompt is skipped in favour of the next one.
+        assert_eq!(prompt_slot([(1, entry(false, false).pinned()), (2, false)], 2), PromptSlot::Evict(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_remote_attempt_waits_for_the_interactive_unlock_gate() {
+        let (d, _backend) = gated_daemon(None).await;
+        let gate = d.unlock_gate.lock().await;
+        let attempt = {
+            let d = d.clone();
+            tokio::spawn(async move { d.unlock_with_password_throttled("pw").await })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!attempt.is_finished(), "the attempt must not run beside an interactive unlock");
+        drop(gate);
+        attempt.await.unwrap().unwrap();
     }
 
     #[test]

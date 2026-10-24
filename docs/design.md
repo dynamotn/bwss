@@ -341,8 +341,8 @@ Unchanged from `legacy`:
 
 - One Bitwarden master password unlocks everything, through pinentry (3
   attempts) on the first request or `bwss unlock`. Failed CLI unlocks are
-  delayed 2 s, and the delay applies per attempt and attempts take turns, without holding the
-  interactive unlock. This is a speed bump against other processes of the
+  delayed 2 s: attempts take turns and the delay never holds the interactive
+  unlock. This is a speed bump against other processes of the
   same user, not a defence against one that can also read the bus.
 - Per bus client: at most 64 sessions (its oldest is closed first; 4096 in
   all) and 16 outstanding prompts (its oldest

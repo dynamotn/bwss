@@ -85,12 +85,17 @@ impl ServiceObj {
         for p in dropped {
             let _ = self.daemon.conn().object_server().remove::<SessionObj, _>(p.as_str()).await;
         }
-        self.daemon
-            .conn()
-            .object_server()
-            .at(path.as_str(), SessionObj { daemon: self.daemon.clone(), path: path.clone() })
-            .await
-            .map_err(SecretError::ZBus)?;
+        let server = self.daemon.conn().object_server();
+        if let Err(e) = server.at(path.as_str(), SessionObj { daemon: self.daemon.clone(), path: path.clone() }).await {
+            self.daemon.sessions.lock().unwrap().remove(&path);
+            return Err(SecretError::ZBus(e));
+        }
+        // Evicted or dropped with its client while the object was being added:
+        // it is no longer tracked, so it must not stay on the bus.
+        if !self.daemon.sessions.lock().unwrap().contains_key(&path) {
+            let _ = server.remove::<SessionObj, _>(path.as_str()).await;
+            return Err(SecretError::Failed("the session was closed while opening".into()));
+        }
         let out = if output.is_empty() {
             empty_variant()
         } else {
@@ -499,7 +504,7 @@ impl PromptObj {
         // the cap loses its oldest prompt that has not started.
         let victim = {
             let mut prompts = daemon.prompts.lock().unwrap();
-            let held = prompts.iter().filter(|p| p.owner == owner).map(|p| (p.seq, p.started));
+            let held = prompts.iter().filter(|p| p.owner == owner).map(|p| (p.seq, p.pinned()));
             let victim = match prompt_slot(held, PROMPTS_PER_OWNER) {
                 PromptSlot::Free => None,
                 PromptSlot::Evict(oldest) => {
@@ -508,7 +513,7 @@ impl PromptObj {
                 }
                 PromptSlot::Full => return Err(SecretError::Failed("too many outstanding prompts".into())),
             };
-            prompts.push(PromptEntry { seq, path: path.clone(), owner, started: false });
+            prompts.push(PromptEntry { seq, path: path.clone(), owner, started: false, registered: false });
             victim
         };
         if let Some(entry) = victim {
@@ -519,24 +524,27 @@ impl PromptObj {
             daemon.prompts.lock().unwrap().retain(|p| p.seq != seq);
             return Err(SecretError::ZBus(e));
         }
+        // Dropped with its client while the object was being added: no longer
+        // tracked, so remove it again (dropping what it holds).
+        let tracked = {
+            let mut prompts = daemon.prompts.lock().unwrap();
+            prompts.iter_mut().find(|p| p.seq == seq).map(|e| e.registered = true).is_some()
+        };
+        if !tracked {
+            let _ = daemon.conn().object_server().remove::<PromptObj, _>(path.as_str()).await;
+            return Err(SecretError::Failed("the prompt was dismissed".into()));
+        }
         Ok(op(&path))
     }
 
     /// Dismisses an evicted prompt, dropping (and so zeroizing) what it holds.
+    /// Only registered prompts are evicted, so the object is on the bus.
     async fn dismiss_pending(daemon: &Arc<Daemon>, path: &str) {
-        let dismissed = match daemon.conn().object_server().interface::<_, PromptObj>(path).await {
-            Ok(iface) => {
-                let obj = iface.get().await;
-                let taken = obj.action.lock().unwrap().take();
-                taken.map(|a| a.dismissed_result())
-            }
-            // The object is not registered yet (a concurrent register is still
-            // adding it) or already gone: nothing is held, so report the plain
-            // dismissed result.
-            Err(_) => Some(PromptAction::CreateCollection { label: String::new() }.dismissed_result()),
-        };
-        if let Some(result) = dismissed {
-            PromptObj::finish(daemon.clone(), path.to_owned(), true, result).await;
+        // Already gone (finished or removed concurrently): nothing to signal.
+        let Ok(iface) = daemon.conn().object_server().interface::<_, PromptObj>(path).await else { return };
+        let taken = iface.get().await.action.lock().unwrap().take();
+        if let Some(action) = taken {
+            PromptObj::finish(daemon.clone(), path.to_owned(), true, action.dismissed_result()).await;
         }
     }
 
