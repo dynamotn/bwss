@@ -236,7 +236,7 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 - `bwss unlock` is the safe way to unlock: the daemon asks through its own
   pinentry, so no password crosses the bus. `bwss unlock --password-stdin`
   (for login hooks) sends the password only to a `bwss daemon` process
-  running the same installed file as the CLI. That stops a look-alike
+  running the same installed file as the CLI (checked by its command line). That stops a look-alike
   service that is not bwss. It does not stop another process of your user
   that forks and starts a real `bwss daemon` to pass the check, or one that
   can ptrace; use `--password-stdin` only if you accept that risk.

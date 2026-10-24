@@ -228,19 +228,48 @@ async fn look_up(proxy: &DBusProxy<'_>, name: BusName<'_>) -> Option<Pin> {
     }
 }
 
+/// What reading a pidfd's `/proc/self/fdinfo` gave.
+#[derive(Debug, PartialEq)]
+enum FdPid {
+    Pid(u32),
+    /// The process is gone, or outside this pid namespace.
+    Gone,
+    /// The file cannot be read (a non-dumpable daemon has a root-owned
+    /// `/proc/self`, and kernels before 5.17-5.19 refuse `fdinfo` then).
+    Unreadable,
+}
+
+/// How to resolve a caller, given its pidfd and the `ProcessID` the bus sent.
+#[derive(Debug, PartialEq)]
+enum Resolution {
+    /// Read this pid, and check after the reads that the pidfd still names it.
+    ByPidfd(u32),
+    /// Read this pid, checking the start time only (no usable pidfd).
+    ByPid(u32),
+    Unknown,
+}
+
+fn resolve(pidfd: Option<FdPid>, bus_pid: Option<u32>) -> Resolution {
+    match pidfd {
+        Some(FdPid::Pid(from_fd)) if bus_pid.is_none_or(|p| p == from_fd) => Resolution::ByPidfd(from_fd),
+        Some(FdPid::Pid(_) | FdPid::Gone) => Resolution::Unknown,
+        // The same path as for a bus without `ProcessFD`.
+        Some(FdPid::Unreadable) | None => bus_pid.map_or(Resolution::Unknown, Resolution::ByPid),
+    }
+}
+
 /// Reads pid, start time and executable of a process. With a pidfd, the pid
 /// comes from it and must still name the same live process after the reads,
-/// so they are about that process and no other.
+/// so they are about that process and no other. When the pidfd cannot be
+/// read, it falls back to `ProcessID` and the start time.
 fn observe(pid: Option<u32>, pidfd: Option<BorrowedFd<'_>>) -> Option<Pin> {
-    let pid = match pidfd {
-        Some(fd) => {
-            let from_fd = pidfd_pid(fd)?;
-            if pid.is_some_and(|p| p != from_fd) {
-                return None;
-            }
-            from_fd
-        }
-        None => pid?,
+    let fd_pid = pidfd.map(pidfd_pid);
+    let resolution = resolve(fd_pid, pid);
+    tracing::debug!(?resolution, "resolved the caller");
+    let (pid, pidfd) = match resolution {
+        Resolution::ByPidfd(pid) => (pid, pidfd),
+        Resolution::ByPid(pid) => (pid, None),
+        Resolution::Unknown => return None,
     };
     let start = start_time(pid)?;
     let exe = executable_of(pid)?;
@@ -249,7 +278,7 @@ fn observe(pid: Option<u32>, pidfd: Option<BorrowedFd<'_>>) -> Option<Pin> {
         Some(script) => script_identity(&exe, &script),
         None => exe,
     };
-    if pidfd.is_some_and(|fd| pidfd_pid(fd) != Some(pid)) || start_time(pid) != Some(start) {
+    if pidfd.is_some_and(|fd| pidfd_pid(fd) != FdPid::Pid(pid)) || start_time(pid) != Some(start) {
         return None;
     }
     Some(Pin { pid, start, identity })
@@ -282,10 +311,12 @@ fn parse_start_time(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// The pid a pidfd refers to, from `/proc/self/fdinfo`; `None` once the
-/// process is gone or when it is outside this pid namespace.
-fn pidfd_pid(fd: BorrowedFd<'_>) -> Option<u32> {
-    parse_pidfd_pid(&std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?)
+/// The pid a pidfd refers to, from `/proc/self/fdinfo`.
+fn pidfd_pid(fd: BorrowedFd<'_>) -> FdPid {
+    match std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())) {
+        Ok(info) => parse_pidfd_pid(&info).map_or(FdPid::Gone, FdPid::Pid),
+        Err(_) => FdPid::Unreadable,
+    }
 }
 
 fn parse_pidfd_pid(fdinfo: &str) -> Option<u32> {
@@ -325,12 +356,27 @@ fn is_daemon_cmdline(raw: &[u8]) -> bool {
 /// real binary beats any pid check anyway. The start time is read before
 /// and after, so a pid reused meanwhile is caught. `Err` says what failed.
 pub fn check_daemon_owner(pid: u32, me: &Path, my_uid: u32) -> Result<(), String> {
-    let first = start_time(pid).ok_or("whose start time cannot be read")?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let path = std::env::var_os("PATH").unwrap_or_default();
-    judge_daemon(parse_uid(&status), &cmdline, me, my_uid, &path)?;
-    if start_time(pid) != Some(first) {
+    check_owner_with(pid, me, my_uid, &path, &|pid, file| std::fs::read(format!("/proc/{pid}/{file}")))
+}
+
+/// [`check_daemon_owner`] over a reader of `/proc/<pid>/<file>`.
+fn check_owner_with(
+    pid: u32,
+    me: &Path,
+    my_uid: u32,
+    path_env: &OsStr,
+    read: &dyn Fn(u32, &str) -> std::io::Result<Vec<u8>>,
+) -> Result<(), String> {
+    let start = || read(pid, "stat").ok().and_then(|raw| parse_start_time(&String::from_utf8_lossy(&raw)));
+    let first = start().ok_or("whose start time cannot be read (it may have exited)")?;
+    let status = read(pid, "status").map_err(|_| "whose /proc status cannot be read (it may have exited)")?;
+    let cmdline = read(pid, "cmdline").unwrap_or_default();
+    if cmdline.is_empty() {
+        return Err("whose command line cannot be read or is empty (it may have exited)".into());
+    }
+    judge_daemon(parse_uid(&String::from_utf8_lossy(&status)), &cmdline, me, my_uid, path_env)?;
+    if start() != Some(first) {
         return Err("whose start time changed during the check (the pid was reused?)".into());
     }
     Ok(())
@@ -364,7 +410,7 @@ fn parse_uid(status: &str) -> Option<u32> {
     status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
 }
 
-/// Whether `owner` (a path from `executable_of`) is the same binary as `me`
+/// Whether `owner` (a path such as `executable_of` returns) is the same binary as `me`
 /// (`current_exe()`), comparing canonical paths where they still resolve.
 pub fn same_executable(owner: &str, me: &Path) -> bool {
     let canonical = |p: &str| {
@@ -438,6 +484,51 @@ mod tests {
         assert_eq!(judge(Some(1000), &cmd("bwss", "daemon\0"), dir.path().as_os_str()), Ok(()));
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(judge(Some(1000), &cmd("bwss", "daemon\0"), elsewhere.path().as_os_str()).is_err());
+    }
+
+    fn proc_files<'a>(
+        stat: &'a [&'a str],
+        status: Option<&'a str>,
+        cmdline: &'a [u8],
+    ) -> impl Fn(u32, &str) -> std::io::Result<Vec<u8>> + 'a {
+        let reads = std::cell::Cell::new(0);
+        move |_, file| match file {
+            "stat" => {
+                let n = reads.get();
+                reads.set(n + 1);
+                stat.get(n).map(|s| s.as_bytes().to_vec()).ok_or_else(|| std::io::ErrorKind::NotFound.into())
+            }
+            "status" => {
+                status.map(|s| s.as_bytes().to_vec()).ok_or_else(|| std::io::ErrorKind::PermissionDenied.into())
+            }
+            _ => Ok(cmdline.to_vec()),
+        }
+    }
+
+    #[test]
+    fn the_owner_check_reports_what_it_cannot_read_and_a_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwss");
+        std::fs::write(&bin, b"").unwrap();
+        let cmd = format!("{}\0daemon\0", bin.display()).into_bytes();
+        let stat = |start: u32| format!("1 (bwss) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0");
+        let (a, b) = (stat(100), stat(200));
+        let status = Some("Uid:\t1000\t1000\t1000\t1000\n");
+        let check = |read: &dyn Fn(u32, &str) -> std::io::Result<Vec<u8>>| {
+            check_owner_with(5, &bin, 1000, OsStr::new(""), read)
+        };
+
+        assert_eq!(check(&proc_files(&[&a, &a], status, &cmd)), Ok(()));
+        let err = check(&proc_files(&[&a, &b], status, &cmd)).unwrap_err();
+        assert!(err.contains("start time changed"), "{err}");
+        let err = check(&proc_files(&[], status, &cmd)).unwrap_err();
+        assert!(err.contains("start time cannot be read"), "{err}");
+        let err = check(&proc_files(&[&a, &a], None, &cmd)).unwrap_err();
+        assert!(err.contains("status cannot be read") && !err.contains("another user"), "{err}");
+        let err = check(&proc_files(&[&a, &a], status, b"")).unwrap_err();
+        assert!(err.contains("command line cannot be read or is empty"), "{err}");
+        let err = check_daemon_owner(u32::MAX, &bin, 1000).unwrap_err();
+        assert!(err.contains("start time cannot be read"), "{err}");
     }
 
     #[test]
@@ -616,6 +707,30 @@ mod tests {
         assert_eq!(parse_pidfd_pid("Pid:\t-1\n"), None, "the process is gone");
         assert_eq!(parse_pidfd_pid("Pid:\t0\n"), None, "in another pid namespace");
         assert_eq!(parse_pidfd_pid("pos:\t0\n"), None, "not a pidfd");
+    }
+
+    #[test]
+    fn an_unreadable_pidfd_falls_back_to_the_bus_pid_and_never_straight_to_unknown() {
+        use FdPid::*;
+        use Resolution::*;
+        assert_eq!(resolve(Some(Pid(7)), Some(7)), ByPidfd(7));
+        assert_eq!(resolve(Some(Pid(7)), None), ByPidfd(7));
+        assert_eq!(resolve(Some(Pid(7)), Some(8)), Unknown, "the bus and the pidfd disagree");
+        assert_eq!(resolve(Some(Gone), Some(7)), Unknown, "the process exited");
+        assert_eq!(resolve(Some(Unreadable), Some(7)), ByPid(7), "EACCES on fdinfo");
+        assert_eq!(resolve(Some(Unreadable), None), Unknown);
+        assert_eq!(resolve(None, Some(7)), ByPid(7), "a bus without ProcessFD");
+        assert_eq!(resolve(None, None), Unknown);
+    }
+
+    #[test]
+    fn an_unreadable_fdinfo_is_not_a_gone_process() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::OwnedFd::from(file);
+        // /dev/null is no pidfd: readable fdinfo without a Pid line is Gone
+        // on Linux, and unreadable (no /proc) elsewhere.
+        let got = pidfd_pid(fd.as_fd());
+        assert!(matches!(got, FdPid::Gone | FdPid::Unreadable), "{got:?}");
     }
 
     #[test]

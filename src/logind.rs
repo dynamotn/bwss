@@ -69,7 +69,10 @@ where
     loop {
         tokio::select! {
             msg = next(&mut sleeps) => {
-                let Some(msg) = msg else { break };
+                let Some(msg) = msg else {
+                    tracing::warn!("the logind connection closed, so sleep and screen lock no longer lock the keyring");
+                    break;
+                };
                 if msg.body().deserialize::<bool>().is_ok_and(locks_on_sleep) {
                     tracing::info!("system is going to sleep");
                     lock().await;
@@ -81,7 +84,11 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                if msg.is_none() { locks = None; continue }
+                if msg.is_none() {
+                    tracing::warn!("the logind session signal ended, so screen lock no longer locks the keyring");
+                    locks = None;
+                    continue;
+                }
                 tracing::info!("session lock requested");
                 lock().await;
             }

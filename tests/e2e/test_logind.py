@@ -20,11 +20,17 @@ SESSION = "/org/freedesktop/login1/session/_32"
 PASSWORD = "open sesame"
 
 
+class SystemBus(str):
+    """The bus address; `proc` is the dbus-daemon behind it."""
+
+    proc = None
+
+
 @pytest.fixture
 def system_bus():
     """A private dbus-daemon, standing in for the system bus."""
     sock = Path(tempfile.mkdtemp(prefix="bwss-sysbus-")) / "bus"
-    address = f"unix:path={sock}"
+    address = SystemBus(f"unix:path={sock}")
     proc = subprocess.Popen(["dbus-daemon", "--session", "--nofork", f"--address={address}"])
     for _ in range(100):
         if sock.exists():
@@ -32,8 +38,10 @@ def system_bus():
         time.sleep(0.1)
     else:
         raise RuntimeError("dbus-daemon did not start")
+    address.proc = proc
     yield address
-    proc.terminate()
+    if proc.poll() is None:
+        proc.terminate()
     proc.wait(10)
 
 
@@ -118,6 +126,7 @@ def test_waking_up_and_unlocking_the_session_leave_it_unlocked(started, logind):
     assert wait_locked(started)
     log = (started.home / "daemon.log").read_text()
     assert "system is going to sleep" not in log, log
+    assert log.count("session lock requested") == 1, "only Lock locks, not Unlock: " + log
 
 
 def test_without_a_system_bus_the_daemon_warns_and_keeps_serving():
@@ -153,3 +162,14 @@ def test_logind_still_locks_when_idle_locking_is_off(system_bus, logind):
         assert wait_locked(d)
     finally:
         d.stop()
+
+
+def test_losing_the_system_bus_is_logged_and_the_daemon_keeps_serving(started, system_bus):
+    unlocked(started)
+    system_bus.proc.kill()
+    system_bus.proc.wait(10)
+    assert wait_log(started, "no longer lock the keyring"), (started.home / "daemon.log").read_text()
+    assert started.proc.poll() is None
+    assert started.cli("status").stdout.startswith("unlocked")
+    started.cli("lock")
+    assert started.cli("status").stdout.startswith("locked")

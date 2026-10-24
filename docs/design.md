@@ -337,6 +337,11 @@ changing are never clobbered. Then:
   `reap_departed` sweeps any left behind. Without a pidfd, a pid reused
   between the client's connect and the daemon handling that signal is
   still taken for the new process: a window of one bus round trip.
+  When `/proc/self/fdinfo` cannot be read (a non-dumpable daemon has a
+  root-owned `/proc/self`, and kernels before about 5.17-5.19 refuse it),
+  the pidfd is ignored and the caller is resolved as on a bus without
+  `ProcessFD`, by `ProcessID` and the start time; it does not become an
+  unknown application. A pidfd that names a gone process still does.
 - **Non-dumpable clients.** A client that is not dumpable (gpg-agent,
   sandboxed browsers, anything that called `PR_SET_DUMPABLE 0`) has an
   unreadable `/proc/<pid>/exe`. It is an `(unknown application)`: asked every
@@ -820,14 +825,16 @@ command line matters because the bus reports the pid of whoever opened the
 connection: a squatter can fork, keep the connection in the child and exec a
 blocking `bwss unlock` in the parent. Without `/proc` (non-Linux),
 `--password-stdin` is refused. The CLI and the daemon must be the same
-installed file.
+installed file. A relative `argv[0]` containing a slash is resolved against
+the CLI's cwd, because the daemon's cwd is unreadable, so `./bwss daemon` is
+refused. Failing closed is intended.
 
 What the owner check stops: a squatter that is not running bwss, and the
 fork form that execs `bwss unlock`. What it cannot stop: a process of the
 same user that forks, keeps the name in the child and execs a real
 `bwss daemon` in the parent (pointed at another bus, hung before it claims
-its names, or stopped with SIGSTOP), so that the exe and the command line
-both pass; or one that can ptrace the daemon or the CLI. A check based on
+its names, or stopped with SIGSTOP), so that the user, `argv[0]` and the
+command line all pass; or one that can ptrace the daemon or the CLI. A check based on
 the pid cannot close this. Processes of the same user are not a security
 boundary for `--password-stdin`.
 
@@ -865,7 +872,7 @@ Notes:
 - The bus names are never replaceable. Plain `bwss unlock` keeps the
   password inside the daemon and is the safe path. `bwss unlock
   --password-stdin` sends it only to a `bwss daemon` process running the
-  CLI's own file (§10). That stops look-alike services that are not bwss,
+  CLI's own file by `argv[0]` (§10). That stops look-alike services that are not bwss,
   but not a process of the same user that forks and execs a real
   `bwss daemon`, nor one that can ptrace. Same-user processes are not a
   security boundary for `--password-stdin`.
