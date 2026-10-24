@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey};
-use crate::model::{Attributes, ItemData};
+use crate::model::ItemData;
 
 pub const PREFIX: &str = "bwss:";
 pub const F_ID: &str = "bwss:id";
@@ -35,8 +35,6 @@ pub enum MapError {
     Crypto(#[from] CryptoError),
     #[error("secret is too large for a Bitwarden item")]
     TooLarge,
-    #[error("item type {0} is not supported")]
-    UnsupportedType(u64),
 }
 
 pub fn parse_date(s: &str) -> u64 {
@@ -76,45 +74,6 @@ fn fields(cipher: &Value, key: &SymmetricKey) -> Result<Vec<(String, Zeroizing<S
         out.push((name, value));
     }
     Ok(out)
-}
-
-/// Decodes a Bitwarden item into a Secret Service item of `collection`.
-pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Result<ItemData, MapError> {
-    let ty = cipher.get("type").and_then(Value::as_u64).unwrap_or(0);
-    if ty != TYPE_LOGIN && ty != TYPE_SECURE_NOTE {
-        return Err(MapError::UnsupportedType(ty));
-    }
-    let key = item_key(cipher, user_key)?;
-    let fields = fields(cipher, &key)?;
-    let get = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str().to_owned());
-
-    let mut attributes = Attributes::new();
-    for (name, value) in &fields {
-        if let Some(attr) = name.strip_prefix(F_ATTR) {
-            attributes.insert(attr.to_owned(), value.to_string());
-        }
-    }
-    let in_notes = get(F_LOCATION).as_deref() == Some("notes") || ty == TYPE_SECURE_NOTE;
-    let raw = if in_notes { cipher.get("notes") } else { cipher.pointer("/login/password") };
-    let text = dec(raw, &key)?.unwrap_or_default();
-    let secret = if get(F_ENCODING).as_deref() == Some("base64") {
-        Zeroizing::new(B64.decode(text.as_bytes()).map_err(|_| CryptoError::Decrypt)?)
-    } else {
-        Zeroizing::new(text.as_bytes().to_vec())
-    };
-    let cipher_id = cipher.get("id").and_then(Value::as_str).unwrap_or_default();
-    let modified = parse_date(cipher.get("revisionDate").and_then(Value::as_str).unwrap_or_default());
-    Ok(ItemData {
-        id: get(F_ID).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| format!("c{cipher_id}")),
-        collection: collection.to_owned(),
-        label: dec(cipher.get("name"), &key)?.map(|s| s.to_string()).unwrap_or_default(),
-        attributes,
-        secret,
-        content_type: get(F_CONTENT_TYPE).unwrap_or_else(|| "text/plain".into()),
-        created: get(F_CREATED).and_then(|s| s.parse().ok()).unwrap_or(modified),
-        modified,
-        acl: get(F_ACL).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
-    })
 }
 
 /// Response-only properties that must not be echoed back in a write.
@@ -245,7 +204,21 @@ pub fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bw::scan::{Keys, Scan, scan};
     use crate::model::Attributes;
+
+    /// Reads an encoded item back the way the backend does.
+    fn read_back(cipher: &Value, key: &SymmetricKey) -> ItemData {
+        let keys = Keys { user: key.clone(), mark: key.derive("value-mark") };
+        match scan(cipher, &keys) {
+            Scan::Marked(m) => m.item,
+            other => panic!("expected a marked item, got {other:?}"),
+        }
+    }
+
+    fn own_attributes(item: &ItemData) -> Attributes {
+        item.attributes.iter().filter(|(k, _)| !k.starts_with(PREFIX)).map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
 
     fn item(secret: &[u8]) -> ItemData {
         let mut attributes = Attributes::new();
@@ -272,19 +245,26 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_text_and_binary_secrets() {
+    fn round_trips_text_secrets() {
         let key = SymmetricKey::generate();
-        for secret in [b"ghp_123".to_vec(), vec![0, 159, 146, 150, 255]] {
-            let it = item(&secret);
-            let cipher = as_server(encode(&it, None, &key, "f").unwrap(), "cid");
-            let back = decode(&cipher, &key, "login").unwrap();
-            assert_eq!(back.secret.to_vec(), secret);
-            assert_eq!(back.id, "abc123");
-            assert_eq!(back.attributes, it.attributes);
-            assert_eq!(back.acl, it.acl);
-            assert_eq!(back.created, it.created);
-            assert_eq!(back.label, "GitHub token");
-        }
+        let it = item(b"ghp_123");
+        let cipher = as_server(encode(&it, None, &key, "f").unwrap(), "cid");
+        let back = read_back(&cipher, &key);
+        assert_eq!(&*back.secret, b"ghp_123");
+        assert_eq!(back.id, "abc123");
+        assert_eq!(own_attributes(&back), it.attributes);
+        assert_eq!(back.acl, it.acl);
+        assert_eq!(back.created, it.created);
+        assert_eq!(back.label, "GitHub token");
+    }
+
+    #[test]
+    fn binary_secrets_are_base64_in_the_password() {
+        let key = SymmetricKey::generate();
+        let secret = [0, 159, 146, 150, 255];
+        let body = encode(&item(&secret), None, &key, "f").unwrap();
+        let stored = key.decrypt_str(body["login"]["password"].as_str().unwrap()).unwrap();
+        assert_eq!(B64.decode(stored.as_bytes()).unwrap(), secret);
     }
 
     #[test]
@@ -305,7 +285,7 @@ mod tests {
         assert_eq!(body["sshKey"], json!({ "privateKey": "2.unknown" }));
         assert_eq!(body["login"]["uris"], cipher["login"]["uris"]);
         assert_eq!(body["passwordHistory"][0]["password"], cipher["login"]["password"]);
-        let back = decode(&as_server(body, "cid"), &key, "login").unwrap();
+        let back = read_back(&as_server(body, "cid"), &key);
         assert_eq!(&*back.secret, b"new");
         assert!(!back.attributes.contains_key("user"));
         let names: Vec<_> = fields(&as_server(encode(&edited, Some(&cipher), &key, "f").unwrap(), "cid"), &key)
@@ -322,24 +302,8 @@ mod tests {
         let big = vec![b'x'; 5_000];
         let cipher = as_server(encode(&item(&big), None, &key, "f").unwrap(), "cid");
         assert!(cipher["login"]["password"].is_null());
-        assert_eq!(decode(&cipher, &key, "login").unwrap().secret.to_vec(), big);
+        assert_eq!(read_back(&cipher, &key).secret.to_vec(), big);
         assert!(matches!(encode(&item(&vec![b'x'; 20_000]), None, &key, "f"), Err(MapError::TooLarge)));
-    }
-
-    #[test]
-    fn decodes_items_made_by_other_clients() {
-        let key = SymmetricKey::generate();
-        let login = json!({
-            "id": "1234-abcd", "type": 1, "name": key.encrypt_str("Bank"), "revisionDate": "2026-01-02T03:04:05Z",
-            "login": { "username": key.encrypt_str("me"), "password": key.encrypt_str("hunter2") }, "fields": null
-        });
-        let it = decode(&login, &key, "login").unwrap();
-        assert_eq!(it.id, "c1234-abcd");
-        assert_eq!(&*it.secret, b"hunter2");
-        assert_eq!(it.modified, 1_767_323_045);
-        let note = json!({ "id": "n", "type": 2, "name": key.encrypt_str("Note"), "notes": key.encrypt_str("text"), "revisionDate": "" });
-        assert_eq!(&*decode(&note, &key, "login").unwrap().secret, b"text");
-        assert!(matches!(decode(&json!({ "type": 3 }), &key, "login"), Err(MapError::UnsupportedType(3))));
     }
 
     #[test]
@@ -350,9 +314,8 @@ mod tests {
             "id": "x", "type": 1, "key": user.encrypt(&item_key.to_bytes()), "name": item_key.encrypt_str("L"),
             "login": { "password": item_key.encrypt_str("s") }, "revisionDate": ""
         });
-        assert_eq!(&*decode(&cipher, &user, "login").unwrap().secret, b"s");
         let body = encode(&item(b"t"), Some(&cipher), &user, "f").unwrap();
         assert_eq!(body["key"], cipher["key"]);
-        assert_eq!(&*decode(&as_server(body, "x"), &user, "login").unwrap().secret, b"t");
+        assert_eq!(&*read_back(&as_server(body, "x"), &user).secret, b"t");
     }
 }

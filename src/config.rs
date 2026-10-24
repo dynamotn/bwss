@@ -28,7 +28,7 @@ pub struct Config {
     pub backend: BackendKind,
     pub server_url: String,
     pub email: String,
-    /// Root Bitwarden folder; collections are its sub-folders.
+    /// The keyring folder: where bwss puts the items it creates.
     pub folder: String,
     /// pinentry-compatible program used for every prompt.
     pub prompter: String,

@@ -4,8 +4,6 @@
 //! an item with a non-blank marker is read any further; everything else
 //! (name, notes, login, other field values) stays ciphertext.
 
-#![allow(dead_code)] // consumed by the backend in a later task; remove then.
-
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,7 +33,7 @@ pub enum ValueSource {
     LoginPassword,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MarkedItem {
     pub cipher_id: String,
     pub revision_date: String,

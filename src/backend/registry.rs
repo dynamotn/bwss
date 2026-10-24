@@ -1,9 +1,6 @@
 //! The collection registry: a mergeable record of collections, kept in one
 //! secure note so that an empty collection survives and devices can merge.
 
-// Task 10 wires the registry into the Bitwarden backend.
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -24,19 +21,15 @@ pub struct Entry {
 pub struct Registry(pub BTreeMap<String, Entry>);
 
 impl Registry {
-    /// Reads the registry note; bad JSON gives an empty registry.
-    pub fn parse(notes: &str) -> Registry {
-        match serde_json::from_str(notes) {
-            Ok(map) => Registry(map),
-            Err(err) => {
-                // Never log the note itself.
-                tracing::warn!("collection registry is not valid JSON: {err}");
-                Registry::default()
-            }
-        }
+    /// Reads the registry note. Parsing is all or nothing: a note that does
+    /// not parse must never be treated as empty and written over (it would
+    /// wipe every collection on every device).
+    pub fn try_parse(notes: &str) -> Result<Registry, serde_json::Error> {
+        serde_json::from_str(notes).map(Registry)
     }
 
     /// Deterministic JSON, so equal registries give equal notes.
+    #[allow(dead_code)] // Task 11 writes the registry note.
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.0).expect("a string-keyed map always serializes")
     }
@@ -55,6 +48,7 @@ impl Registry {
     }
 
     /// Sets an entry unconditionally; the caller decides.
+    #[allow(dead_code)] // Task 11 creates and deletes collections.
     pub fn put(&mut self, id: &str, entry: Entry) {
         self.0.insert(id.to_string(), entry);
     }
@@ -129,14 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_is_empty() {
-        assert_eq!(Registry::parse("not json"), Registry::default());
-        assert_eq!(Registry::parse(""), Registry::default());
+    fn bad_json_is_an_error() {
+        assert!(Registry::try_parse("not json").is_err());
+        assert!(Registry::try_parse("").is_err());
     }
 
     #[test]
     fn extra_keys_are_ignored_and_deleted_defaults_false() {
-        let r = Registry::parse(r#"{"a":{"label":"A","created":1,"extra":true}}"#);
+        let r = Registry::try_parse(r#"{"a":{"label":"A","created":1,"extra":true}}"#).unwrap();
         assert_eq!(r.0["a"], entry("A", 1, false));
     }
 
@@ -145,7 +139,7 @@ mod tests {
         let a = reg(&[("b", entry("B", 2, false)), ("a", entry("A", 1, true))]);
         let b = reg(&[("a", entry("A", 1, true)), ("b", entry("B", 2, false))]);
         assert_eq!(a.to_json(), b.to_json());
-        assert_eq!(Registry::parse(&a.to_json()), a);
+        assert_eq!(Registry::try_parse(&a.to_json()).unwrap(), a);
     }
 
     #[test]

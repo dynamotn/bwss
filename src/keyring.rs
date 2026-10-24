@@ -15,8 +15,13 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, now};
 
+/// Version of the locked index file; an index without it is not read.
+const INDEX_FORMAT: u64 = 2;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LockedIndexFile {
+    #[serde(default)]
+    format: u64,
     salt: String,
     collections: Vec<IndexedCollection>,
     items: Vec<IndexedItem>,
@@ -76,11 +81,11 @@ impl Keyring {
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<LockedIndexFile>(&b).ok())
-            .filter(|i| B64.decode(&i.salt).is_ok_and(|s| s.len() == 32))
+            .filter(|i| i.format == INDEX_FORMAT && B64.decode(&i.salt).is_ok_and(|s| s.len() == 32))
             .unwrap_or_else(|| {
                 let mut salt = [0u8; 32];
                 rand::fill(&mut salt);
-                LockedIndexFile { salt: B64.encode(salt), ..Default::default() }
+                LockedIndexFile { format: INDEX_FORMAT, salt: B64.encode(salt), ..Default::default() }
             });
         let mut collections = builtin_collections();
         for c in &index.collections {
@@ -330,7 +335,29 @@ mod tests {
         assert_eq!(locked, vec![("login".into(), "a".into())]);
         assert!(k2.search(&q(&[("service", "nope")]), None).1.is_empty());
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("gh") && !text.contains("\"me\""));
+        // Quoted: the random base64 salt may contain the bare letters.
+        assert!(!text.contains("\"gh\"") && !text.contains("\"me\""));
+    }
+
+    #[test]
+    fn index_without_format_2_is_ignored_and_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut k = Keyring::new(Some(path.clone()));
+        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
+        let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format"], 2);
+        assert_eq!(Keyring::new(Some(path.clone())).search(&q(&[("service", "gh")]), None).1.len(), 1);
+
+        // The same index as an older version wrote it is not read.
+        saved.as_object_mut().unwrap().remove("format");
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut old = Keyring::new(Some(path.clone()));
+        assert!(old.search(&q(&[("service", "gh")]), None).1.is_empty());
+        assert_ne!(old.index.salt, saved["salt"].as_str().unwrap());
+        old.load(Snapshot::default());
+        let rebuilt: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rebuilt["format"], 2);
     }
 
     #[test]

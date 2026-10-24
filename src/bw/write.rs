@@ -4,8 +4,6 @@
 //! bwss changes only its own fields and the value source of the item it read
 //! (design §5). Everything else in the cipher passes through untouched.
 
-#![allow(dead_code)] // consumed by the backend in a later task; remove then.
-
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -22,6 +20,7 @@ use crate::model::{ItemData, LOGIN_COLLECTION};
 
 /// Bitwarden's limit on the encrypted size of a custom field value.
 const MAX_FIELD_ENC: usize = 5_000;
+#[allow(dead_code)] // Task 11 deletes items through `has_foreign_content`.
 const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
 const FIELD_TEXT: u64 = 0;
@@ -343,6 +342,7 @@ fn finish_body(body: &mut Map<String, Value>, fields: Fields, revision: &str) {
 /// Body of the update request that removes every bwss field from `cipher`
 /// (design §5.4 step 1). The notes are cleared when they held bwss's secret
 /// (`bwss:location=notes`); everything else passes through as in `apply`.
+#[allow(dead_code)] // Task 11 deletes items with it.
 pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteError> {
     if cipher.get("deletedDate").is_some_and(|d| !d.is_null()) {
         return Err(WriteError::Gone);
@@ -365,6 +365,7 @@ pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteErr
 /// Whether anything in `cipher` is not bwss's (design §5.4, spec §8.2). Only
 /// what the answer needs is decrypted. An item that cannot be read is an
 /// error, never `false`: it must not be trashed.
+#[allow(dead_code)] // Task 11 deletes items with it.
 pub fn has_foreign_content(cipher: &Value, keys: &Keys) -> Result<bool, WriteError> {
     // Card, identity and SSH key data is never inspected: not bare.
     if !matches!(cipher.get("type").and_then(Value::as_u64), Some(TYPE_LOGIN | TYPE_SECURE_NOTE)) {

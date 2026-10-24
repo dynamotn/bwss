@@ -4,9 +4,6 @@
 //! the user key (design §8.1, stricter: op kinds are hidden too). State files
 //! carry `"format": 2`; anything older is set aside, never overwritten.
 
-// Task 10 wires the queue into the Bitwarden backend.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -159,7 +156,8 @@ pub fn read_versioned(path: &Path, legacy_suffix: &str) -> Loaded<Value> {
     }
 }
 
-fn set_aside(path: &Path, suffix: &str) -> Loaded<Value> {
+/// Renames `path` to `<name>.<suffix>` (numbered, never overwriting).
+pub(crate) fn set_aside(path: &Path, suffix: &str) -> Loaded<Value> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut target = path.with_file_name(format!("{name}.{suffix}"));
     let mut n = 0u32;

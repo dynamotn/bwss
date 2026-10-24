@@ -55,7 +55,7 @@ pub struct CollectionData {
 }
 
 /// Everything a backend knows once unlocked.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub collections: Vec<CollectionData>,
     pub items: Vec<ItemData>,

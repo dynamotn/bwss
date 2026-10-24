@@ -5,8 +5,10 @@ use std::time::Instant;
 
 use zeroize::Zeroizing;
 
+use crate::backend::bitwarden::build;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::items;
+use crate::bw::scan::Keys;
 use crate::keyring::Keyring;
 use crate::model::{Attributes, ItemData, Snapshot};
 use crate::session::{DH_AES, Session};
@@ -56,9 +58,12 @@ fn perf_budgets() {
             })
             .collect()
     });
-    let decoded: Vec<_> = time("decode-10000-items", 5_000, || {
-        ciphers.iter().map(|c| items::decode(c, &key, "login").unwrap()).collect()
-    });
+    let keys = Keys { mark: key.derive("value-mark"), user: key };
+    let sync = serde_json::json!({ "ciphers": ciphers });
+    let built = time("scan-10000-items", 5_000, || build(&sync, &keys, None));
+    assert_eq!(built.snapshot.items.len(), 10_000);
+    time("rescan-10000-unchanged", 5_000, || build(&sync, &keys, Some(&built)));
+    let decoded = built.snapshot.items;
 
     let mut k = Keyring::new(None);
     time("load-10000-items", 1_000, || k.load(Snapshot { collections: vec![], items: decoded }));

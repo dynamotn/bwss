@@ -162,7 +162,6 @@ impl SymmetricKey {
 
     /// A key of its own for `purpose` (HKDF-Expand over this key), so that
     /// nothing encrypted with this key can pass for data of that purpose.
-    #[allow(dead_code)]
     pub fn derive(&self, purpose: &str) -> Self {
         let mut prk = Zeroizing::new([0u8; 64]);
         prk[..32].copy_from_slice(&self.enc);

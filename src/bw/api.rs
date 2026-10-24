@@ -21,6 +21,7 @@ pub enum ApiError {
 
 impl ApiError {
     /// The server rejected an edit because the item changed elsewhere.
+    #[allow(dead_code)] // Task 11 retries out-of-date writes.
     pub fn is_out_of_date(&self) -> bool {
         matches!(self, ApiError::Http { status: 400, message } if message.to_lowercase().contains("out of date"))
     }
@@ -122,7 +123,8 @@ impl Api {
         &self.urls
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value, ApiError> {
+    /// Sends a request and returns the body text of a 2xx answer.
+    async fn send_text(&self, req: reqwest::RequestBuilder) -> Result<String, ApiError> {
         let res = req
             .header("Bitwarden-Client-Name", CLIENT_NAME)
             .header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"))
@@ -132,15 +134,14 @@ impl Api {
             .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
         let status = res.status().as_u16();
         let text = res.text().await.map_err(|e| ApiError::Network(e.without_url().to_string()))?;
-        let body = if text.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&text).map(normalize_keys).unwrap_or(Value::Null)
-        };
         if !(200..300).contains(&status) {
-            return Err(ApiError::Http { status, message: describe_error(&body) });
+            return Err(ApiError::Http { status, message: describe_error(&parse_body(&text)) });
         }
-        Ok(body)
+        Ok(text)
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value, ApiError> {
+        self.send_text(req).await.map(|text| parse_body(&text))
     }
 
     pub async fn prelogin(&self, email: &str) -> Result<KdfParams, ApiError> {
@@ -185,6 +186,12 @@ impl Api {
         self.token.as_ref().is_some_and(|(_, exp)| *exp > Instant::now())
     }
 
+    /// Whether a `/sync` has run since login, so item writes can name
+    /// their owner.
+    pub fn has_profile(&self) -> bool {
+        self.user_id.is_some()
+    }
+
     pub fn logout(&mut self) {
         self.token = None;
         self.user_id = None;
@@ -208,14 +215,23 @@ impl Api {
         Ok(body)
     }
 
+    /// The account's revision date as the server sends it (a JSON number of
+    /// milliseconds, or a string), kept as raw text: it is only compared.
+    pub async fn revision_date(&self) -> Result<String, ApiError> {
+        let req = self.authed(self.http.get(format!("{}/accounts/revision-date", self.urls.api)))?;
+        Ok(self.send_text(req).await?.trim().to_owned())
+    }
+
+    /// One cipher, fresh from the server.
+    #[allow(dead_code)] // Task 11 re-reads an item after an out-of-date rejection.
+    pub async fn get_item(&self, id: &str) -> Result<Value, ApiError> {
+        let req = self.authed(self.http.get(format!("{}/ciphers/{}", self.urls.api, enc(id))))?;
+        self.send(req).await
+    }
+
     pub async fn create_folder(&self, encrypted_name: &str) -> Result<Value, ApiError> {
         let req = self.authed(self.http.post(format!("{}/folders", self.urls.api)))?;
         self.send(req.json(&json!({ "name": encrypted_name }))).await
-    }
-
-    pub async fn delete_folder(&self, id: &str) -> Result<(), ApiError> {
-        let req = self.authed(self.http.delete(format!("{}/folders/{}", self.urls.api, enc(id))))?;
-        self.send(req).await.map(|_| ())
     }
 
     fn with_owner(&self, mut body: Map<String, Value>) -> Result<Value, ApiError> {
@@ -240,6 +256,10 @@ impl Api {
         let req = self.authed(self.http.put(format!("{}/ciphers/{}/delete", self.urls.api, enc(id))))?;
         self.send(req).await.map(|_| ())
     }
+}
+
+fn parse_body(text: &str) -> Value {
+    if text.is_empty() { Value::Null } else { serde_json::from_str(text).map(normalize_keys).unwrap_or(Value::Null) }
 }
 
 fn enc(segment: &str) -> String {
