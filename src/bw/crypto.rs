@@ -101,7 +101,6 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 
 /// A mark of `stored` (an encrypted string as kept in the vault): HMAC-SHA256
 /// under the MAC half of `mark_key`. Equal marks mean the stored text is unchanged.
-#[allow(dead_code)]
 pub fn value_mark(mark_key: &SymmetricKey, stored: &str) -> [u8; 32] {
     hmac(&mark_key.mac, &[stored.as_bytes()])
 }

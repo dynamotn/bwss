@@ -1,12 +1,12 @@
 //! Custom-field primitives: decrypt names without touching values, and one
 //! value at a time, so secrets are decrypted only when asked for.
-#![allow(dead_code)] // consumers arrive in later tasks; remove then.
 
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey};
 
+#[allow(dead_code)] // used by the write path in a later task; remove then.
 pub const PREFIX: &str = "bwss:";
 pub const F_ID: &str = "bwss:id";
 pub const F_PASSWORD: &str = "bwss:password";
@@ -18,6 +18,7 @@ pub const F_ENCODING: &str = "bwss:encoding";
 pub const F_LOCATION: &str = "bwss:location";
 pub const F_ACL: &str = "bwss:acl";
 pub const F_CREATED: &str = "bwss:created";
+#[allow(dead_code)] // used by the collection registry in a later task; remove then.
 pub const F_KIND: &str = "bwss:kind";
 
 /// Derived attributes.
