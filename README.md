@@ -137,7 +137,7 @@ flowchart LR
 |---|---|
 | default collection (`login`, alias `default`) | marked items without `bwss:collection` |
 | collection "Work" | items with `bwss:collection=work` |
-| item label | item name |
+| item label | `bwss:label` field, falling back to the item name |
 | secret | `bwss:password` field, notes, login password or note text (base64 for binary data) |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
