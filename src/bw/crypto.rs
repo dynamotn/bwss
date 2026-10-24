@@ -100,10 +100,12 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// A mark of `stored` (a value's decrypted text as kept in the vault, before
-/// any base64 decoding): HMAC-SHA256 under the MAC half of `mark_key`. Equal
-/// marks mean the stored text is unchanged, whatever IV it was encrypted with.
-pub fn value_mark(mark_key: &SymmetricKey, stored: &str) -> [u8; 32] {
-    hmac(&mark_key.mac, &[stored.as_bytes()])
+/// any base64 decoding) for the item `id`: HMAC-SHA256 of `id ‖ 0x00 ‖ stored`
+/// under the MAC half of `mark_key`, as the Obsidian plugin computes it. Equal
+/// marks mean the stored text is unchanged, whatever IV it was encrypted with;
+/// two items holding the same secret still get different marks.
+pub fn value_mark(mark_key: &SymmetricKey, id: &str, stored: &str) -> [u8; 32] {
+    hmac(&mark_key.mac, &[id.as_bytes(), &[0], stored.as_bytes()])
 }
 
 /// HKDF-Expand (RFC 5869) for one 32-byte block.
@@ -330,11 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn value_mark_depends_on_key_and_value() {
+    fn value_mark_depends_on_key_id_and_value() {
         let user = SymmetricKey::generate();
         let mark_key = user.derive("marks");
-        assert_eq!(value_mark(&mark_key, "a"), value_mark(&mark_key, "a"));
-        assert_ne!(value_mark(&mark_key, "a"), value_mark(&mark_key, "b"));
-        assert_ne!(value_mark(&mark_key, "a"), value_mark(&user.derive("other"), "a"));
+        assert_eq!(value_mark(&mark_key, "i", "a"), value_mark(&mark_key, "i", "a"));
+        assert_ne!(value_mark(&mark_key, "i", "a"), value_mark(&mark_key, "i", "b"));
+        assert_ne!(value_mark(&mark_key, "i", "a"), value_mark(&user.derive("other"), "i", "a"));
+        // Two items holding the same secret do not share a mark.
+        assert_ne!(value_mark(&mark_key, "i", "a"), value_mark(&mark_key, "j", "a"));
+        // The separator keeps the id and the value apart.
+        assert_ne!(value_mark(&mark_key, "ab", "c"), value_mark(&mark_key, "a", "bc"));
     }
 }

@@ -174,7 +174,7 @@ fn read_marked(
     };
     // Over the decrypted text, never the ciphertext: official clients
     // re-encrypt every value with a fresh IV on any save.
-    let mark = value_mark(&keys.mark, &text);
+    let mark = value_mark(&keys.mark, &id, &text);
 
     // Derived attributes and the item name.
     let name = dec_opt(str_at(cipher, "/name"), key)?;
@@ -339,7 +339,7 @@ mod tests {
         let s = marked(scan(&c, &k));
         assert_eq!(s.item.secret.as_slice(), &[0u8, 1][..]);
         // the mark follows the stored text, decrypted but not decoded
-        assert_eq!(s.mark, value_mark(&k.mark, "AAE="));
+        assert_eq!(s.mark, value_mark(&k.mark, "x", "AAE="));
     }
 
     #[test]
