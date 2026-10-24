@@ -64,6 +64,10 @@ pub enum WriteError {
     Gone,
     #[error("the item no longer carries its bwss:id")]
     Unmarked,
+    /// The fresh copy cannot be read now (for example a key that does not
+    /// unwrap). Unlike `Unmarked`, the change must not be dropped.
+    #[error("the item cannot be read: {0}")]
+    Uninspectable(String),
 }
 
 /// Custom fields being edited: the raw (encrypted) entries with their
@@ -263,7 +267,8 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
     }
     let fresh = match scan(cipher, keys) {
         Scan::Marked(m) if m.item.id == patch.id => m,
-        _ => return Err(WriteError::Unmarked),
+        Scan::Uninspectable(why) => return Err(WriteError::Uninspectable(why)),
+        Scan::Marked(_) | Scan::Unmarked | Scan::Skipped(_) => return Err(WriteError::Unmarked),
     };
     if let ValueChange::Set { source, base_mark, .. } = &patch.value
         && (fresh.source != *source || fresh.mark != *base_mark)
@@ -802,6 +807,11 @@ mod tests {
         assert!(matches!(apply(&fresh, &keep(&c, &k), &k), Err(WriteError::Unmarked)));
         let fresh = login(&k, &[("bwss:id", " ", false), ("obsidian:id", "o", false)], Some("pw"), None);
         assert!(matches!(apply(&fresh, &keep(&c, &k), &k), Err(WriteError::Unmarked)));
+        // cannot be read right now: distinct from unmarked, so the change is not dropped
+        let mut fresh = c.clone();
+        fresh["key"] = json!("2.bad|bad|bad");
+        assert!(matches!(apply(&fresh, &keep(&c, &k), &k), Err(WriteError::Uninspectable(_))));
+        assert!(matches!(apply(&fresh, &p, &k), Err(WriteError::Uninspectable(_))));
         // no longer readable as bwss's item
         let mut fresh = c.clone();
         fresh["type"] = json!(3);
