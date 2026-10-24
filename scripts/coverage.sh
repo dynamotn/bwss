@@ -6,18 +6,29 @@
 #   COVERAGE_MIN (default 100) is the line-coverage threshold. See README.
 set -euo pipefail
 
-ignore='(perf|backend/tests)\.rs$'
+ignore='(^|/)src/(perf|backend/tests)\.rs$'
 
 # Instrument every build and point every process at one profile directory.
 env_script="$(cargo llvm-cov show-env --sh --remap-path-prefix)"
 # shellcheck source=/dev/null # the exports come from cargo llvm-cov at run time
 . /dev/stdin <<< "${env_script}"
+profile_dir="${CARGO_LLVM_COV_TARGET_DIR:?}"
+mkdir -p "${profile_dir}"
+
+# `cargo llvm-cov clean` refuses a target directory without CACHEDIR.TAG and
+# would leave stale builds that skew the report, so create the tag first.
+cachedir_tag="${profile_dir}/CACHEDIR.TAG"
+if [[ ! -f "${cachedir_tag}" ]]; then
+  printf '%s\n' \
+    'Signature: 8a477f597d28d172789f06886806bc55' \
+    '# This file is a cache directory tag created by scripts/coverage.sh.' \
+    '# For information about cache directory tags see https://bford.info/cachedir/' \
+    > "${cachedir_tag}"
+fi
 cargo llvm-cov clean --workspace
 
 # The daemons that pytest starts run as `tester`, so it must be able to write
 # their .profraw files (written at exit, hence SIGTERM in the fixtures).
-profile_dir="${CARGO_LLVM_COV_TARGET_DIR:?}"
-mkdir -p "${profile_dir}"
 chmod 1777 "${profile_dir}"
 
 cargo build --locked
