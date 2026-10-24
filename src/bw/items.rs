@@ -26,8 +26,8 @@ const TYPE_SECURE_NOTE: u64 = 2;
 const FIELD_TEXT: u64 = 0;
 const FIELD_HIDDEN: u64 = 1;
 /// Bitwarden's limits on the encrypted size of a password and of notes.
-const MAX_PASSWORD_ENC: usize = 5_000;
-const MAX_NOTES_ENC: usize = 10_000;
+pub(crate) const MAX_PASSWORD_ENC: usize = 5_000;
+pub(crate) const MAX_NOTES_ENC: usize = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MapError {
@@ -45,7 +45,7 @@ pub fn parse_date(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn format_date(secs: u64) -> String {
+pub(crate) fn format_date(secs: u64) -> String {
     time::OffsetDateTime::from_unix_timestamp(i64::try_from(secs).unwrap_or(i64::MAX))
         .ok()
         .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
@@ -118,7 +118,7 @@ pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Resu
 }
 
 /// Response-only properties that must not be echoed back in a write.
-const RESPONSE_ONLY: &[&str] = &[
+pub(crate) const RESPONSE_ONLY: &[&str] = &[
     "id",
     "revisionDate",
     "creationDate",

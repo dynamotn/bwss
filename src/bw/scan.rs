@@ -7,6 +7,7 @@
 #![allow(dead_code)] // consumed by the backend in a later task; remove then.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -22,7 +23,7 @@ const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
 
 /// Where a marked item's secret was read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueSource {
     /// The `bwss:password` field.
     Field,
