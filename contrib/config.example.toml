@@ -2,7 +2,7 @@
 backend = "bitwarden"
 server_url = "https://vault.bitwarden.com"
 email = "you@example.com"
-# Root folder in the vault; collections are its sub-folders ("secret-service/Work").
+# Folder where new items are created. Items you mark with a bwss:id field in any folder are used too.
 folder = "secret-service"
 # Any pinentry: pinentry-gnome3, pinentry-qt, pinentry-gtk-2 ...
 prompter = "pinentry"

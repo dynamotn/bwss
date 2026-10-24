@@ -21,7 +21,9 @@ a new laptop and you start over, and lose the disk and the secrets go with it.
 **bwss** implements the standard
 [freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/),
 so every app that already talks to gnome-keyring or KWallet works unchanged.
-The storage behind it is a folder in your Bitwarden vault:
+The storage behind it is your Bitwarden vault: any login or secure note you
+mark with a `bwss:id` field becomes a keyring item.
+
 
 ```console
 $ secret-tool store --label="GitHub token" service github user me
@@ -33,15 +35,61 @@ ghp_8x7…
 …and *GitHub token* now shows up in Bitwarden on your phone, and in the
 keyring of every other machine running bwss.
 
+## 🏷️ Marking items for bwss
+
+An item joins the keyring when it carries a custom field named `bwss:id`.
+The value can be anything. Add the field to a personal login or secure note,
+in any folder, with any Bitwarden client:
+
+```console
+$ secret-tool lookup bwss:name GitHub
+ghp_8x7…
+```
+
+- **Unmarked items stay private.** bwss reads only their field names. They
+  are never decrypted further and never reach the bus.
+- **Finding a hand-marked item.** Apps see derived attributes `bwss:id`,
+  `bwss:name`, `bwss:username` and `bwss:uri`, so you can look an item up
+  with `secret-tool lookup bwss:name GitHub` even though no app created it.
+- **Where the secret is read from.** The first of these that exists wins:
+  1. a custom field `bwss:password` (even when empty);
+  2. the item's notes, when the field `bwss:location=notes` is set;
+  3. the login password (login) or the note text (secure note).
+- **Where a write goes.** Back to where the secret was read. Changing a login
+  password keeps the old one in password history, like the official clients.
+  Add a `bwss:password` field when you want an app-only value and leave the
+  login password alone.
+- **Binary secrets** never go into a login password or a note text. bwss adds
+  a hidden `bwss:password` field with `bwss:encoding=base64` instead.
+- **New items** that apps create are personal secure notes in the `folder`
+  from your config (default `secret-service`), with the secret in
+  `bwss:password`. A very large secret uses the new note's own notes.
+- **Deleting from an app** removes all `bwss:*` fields. The item goes to the
+  Bitwarden trash only when nothing of yours is left. Content from other
+  tools counts as yours: an item with `obsidian:*` fields, a login password
+  or your own notes is kept, just no longer marked.
+- **Collections** come from the `bwss:collection` field, not from folders.
+  `login` (alias `default`) always exists. The list of collections apps
+  created is kept in a secure note marked `bwss:id=_collections`.
+
+bwss follows the dybw data model 1.1, shared with the Obsidian plugin
+keychain-bitwarden.
+
+**Coming from the old folder-based bwss?** There is no migration: start over.
+Items it created carry `bwss:id`, so they show up as marked items, but its
+folder-based collections are not recognised, and an old config with a key
+this version no longer has stops the daemon at start (remove that key). See
+[`docs/design.md`](docs/design.md) section 14.
+
 ## ✨ Features
 
 - **Works with your existing apps**: anything that speaks Secret Service.
   That includes libsecret (`secret-tool`, GNOME apps), Chromium and Electron
   apps such as VS Code, NetworkManager, Python `keyring`/`secretstorage`,
   and `oo7`.
-- **Synced everywhere.** Items are ordinary Bitwarden logins: visible and
-  editable in every Bitwarden client, and shared by every bwss instance on
-  the same account.
+- **Synced everywhere.** Items are ordinary Bitwarden logins and secure
+  notes: visible and editable in every Bitwarden client, and shared by every
+  bwss instance on the same account.
 - **Unlock once.** The first app that needs a secret pops up a pinentry
   dialog. Scripts and login hooks can use `bwss unlock --password-stdin`.
 - **Per-app access control, like the macOS Keychain.** The app that created
@@ -55,8 +103,8 @@ keyring of every other machine running bwss.
   salted attribute index, so apps trigger the unlock prompt instead of
   failing silently after a reboot.
 - **Your Bitwarden data stays intact.** Editing an item keeps its username,
-  URIs, custom fields, attachments and history, and the previous secret
-  goes into password history.
+  URIs, custom fields, attachments and history, and a replaced login
+  password goes into password history.
 - **Small and self-contained**: one binary, and the musl build is fully
   static (about 14 MB). It talks to Bitwarden directly, with no `bw` CLI or
   Node.js.
@@ -84,10 +132,10 @@ flowchart LR
 
 | Secret Service | Bitwarden |
 |---|---|
-| default collection (`login`, alias `default`) | folder **`secret-service`** |
-| collection "Work" | folder `secret-service/Work` |
+| default collection (`login`, alias `default`) | marked items without `bwss:collection` |
+| collection "Work" | items with `bwss:collection=work` |
 | item label | item name |
-| secret | login password (notes for very large secrets; base64 for binary data) |
+| secret | `bwss:password` field, notes, login password or note text (base64 for binary data) |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
 
@@ -118,7 +166,7 @@ bwss login --email you@example.com --client-id user.xxxxxxxx   # asks for client
 This writes `~/.config/bwss/config.toml` and `~/.config/bwss/credentials.toml`,
 both with mode `0600`. See
 [`contrib/config.example.toml`](contrib/config.example.toml) for the options
-(root folder, pinentry program, access control, idle lock, sync interval).
+(folder for new items, pinentry program, access control, idle lock, sync interval).
 
 **3. Take over the keyring.** Stop gnome-keyring's secrets component (or
 KWallet's or KeePassXC's integration) first, then:
@@ -169,10 +217,10 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, sessions, keyring) | 19 ✓ on macOS, Debian (glibc, aarch64), Alpine (musl, aarch64 and x86_64) |
-| End-to-end: real D-Bus, `secret-tool`, python-secretstorage (DH sessions), Vaultwarden, checked by an independent Bitwarden client | 18 ✓ |
-| `cargo clippy`, `cargo audit` | clean |
-| Search over 10,000 items | 0.4 ms |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring) | 98 pass |
+| `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
+
+The end-to-end suite and `cargo audit` are described under Development.
 
 **Not tested yet**: bitwarden.com itself (all server tests used
 Vaultwarden), desktop apps such as Chromium and VS Code under a real
@@ -182,7 +230,6 @@ session, and end-to-end tests on x86_64.
 
 - a PAM module for unlock-at-login;
 - the Flatpak secret portal;
-- `bwss import`, to tag existing Bitwarden logins from any folder;
 - organization collections;
 - push updates instead of polling.
 
@@ -217,7 +264,7 @@ CI runs the same checks on both forges:
   need an arm64 runner (`ARM64_RUNNER_TAG`, which defaults to GitLab.com's
   `saas-linux-small-arm64`).
 
-The full design is in [`docs/design.md`](docs/design.md): storage mapping,
+The full design is in [`docs/design.md`](docs/design.md): the item model, collections, writing and deletion,
 locking, sessions, prompts, access control, the offline queue, the security
 review and the test matrix. The original plan is in
 [`docs/plan.md`](docs/plan.md).
