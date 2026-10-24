@@ -24,7 +24,10 @@ use super::registry::{REGISTRY_ID, Registry};
 use super::{Backend, BackendError};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
-use crate::bw::fields::{A_NAME, F_KIND, field_names, field_value, first_index};
+use crate::bw::fields::{
+    A_NAME, F_ACL, F_ATTR, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, PREFIX, field_names,
+    field_value, first_index,
+};
 use crate::bw::items::{self, item_key};
 use crate::bw::scan::{Keys, MarkedItem, Scan, ValueSource, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
@@ -313,6 +316,43 @@ fn encode_keeps_item(cipher: &Value, body: &Map<String, Value>, item: &ItemData,
     }
 }
 
+/// Body of the interim legacy update of `cipher` to `item`, or why it is refused.
+fn legacy_update_body(cipher: &Value, item: &ItemData, keys: &Keys) -> Result<Map<String, Value>, BackendError> {
+    let refused = || BackendError::Rejected("changing this item is not supported yet".into());
+    // `encode` drops every `bwss:` field and rewrites only these (and
+    // `bwss:attr:*`): anything else would be lost (§3.1).
+    let rewritten = [F_ID, F_CONTENT_TYPE, F_ENCODING, F_LOCATION, F_ACL, F_CREATED];
+    let key = item_key(cipher, &keys.user).map_err(|_| refused())?;
+    let names = field_names(cipher, &key).map_err(|_| refused())?;
+    if names
+        .iter()
+        .flatten()
+        .any(|n| n.starts_with(PREFIX) && !n.starts_with(F_ATTR) && !rewritten.contains(&n.as_str()))
+    {
+        return Err(refused());
+    }
+    // Derived attributes come from the item itself; never store them.
+    let mut item = item.clone();
+    item.attributes.retain(|k, _| !k.starts_with(PREFIX));
+    let mut body =
+        items::encode(&item, Some(cipher), &keys.user, "").map_err(|e| BackendError::Rejected(e.to_string()))?;
+    // The item stays in its own folder.
+    body.insert("folderId".into(), cipher.get("folderId").cloned().unwrap_or(Value::Null));
+    if !encode_keeps_item(cipher, &body, &item, keys) {
+        return Err(refused());
+    }
+    Ok(body)
+}
+
+/// Whether the interim delete may trash `cipher` as the item `id`: only an
+/// item bwss can read now, in the keyring folder. Hand-marked items
+/// elsewhere and held ones wait for the marker delete (§5.4).
+fn may_trash(cipher: &Value, id: &str, keys: &Keys, folder: Option<&str>) -> bool {
+    folder.is_some()
+        && cipher.get("folderId").and_then(Value::as_str) == folder
+        && matches!(scan(cipher, keys), Scan::Marked(m) if m.item.id == id)
+}
+
 /// Id of the keyring folder: the folder named `name`, lowest id first.
 fn keyring_folder(sync: &Value, key: &SymmetricKey, name: &str) -> Option<String> {
     sync.get("folders")
@@ -566,6 +606,9 @@ impl BitwardenBackend {
             },
             Op::Delete { id, .. } => match find(id) {
                 None => Outgoing::Drop("a queued delete targets an item that is gone".into()),
+                Some(i) if !may_trash(&list[i], id, &state.keys, state.keyring_folder.as_deref()) => {
+                    Outgoing::Drop("a queued delete targets an item outside the keyring folder".into())
+                }
                 Some(i) => Outgoing::Trash(list[i].get("id").and_then(Value::as_str).unwrap_or_default().to_owned()),
             },
             Op::Registry { .. } => {
@@ -664,14 +707,7 @@ impl BitwardenBackend {
                         .iter()
                         .find(|c| c.get("id").and_then(Value::as_str) == Some(&cid))
                         .ok_or_else(|| unavailable("the item is not in the cache"))?;
-                    let mut body = items::encode(item, Some(cipher), &state.keys.user, "")
-                        .map_err(|e| BackendError::Rejected(e.to_string()))?;
-                    // The item stays in its own folder.
-                    body.insert("folderId".into(), cipher.get("folderId").cloned().unwrap_or(Value::Null));
-                    if !encode_keeps_item(cipher, &body, item, &state.keys) {
-                        return Err(BackendError::Rejected("changing this item is not supported yet".into()));
-                    }
-                    body
+                    legacy_update_body(cipher, item, &state.keys)?
                 };
                 let server = self.api.lock().await.update_item(&cid, body).await;
                 match server {
@@ -850,13 +886,22 @@ impl Backend for BitwardenBackend {
         let target = {
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            state.built.marked.get(&item.id).map(|m| (m.cipher_id.clone(), m.revision_date.clone()))
+            state.built.marked.get(&item.id).map(|m| {
+                let allowed = ciphers(&state.sync).iter().any(|c| {
+                    c.get("id").and_then(Value::as_str) == Some(&m.cipher_id)
+                        && may_trash(c, &item.id, &state.keys, state.keyring_folder.as_deref())
+                });
+                (m.cipher_id.clone(), m.revision_date.clone(), allowed)
+            })
         };
-        let Some((cid, base_revision)) = target else { return Ok(()) };
+        let Some((cid, base_revision, allowed)) = target else { return Ok(()) };
         if cid == QUEUED {
             // Never reached the server: drop it from the queue.
             queue.retain(|op| !matches!(op, Op::Create { id, .. } if *id == item.id));
             return self.queue_changed(&queue).await;
+        }
+        if !allowed {
+            return Err(BackendError::Rejected("deleting this item is not supported yet".into()));
         }
         let delete = Op::Delete { id: item.id.clone(), base_revision };
         if !queue.is_empty() || !self.can_write().await {
@@ -1080,6 +1125,39 @@ mod tests {
         item.label = "renamed".into();
         let body = items::encode(&item, Some(&plain), &k.user, "").unwrap();
         assert!(!encode_keeps_item(&plain, &body, &item, &k));
+    }
+
+    #[test]
+    fn legacy_update_drops_derived_attributes_and_refuses_unknown_fields() {
+        let k = keys();
+        let mine = login(&k, "c1", &[("bwss:id", "a"), ("bwss:attr:service", "gh")]);
+        let item = build(&sync(vec![mine.clone()]), &k, None).marked["a"].item.clone();
+        assert!(item.attributes.contains_key("bwss:name"));
+        let body = legacy_update_body(&mine, &item, &k).unwrap();
+        let names = field_names(&Value::Object(body), &k.user).unwrap();
+        assert!(names.iter().flatten().all(|n| !n.starts_with("bwss:attr:bwss:")), "{names:?}");
+        assert!(names.iter().flatten().any(|n| n == "bwss:attr:service"));
+
+        let unknown = login(&k, "c1", &[("bwss:id", "a"), ("bwss:x", "keep me")]);
+        let item = build(&sync(vec![unknown.clone()]), &k, None).marked["a"].item.clone();
+        assert!(matches!(legacy_update_body(&unknown, &item, &k), Err(BackendError::Rejected(_))));
+    }
+
+    #[test]
+    fn interim_delete_trashes_only_readable_items_in_the_keyring_folder() {
+        let k = keys();
+        let mut ours = login(&k, "c1", &[("bwss:id", "a")]);
+        ours["folderId"] = json!("kf");
+        assert!(may_trash(&ours, "a", &k, Some("kf")));
+        assert!(!may_trash(&ours, "a", &k, None));
+        assert!(!may_trash(&ours, "other", &k, Some("kf")));
+        // A hand-marked login elsewhere in the vault.
+        let elsewhere = login(&k, "c2", &[("bwss:id", "b")]);
+        assert!(!may_trash(&elsewhere, "b", &k, Some("kf")));
+        // A held item: its cipher can no longer be read.
+        let mut held = ours.clone();
+        held["key"] = json!("2.AAAA|AAAA|AAAA");
+        assert!(!may_trash(&held, "a", &k, Some("kf")));
     }
 
     #[test]

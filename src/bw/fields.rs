@@ -6,7 +6,6 @@ use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey};
 
-#[allow(dead_code)] // Task 11 deletes items with it (`write::strip`).
 pub const PREFIX: &str = "bwss:";
 pub const F_ID: &str = "bwss:id";
 pub const F_PASSWORD: &str = "bwss:password";
