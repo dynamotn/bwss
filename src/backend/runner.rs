@@ -254,6 +254,7 @@ fn new_collection_id(label: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 /// What an op did on the server.
+#[derive(Debug)]
 pub(crate) enum Effect {
     /// Nothing to record: an empty patch, an item already gone or created.
     Nothing,
@@ -263,6 +264,7 @@ pub(crate) enum Effect {
     Trashed(String),
 }
 
+#[derive(Debug)]
 pub(super) enum Failure {
     Locked,
     /// Try again later.
@@ -339,10 +341,9 @@ fn locate(state: &Unlocked, id: &str, cipher_id: Option<&str>) -> Target {
 /// The base of the cached server copy of item `id`, when it can be read.
 fn server_base(state: &Unlocked, id: &str) -> Option<Base> {
     let Target::Found(cipher) = locate(state, id, None) else { return None };
-    match scan(&cipher, &state.keys) {
-        Scan::Marked(m) => Some((m.source, m.mark)),
-        _ => None,
-    }
+    // `locate` found it by scanning it as marked, and a scan is repeatable.
+    let Scan::Marked(m) = scan(&cipher, &state.keys) else { return None };
+    Some((m.source, m.mark))
 }
 
 /// The registry note to write to: the one with the lowest cipher id.
@@ -496,9 +497,9 @@ impl BitwardenBackend {
                         _ => return Ok(None),
                     }
                     let cid = id_of(&cipher).to_owned();
+                    // The scan above already returned for a trashed cipher.
                     match strip(&cipher, &state.keys) {
                         Ok(body) => Ok(Some((cid, body))),
-                        Err(WriteError::Gone) => Ok(None),
                         Err(e) => Err(write_failure(e, &cid)),
                     }
                 })
@@ -657,21 +658,11 @@ impl BitwardenBackend {
 
     /// The error an app gets for a live op that failed for good.
     async fn refuse(&self, queue: &[Op], f: Failure) -> BackendError {
-        match f {
-            Failure::Locked => BackendError::Locked,
-            Failure::Transient(why) => BackendError::Unavailable(why),
-            Failure::Wait(why) => BackendError::Unavailable(format!("{why}; try again later")),
-            Failure::Busy(why) => BackendError::Unavailable(format!("{why}; try again")),
-            Failure::Conflict => BackendError::Conflict("the secret was changed elsewhere".into()),
-            Failure::Gone => BackendError::Rejected("the item was deleted elsewhere".into()),
-            Failure::Permanent { why, cid } => {
-                tracing::warn!("a change was refused: {why}");
-                if let Some(cid) = cid {
-                    self.rescan(queue, &cid).await;
-                }
-                BackendError::Rejected(why)
-            }
+        let (error, reread) = refusal(f);
+        if let Some(cid) = reread {
+            self.rescan(queue, &cid).await;
         }
+        error
     }
 
     async fn settle(&self, queue: &[Op], effect: Effect) -> Result<(), BackendError> {
@@ -856,10 +847,12 @@ impl BitwardenBackend {
                     tracing::warn!("a queued change waits: {why}");
                     return Err(BackendError::Unavailable(format!("a queued change waits: {why}")));
                 }
-                Err(Failure::Conflict) => {
+                Err(f @ (Failure::Conflict | Failure::Gone)) => {
+                    let conflict = matches!(f, Failure::Conflict);
                     // Only the value can conflict: keep the label, attribute
                     // and ACL changes merged with it, and send them alone.
-                    if let Some(Op::Patch(p)) = queue.first()
+                    if conflict
+                        && let Some(Op::Patch(p)) = queue.first()
                         && !matches!(p.value, ValueChange::Keep)
                     {
                         tracing::warn!(
@@ -873,11 +866,8 @@ impl BitwardenBackend {
                         let _ = self.save_queue(queue, &seal_key);
                         continue;
                     }
-                    tracing::warn!("dropping a queued change: the secret was changed elsewhere");
-                    (Effect::Nothing, None)
-                }
-                Err(Failure::Gone) => {
-                    tracing::warn!("dropping a queued change: its item is gone");
+                    let why = if conflict { "the secret was changed elsewhere" } else { "its item is gone" };
+                    tracing::warn!("dropping a queued change: {why}");
                     (Effect::Nothing, None)
                 }
                 Err(Failure::Permanent { why, cid }) => {
@@ -897,19 +887,41 @@ impl BitwardenBackend {
     }
 }
 
+/// What an app is told when a live op failed, and the cipher to reread from
+/// the server so the local view returns to the truth.
+fn refusal(f: Failure) -> (BackendError, Option<String>) {
+    match f {
+        Failure::Locked => (BackendError::Locked, None),
+        Failure::Transient(why) => (BackendError::Unavailable(why), None),
+        Failure::Wait(why) => (BackendError::Unavailable(format!("{why}; try again later")), None),
+        Failure::Busy(why) => (BackendError::Unavailable(format!("{why}; try again")), None),
+        Failure::Conflict => (BackendError::Conflict("the secret was changed elsewhere".into()), None),
+        Failure::Gone => (BackendError::Rejected("the item was deleted elsewhere".into()), None),
+        Failure::Permanent { why, cid } => {
+            tracing::warn!("a change was refused: {why}");
+            (BackendError::Rejected(why), cid)
+        }
+    }
+}
+
 fn target_is_not(op: &Op, id: &str) -> bool {
     target(op) != Some(id)
 }
 
+/// What a write error means for an op about to be queued: a size problem
+/// refuses it now, since it could never be written; everything else is
+/// decided against the server when the op runs.
+fn queueable(e: WriteError) -> Result<(), BackendError> {
+    match e {
+        WriteError::TooLarge | WriteError::NotesTaken => Err(BackendError::Rejected(e.to_string())),
+        _ => Ok(()),
+    }
+}
+
 /// Refuses, before it is queued, an op that could never be written.
 fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), BackendError> {
-    let refused = |e: WriteError| match e {
-        WriteError::TooLarge | WriteError::NotesTaken => Err(BackendError::Rejected(e.to_string())),
-        // Everything else is decided against the server when the op runs.
-        _ => Ok(()),
-    };
     match op {
-        Op::Create { item, .. } => new_note(item, None, &state.keys).map(|_| ()).or_else(refused),
+        Op::Create { item, .. } => new_note(item, None, &state.keys).map(|_| ()).or_else(queueable),
         Op::Patch(p) => {
             let list =
                 with_queue(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), &state.built.unmarked);
@@ -926,7 +938,7 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
                 *source = m.source;
                 *base_mark = m.mark;
             }
-            apply(cipher, &trial, &state.keys).map(|_| ()).or_else(refused)
+            apply(cipher, &trial, &state.keys).map(|_| ()).or_else(queueable)
         }
         Op::Delete { .. } | Op::Registry { .. } => Ok(()),
     }
@@ -937,9 +949,11 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
 mod tests {
     use super::*;
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use zeroize::Zeroizing;
+
+    use crate::model::Snapshot;
 
     fn old() -> MarkedItem {
         MarkedItem {
@@ -967,11 +981,10 @@ mod tests {
         }
     }
 
+    // Ops carry secrets and have no `Debug`: the messages name the kind only.
     fn patch(op: Op) -> Patch {
-        match op {
-            Op::Patch(p) => p,
-            _ => panic!("expected a patch"),
-        }
+        let Op::Patch(p) = op else { panic!("expected a patch, got another op") };
+        p
     }
 
     #[test]
@@ -990,16 +1003,9 @@ mod tests {
         new.secret = Zeroizing::new(b"new".to_vec());
         let p = patch(plan_put(Some(&old), &new));
         assert!(p.set.is_empty() && p.remove.is_empty());
-        match &p.value {
-            ValueChange::Set { source, secret, base_mark, owned } => {
-                assert_eq!(
-                    (*source, secret.as_slice(), *base_mark),
-                    (ValueSource::LoginPassword, &b"new"[..], [9; 32])
-                );
-                assert!(!owned);
-            }
-            ValueChange::Keep => panic!("the secret changed"),
-        }
+        let (source, secret, base_mark, owned) = value(&p.value);
+        assert_eq!((source, secret.as_slice(), base_mark), (ValueSource::LoginPassword, &b"new"[..], [9; 32]));
+        assert!(!owned);
 
         let p = patch(plan_put(Some(&old), &old.item));
         assert!(is_empty(&p));
@@ -1038,14 +1044,10 @@ mod tests {
     #[test]
     fn plan_put_without_old_creates() {
         let new = old().item;
-        match plan_put(None, &new) {
-            Op::Create { id, collection, item } => {
-                assert_eq!((id.as_str(), collection.as_str()), ("a", "login"));
-                assert_eq!(item.label, "GitHub");
-                assert_eq!(&*item.secret, b"pw");
-            }
-            _ => panic!("expected a create"),
-        }
+        let Op::Create { id, collection, item } = plan_put(None, &new) else { panic!("expected a create") };
+        assert_eq!((id.as_str(), collection.as_str()), ("a", "login"));
+        assert_eq!(item.label, "GitHub");
+        assert_eq!(&*item.secret, b"pw");
     }
 
     #[test]
@@ -1063,10 +1065,8 @@ mod tests {
         assert!(p.set.iter().all(|(n, _, _)| !n.starts_with("bwss:attr:bwss:")), "{:?}", p.set);
         assert!(p.set.iter().any(|(n, _, _)| n == "bwss:attr:user"));
 
-        match plan_put(None, &new) {
-            Op::Create { item, .. } => assert!(item.attributes.keys().all(|k| !k.starts_with("bwss:"))),
-            _ => panic!("expected a create"),
-        }
+        let Op::Create { item, .. } = plan_put(None, &new) else { panic!("expected a create") };
+        assert!(item.attributes.keys().all(|k| !k.starts_with("bwss:")));
     }
 
     #[test]
@@ -1075,7 +1075,7 @@ mod tests {
             id: "a".into(),
             base_revision: "r1".into(),
             set: vec![("bwss:label".into(), "One".into(), false), ("bwss:collection".into(), "work".into(), false)],
-            remove: vec![],
+            remove: vec!["bwss:content-type".into(), "bwss:collection".into()],
             acl_add: vec!["/bin/a".into()],
             value: set(ValueSource::LoginPassword, b"1", 1),
             cipher_id: Some("c1".into()),
@@ -1096,7 +1096,11 @@ mod tests {
         assert_eq!(queue.len(), 2);
         let m = patch(queue.remove(0));
         assert_eq!(m.base_revision, "r1");
-        assert_eq!(m.remove, vec!["bwss:attr:".to_owned(), "bwss:collection".to_owned()]);
+        // What the first change removes stays, unless the later one says otherwise.
+        assert_eq!(
+            m.remove,
+            vec!["bwss:content-type".to_owned(), "bwss:attr:".to_owned(), "bwss:collection".to_owned()]
+        );
         assert_eq!(
             m.set,
             vec![("bwss:label".to_owned(), "Two".to_owned(), false), ("bwss:attr:k".to_owned(), "v".to_owned(), false)]
@@ -1133,10 +1137,8 @@ mod tests {
     }
 
     fn value(v: &ValueChange) -> (ValueSource, Vec<u8>, [u8; 32], bool) {
-        match v {
-            ValueChange::Set { source, secret, base_mark, owned } => (*source, secret.clone(), *base_mark, *owned),
-            ValueChange::Keep => panic!("the value was set"),
-        }
+        let ValueChange::Set { source, secret, base_mark, owned } = v else { panic!("the value was kept") };
+        (*source, secret.clone(), *base_mark, *owned)
     }
 
     fn value_patch(v: ValueChange) -> Patch {
@@ -1184,5 +1186,118 @@ mod tests {
         assert_eq!(new_collection_id("default", taken), "default-2");
         assert_eq!(new_collection_id("Session", taken), "session-2");
         assert_eq!(new_collection_id("  ", taken), "collection");
+    }
+
+    #[test]
+    fn a_later_write_with_nothing_to_set_keeps_the_queued_value() {
+        let first = value_patch(set(ValueSource::LoginPassword, b"one", 0));
+        let later = value_patch(ValueChange::Keep);
+        let m = merge_patches(&first, later, Some((ValueSource::LoginPassword, [0; 32])));
+        assert_eq!(value(&m.value), (ValueSource::LoginPassword, b"one".to_vec(), [0; 32], false));
+    }
+
+    #[test]
+    fn a_value_after_a_queued_change_without_one_is_the_value_to_send() {
+        let first = value_patch(ValueChange::Keep);
+        let later = value_patch(set(ValueSource::Field, b"two", 3));
+        // Not the server's base (the first change was never shown), and no
+        // earlier value to build on: the later one stands as it is.
+        let m = merge_patches(&first, later, Some((ValueSource::LoginPassword, [9; 32])));
+        assert_eq!(value(&m.value), (ValueSource::Field, b"two".to_vec(), [3; 32], false));
+    }
+
+    #[test]
+    fn a_patch_queues_behind_a_collection_change_without_merging() {
+        let entry = Entry { label: "Work".into(), created: 1, deleted: false };
+        let mut queue = vec![Op::Registry { collection: "work".into(), entry }];
+        let undo = push_op(&mut queue, Op::Patch(value_patch(set(ValueSource::Field, b"1", 1))), None);
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(queue[0], Op::Registry { .. }) && matches!(queue[1], Op::Patch(_)));
+        undo.apply(&mut queue);
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(&queue[0], Op::Registry { collection, .. } if collection == "work"));
+    }
+
+    #[test]
+    fn write_errors_decide_whether_an_op_waits_or_goes() {
+        use crate::bw::crypto::CryptoError;
+        assert!(matches!(write_failure(WriteError::Conflict, "c"), Failure::Conflict));
+        assert!(matches!(write_failure(WriteError::Gone, "c"), Failure::Gone));
+        assert!(matches!(write_failure(WriteError::Unmarked, "c"), Failure::Gone));
+        let f = write_failure(WriteError::Uninspectable("no revision".into()), "c");
+        assert!(matches!(&f, Failure::Wait(why) if why == "no revision"), "{f:?}");
+        let f = write_failure(WriteError::Crypto(CryptoError::BadMac), "c9");
+        assert!(matches!(&f, Failure::Wait(why) if why == "c9: the item cannot be read"), "{f:?}");
+        for e in [WriteError::TooLarge, WriteError::NotesTaken] {
+            let text = e.to_string();
+            let f = write_failure(e, "c");
+            assert!(matches!(&f, Failure::Permanent { why, cid: None } if *why == text), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn an_app_is_told_what_a_failed_live_op_means() {
+        let say = refusal;
+        let (e, reread) = say(Failure::Locked);
+        assert!(matches!(e, BackendError::Locked) && reread.is_none());
+        let (e, reread) = say(Failure::Transient("down".into()));
+        assert!(matches!(&e, BackendError::Unavailable(m) if m == "down") && reread.is_none(), "{e}");
+        let (e, _) = say(Failure::Wait("cannot be read".into()));
+        assert!(matches!(&e, BackendError::Unavailable(m) if m == "cannot be read; try again later"), "{e}");
+        let (e, _) = say(Failure::Busy("keeps changing".into()));
+        assert!(matches!(&e, BackendError::Unavailable(m) if m == "keeps changing; try again"), "{e}");
+        let (e, _) = say(Failure::Conflict);
+        assert!(matches!(&e, BackendError::Conflict(m) if m == "the secret was changed elsewhere"), "{e}");
+        let (e, _) = say(Failure::Gone);
+        assert!(matches!(&e, BackendError::Rejected(m) if m == "the item was deleted elsewhere"), "{e}");
+        // A refused write rereads the cipher it was for.
+        let (e, reread) = say(Failure::Permanent { why: "HTTP 400".into(), cid: Some("c1".into()) });
+        assert!(matches!(&e, BackendError::Rejected(m) if m == "HTTP 400"), "{e}");
+        assert_eq!(reread.as_deref(), Some("c1"));
+        let (_, reread) = say(Failure::Permanent { why: "HTTP 400".into(), cid: None });
+        assert_eq!(reread, None);
+    }
+
+    #[test]
+    fn only_a_size_problem_refuses_an_op_before_it_is_queued() {
+        use crate::bw::crypto::CryptoError;
+        for e in [WriteError::TooLarge, WriteError::NotesTaken] {
+            let text = e.to_string();
+            let r = queueable(e);
+            assert!(matches!(&r, Err(BackendError::Rejected(m)) if *m == text), "{r:?}");
+        }
+        for e in [
+            WriteError::Conflict,
+            WriteError::Gone,
+            WriteError::Unmarked,
+            WriteError::Uninspectable("x".into()),
+            WriteError::Crypto(CryptoError::BadMac),
+        ] {
+            let text = e.to_string();
+            let r = queueable(e);
+            assert!(matches!(r, Ok(())), "{text}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn status_lists_what_the_user_may_want_to_fix() {
+        let built = Built {
+            snapshot: Snapshot { collections: vec![], items: vec![] },
+            marked: HashMap::new(),
+            registry: Registry::default(),
+            registry_ciphers: vec![],
+            registry_unreadable: true,
+            duplicates: vec![("a".into(), vec!["c2".into(), "c3".into()])],
+            skipped: vec![("c4".into(), "c4: item type 3 is not supported".into())],
+            unmarked: HashSet::new(),
+        };
+        assert_eq!(
+            status_lines(&built),
+            [
+                "duplicate id a: 2 items ignored".to_owned(),
+                "skipped: c4: item type 3 is not supported".to_owned(),
+                REGISTRY_UNREADABLE.to_owned(),
+            ]
+        );
     }
 }

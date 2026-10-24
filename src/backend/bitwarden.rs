@@ -335,8 +335,14 @@ pub(super) fn with_queue<'a>(
     unmarked: &HashSet<(String, String)>,
 ) -> Vec<Cow<'a, Value>> {
     let mut list: Vec<Cow<'a, Value>> = ciphers(sync).iter().map(Cow::Borrowed).collect();
-    // Positions stay valid across patches (they keep the id and the dates);
-    // a create or a delete changes who wins, so it is scanned again.
+    // Positions stay valid across patches, so one scan serves a run of them:
+    // `apply` edits only bwss's own fields and the value source, so a patch
+    // never changes `bwss:id`, and the patched cipher keeps its id and dates
+    // (restored below), so it still wins its `bwss:id` at the same index.
+    // Organization ciphers are never `Marked` (`scan` refuses to read them),
+    // so they are never in the map and never patched. A create appends a
+    // cipher that may win or lose a duplicate id, and a delete shifts every
+    // later index, so both drop the map and the next op scans again.
     let mut positions: Option<HashMap<String, usize>> = None;
     for op in queue {
         match op {
@@ -814,6 +820,7 @@ impl Backend for BitwardenBackend {
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::bw::write::{Patch, ValueChange};
 
     const REV: &str = "2026-01-02T03:04:05Z";
 
@@ -1166,5 +1173,232 @@ mod tests {
         assert!(load_queue(&q.path, &SymmetricKey::generate(), &q.flag).unwrap().is_empty());
         assert!(!q.path.exists());
         assert_eq!(std::fs::read(&q.aside).unwrap(), foreign, "set aside as it was, never lost");
+    }
+
+    #[test]
+    fn registry_errors_say_why() {
+        for (why, text) in [
+            (RegistryError::Key, "its item key does not decrypt"),
+            (RegistryError::Fields, "its fields do not decrypt"),
+            (RegistryError::Notes, "its notes do not decrypt"),
+            (RegistryError::Parse, "its notes are not a collection registry"),
+        ] {
+            assert_eq!(why.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn only_a_note_of_the_registry_kind_is_a_registry() {
+        let k = keys();
+        let other_kind = note(&k, "r", &[("bwss:id", REGISTRY_ID), ("bwss:kind", "something-else")], "{}");
+        assert_eq!(read_registry(&other_kind, &k), Ok(None));
+
+        // No notes, or notes of white space only: an empty registry.
+        let mut no_notes = registry_note(&k, "r", "{}");
+        no_notes["notes"] = Value::Null;
+        assert!(read_registry(&no_notes, &k).unwrap().unwrap().0.is_empty());
+        let mut empty_notes = registry_note(&k, "r", "{}");
+        empty_notes["notes"] = json!("");
+        assert!(read_registry(&empty_notes, &k).unwrap().unwrap().0.is_empty());
+        assert!(read_registry(&registry_note(&k, "r", " \n "), &k).unwrap().unwrap().0.is_empty());
+    }
+
+    fn broken(mut cipher: Value) -> Value {
+        cipher["key"] = json!("2.AAAA|AAAA|AAAA");
+        cipher
+    }
+
+    #[test]
+    fn organization_items_and_items_without_an_id_are_ignored() {
+        let k = keys();
+        let mut org = login(&k, "c8", &[("bwss:id", "z")]);
+        org["organizationId"] = json!("org1");
+        let mut anonymous = broken(login(&k, "c9", &[("bwss:id", "y")]));
+        anonymous.as_object_mut().unwrap().remove("id");
+        let first = build(&sync(vec![login(&k, "c1", &[("bwss:id", "x")])]), &k, None);
+        assert_eq!(item_ids(&first), ["x"]);
+        // Held items are looked up by cipher id: neither of these is one.
+        let b = build(&sync(vec![org, anonymous]), &k, Some(&first));
+        assert!(b.snapshot.items.is_empty() && b.marked.is_empty());
+        assert!(b.skipped.is_empty() && b.registry_ciphers.is_empty() && !b.registry_unreadable);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_inspected_is_held_as_last_read() {
+        let k = keys();
+        let note = registry_note(&k, "r1", r#"{"home":{"label":"Home","created":1}}"#);
+        let first = build(&sync(vec![note.clone()]), &k, None);
+        assert!(!first.registry_unreadable);
+
+        let mut changed = broken(note);
+        changed["revisionDate"] = json!("2026-02-02T00:00:00Z");
+        let b = build(&sync(vec![changed]), &k, Some(&first));
+        assert_eq!(collection_ids(&b), ["home", "login"], "the registry as last read");
+        assert_eq!(b.registry_ciphers, ["r1"]);
+        assert!(b.registry_unreadable, "it must never be written over");
+        // Without a previous read there is nothing to hold, and nothing to protect.
+        let b = build(&sync(vec![broken(registry_note(&k, "r1", "{}"))]), &k, None);
+        assert!(b.registry_ciphers.is_empty() && !b.registry_unreadable);
+    }
+
+    #[test]
+    fn registry_entries_never_shadow_the_built_in_collections() {
+        let k = keys();
+        let s = sync(vec![registry_note(
+            &k,
+            "r1",
+            r#"{"login":{"label":"Shadow","created":1},"default":{"label":"Alias","created":1},
+                "session":{"label":"Session","created":1},"home":{"label":"Home","created":1}}"#,
+        )]);
+        let b = build(&s, &k, None);
+        assert_eq!(collection_ids(&b), ["home", "login"]);
+        assert_eq!(b.snapshot.collections[1].label, "Login");
+    }
+
+    fn label_patch(id: &str, label: &str) -> Op {
+        Op::Patch(Patch {
+            id: id.into(),
+            base_revision: REV.into(),
+            set: vec![("bwss:label".into(), label.into(), false)],
+            remove: vec![],
+            acl_add: vec![],
+            value: ValueChange::Keep,
+            cipher_id: None,
+        })
+    }
+
+    fn view_labels(view: &[Cow<'_, Value>], k: &Keys) -> Vec<(String, String)> {
+        let b = build_list(view, k, None);
+        let mut out: Vec<_> = b.marked.values().map(|m| (m.item.id.clone(), m.item.label.clone())).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_run_of_queued_ops_keeps_every_patch_on_its_own_cipher() {
+        // One scan serves the patches between creates and deletes: patch a,
+        // patch b, create d, patch a, delete b, patch c.
+        let k = keys();
+        let s = sync(vec![
+            login(&k, "c1", &[("bwss:id", "a")]),
+            login(&k, "c2", &[("bwss:id", "b")]),
+            login(&k, "c3", &[("bwss:id", "c")]),
+        ]);
+        let mut d = build(&s, &k, None).marked["a"].item.clone();
+        d.id = "d".into();
+        d.label = "created".into();
+        let queue = vec![
+            label_patch("a", "a1"),
+            label_patch("b", "b1"),
+            Op::Create { id: "d".into(), collection: "login".into(), item: d },
+            label_patch("a", "a2"),
+            Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) },
+            label_patch("c", "c1"),
+        ];
+        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(ids, ["c1", "c3", ""], "b is gone, d is queued, nothing else moved");
+        assert_eq!(
+            view_labels(&view, &k),
+            [("a".into(), "a2".into()), ("c".into(), "c1".into()), ("d".into(), "created".into())]
+        );
+        // Every patched cipher still carries its own bwss:id and its dates.
+        let built = build_list(&view, &k, None);
+        assert_eq!(built.marked["a"].cipher_id, "c1");
+        assert_eq!(built.marked["c"].cipher_id, "c3");
+        assert_eq!(built.marked["a"].revision_date, REV);
+        assert_eq!(ciphers(&s).len(), 3, "the cache is untouched");
+    }
+
+    #[test]
+    fn a_queued_create_that_cannot_be_built_is_not_shown() {
+        let k = keys();
+        let s = sync(vec![login(&k, "c1", &[("bwss:id", "a")])]);
+        let mut big = build(&s, &k, None).marked["a"].item.clone();
+        big.id = "n".into();
+        // A field value over the limit of a Bitwarden custom field.
+        big.attributes.insert("blob".into(), "x".repeat(5_000));
+        let queue = [Op::Create { id: "n".into(), collection: "login".into(), item: big }];
+        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        assert_eq!(view.len(), 1);
+        assert_eq!(view_labels(&view, &k), [("a".to_owned(), "name c1".to_owned())]);
+    }
+
+    #[test]
+    fn api_errors_are_retried_or_refused_by_their_status() {
+        let http = |status| ApiError::Http { status, message: String::new() };
+        for e in [http(429), http(500), http(503), ApiError::Network("reset".into()), ApiError::NotSynced] {
+            let text = e.to_string();
+            assert!(matches!(map_api(e), BackendError::Unavailable(m) if m == text), "{text}");
+        }
+        for e in [http(400), http(401), http(404), ApiError::Protocol("odd".into())] {
+            let text = e.to_string();
+            assert!(matches!(map_api(e), BackendError::Rejected(m) if m == text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_migration_flag_that_cannot_be_set_does_not_stop_the_queue() {
+        let q = queue_dir();
+        // A file where the flag's directory should be: setting it fails.
+        let blocker = q.flag.parent().unwrap();
+        std::fs::write(blocker, b"x").unwrap();
+        let user = SymmetricKey::generate();
+        assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
+        assert!(!crate::config::flag_set(&q.flag), "not recorded, so the window stays open");
+        assert_eq!(std::fs::read(blocker).unwrap(), b"x");
+    }
+
+    #[test]
+    fn a_queue_that_cannot_be_read_is_never_touched() {
+        let q = queue_dir();
+        let user = SymmetricKey::generate();
+        // A directory where the file should be: reading it fails.
+        std::fs::create_dir(&q.path).unwrap();
+        let e = load_queue(&q.path, &user, &q.flag).err().unwrap();
+        let shown = q.path.display().to_string();
+        assert!(
+            matches!(&e, BackendError::Unavailable(m) if m.contains(&shown) && m.contains("left untouched")),
+            "{e}"
+        );
+        assert!(q.path.is_dir());
+        assert!(!crate::config::flag_set(&q.flag));
+    }
+
+    #[test]
+    fn a_queue_of_an_older_version_is_set_aside_not_replayed() {
+        let q = queue_dir();
+        let user = SymmetricKey::generate();
+        let old = br#"{"format":1,"ops":[]}"#;
+        std::fs::write(&q.path, old).unwrap();
+        assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
+        assert!(!q.path.exists());
+        assert_eq!(std::fs::read(q.path.with_file_name("queue.json.legacy")).unwrap(), old);
+    }
+
+    #[test]
+    fn an_old_queue_that_does_not_open_with_the_user_key_is_kept_aside() {
+        let q = queue_dir();
+        let mut file = seal(&one_op(), &SymmetricKey::generate());
+        file["format"] = json!(2);
+        let foreign = serde_json::to_vec(&file).unwrap();
+        std::fs::write(&q.path, &foreign).unwrap();
+        assert!(load_queue(&q.path, &SymmetricKey::generate(), &q.flag).unwrap().is_empty());
+        assert!(!q.path.exists());
+        assert_eq!(std::fs::read(&q.aside).unwrap(), foreign);
+        assert!(!crate::config::flag_set(&q.flag), "the window is not closed by a queue that never opened");
+    }
+
+    #[test]
+    fn a_queue_that_neither_opens_nor_moves_aside_is_left_where_it_is() {
+        // The set-aside name is longer than a file name may be, so the move
+        // fails on every system and for every user.
+        let q = queue_dir();
+        let long = q.path.with_file_name("q".repeat(250));
+        let foreign = serde_json::to_vec(&seal(&one_op(), &SymmetricKey::generate())).unwrap();
+        std::fs::write(&long, &foreign).unwrap();
+        let e = load_queue(&long, &SymmetricKey::generate(), &q.flag).err().unwrap();
+        assert!(matches!(&e, BackendError::Unavailable(m) if m.contains("left untouched")), "{e}");
+        assert_eq!(std::fs::read(&long).unwrap(), foreign);
     }
 }

@@ -152,13 +152,13 @@ mod tests {
 
     #[test]
     fn save_failure_never_writes_an_empty_file() {
-        let dir = std::env::temp_dir().join(format!("bwss-fsutil-{}", std::process::id()));
-        let path = dir.join("state.json");
+        // Unique to this test and removed when it ends, even when it fails.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         write_json_private(&path, &serde_json::json!({ "kept": true })).unwrap();
         let err = write_json_private(&path, &Unserializable).unwrap_err();
         assert!(err.to_string().contains("cannot serialize"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"kept":true}"#);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

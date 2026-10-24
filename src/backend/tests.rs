@@ -12,11 +12,13 @@ use zeroize::Zeroizing;
 use super::Backend;
 use super::BackendError;
 use super::bitwarden::BitwardenBackend;
-use super::ops::{Loaded, QUEUE_FORMAT, read_formats, unseal};
+use super::ops::{Loaded, Op, QUEUE_FORMAT, read_formats, unseal};
 use super::registry::Registry;
+use super::runner::Effect;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::field_names;
 use crate::bw::scan::{Keys, Scan, scan};
+use crate::bw::write::{Patch, ValueChange};
 use crate::config::{Config, Credentials, Paths};
 use crate::model::{Attributes, ItemData, Snapshot};
 
@@ -27,6 +29,16 @@ const REV: &str = "2026-01-01T00:00:00Z";
 
 type Hook = Box<dyn FnOnce(&mut Value) + Send>;
 
+/// A canned answer for the requests it matches, `times` times.
+struct Fault {
+    method: &'static str,
+    /// Matches the path without its query.
+    prefix: String,
+    status: u16,
+    reply: Option<Value>,
+    times: usize,
+}
+
 struct Server {
     sync: Value,
     rev: u64,
@@ -36,6 +48,8 @@ struct Server {
     /// The next this many item updates find the cipher changed elsewhere.
     stale_puts: usize,
     requests: Vec<(String, String)>,
+    /// Answers that replace the server's own, first match first.
+    faults: Vec<Fault>,
     /// Run on the stored cipher right before the next PUT to it is handled:
     /// an edit made on another device.
     before_put: Option<Hook>,
@@ -66,7 +80,13 @@ impl Server {
         o.insert("object".into(), json!("cipherDetails"));
         match self.find(id) {
             Some(c) => *c = body.clone(),
-            None => self.sync["ciphers"].as_array_mut().expect("ciphers").push(body.clone()),
+            None => {
+                // A vault that never held a cipher may have no list yet.
+                if !self.sync["ciphers"].is_array() {
+                    self.sync["ciphers"] = json!([]);
+                }
+                self.sync["ciphers"].as_array_mut().expect("ciphers").push(body.clone());
+            }
         }
         body
     }
@@ -78,6 +98,12 @@ impl Server {
         }
         let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
         let path = path.split('?').next().unwrap_or_default();
+        if let Some(f) =
+            self.faults.iter_mut().find(|f| f.times > 0 && f.method == method && path.starts_with(&f.prefix))
+        {
+            f.times -= 1;
+            return (f.status, f.reply.clone());
+        }
         match (method, path) {
             ("POST", "/identity/accounts/prelogin") => (200, Some(json!({ "kdf": 0, "kdfIterations": ITERATIONS }))),
             ("POST", "/identity/connect/token") => (200, Some(json!({ "access_token": "t", "expires_in": 3600 }))),
@@ -160,6 +186,7 @@ impl Fake {
             fail_puts: false,
             stale_puts: 0,
             requests: Vec::new(),
+            faults: Vec::new(),
             before_put: None,
             pause: None,
         })));
@@ -227,6 +254,17 @@ impl Fake {
                 return;
             }
         }
+    }
+
+    /// The next `times` requests `method` to a path starting with `prefix`
+    /// are answered with `status` and no body.
+    fn fault(&self, method: &'static str, prefix: &str, status: u16, times: usize) {
+        self.with(|s| s.faults.push(Fault { method, prefix: prefix.into(), status, reply: None, times }));
+    }
+
+    /// Like `fault`, with a JSON body.
+    fn fault_reply(&self, method: &'static str, prefix: &str, status: u16, reply: Value) {
+        self.with(|s| s.faults.push(Fault { method, prefix: prefix.into(), status, reply: Some(reply), times: 1 }));
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Server) -> T) -> T {
@@ -573,25 +611,24 @@ async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
     assert_eq!(m.item.acl, ["/usr/bin/app"]);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn a_change_that_cannot_be_kept_on_disk_is_refused() {
-    use std::os::unix::fs::PermissionsExt;
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.fake.with(|s| s.down = true);
-    let state = v.dir.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
-    if std::fs::File::create(state.join("probe")).is_ok() {
-        return; // permissions not enforced (running as root)
-    }
+    // The private write goes through this temporary name: a directory there
+    // makes it fail, for any user.
+    let queue = v.dir.join("state/queue.json");
+    std::fs::create_dir_all(crate::fsutil::temp_path(&queue)).unwrap();
     let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
     let result = v.backend.put_item(&item).await;
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(&result, Err(BackendError::Unavailable(_))), "{result:?}");
+    assert!(
+        matches!(&result, Err(BackendError::Unavailable(m)) if m.contains("cannot be queued on disk")),
+        "{result:?}"
+    );
     assert_eq!(v.queued().await, 0, "a change not on disk is not kept in memory either");
     assert_eq!(v.item_offline("gh").await.label, "GitHub");
+    assert!(!queue.exists());
 }
 
 impl Vault {
@@ -935,4 +972,824 @@ async fn acl_decisions_are_keyed_by_a_key_of_their_own() {
     }
     v.backend.lock().await;
     assert!(matches!(v.backend.acl_trust().await, Err(BackendError::Locked)));
+}
+
+// --- what goes wrong on the server ---------------------------------------------
+
+impl Vault {
+    async fn has_item(&self, id: &str) -> bool {
+        self.backend.state.lock().await.as_ref().unwrap().built.marked.contains_key(id)
+    }
+
+    async fn logged_in(&self) -> bool {
+        self.backend.api.lock().await.is_logged_in()
+    }
+
+    /// Another device adds a field to `cid`. The server's revision stays
+    /// as it is, so a refresh does not look at it.
+    fn add_field(&self, cid: &str, name: &str, value: &str) {
+        let field = json!({
+            "type": 0, "name": self.keys.user.encrypt_str(name), "value": self.keys.user.encrypt_str(value),
+            "linkedId": null,
+        });
+        self.fake.with(|s| s.find(cid).unwrap()["fields"].as_array_mut().unwrap().push(field));
+    }
+
+    /// Another device changes `cid` with `edit`, and the vault's revision moves.
+    fn edit_elsewhere(&self, cid: &str, edit: impl FnOnce(&mut Value)) {
+        self.fake.with(|s| {
+            s.rev += 1;
+            let rev = s.revision();
+            let c = s.find(cid).unwrap();
+            edit(c);
+            c["revisionDate"] = json!(rev);
+        });
+    }
+
+    /// The write queue, shown and on disk.
+    async fn queue_sizes(&self) -> (usize, usize) {
+        (self.queued().await, self.queue_file())
+    }
+}
+
+/// A request the fake server holds until it is released.
+struct Gate {
+    reached: Option<mpsc::Receiver<()>>,
+    release: mpsc::Sender<()>,
+}
+
+impl Gate {
+    /// Holds the next request `method path` of `fake`.
+    fn hold(fake: &Fake, method: &str, path: &str) -> Gate {
+        let (reached_tx, reached) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        fake.with(|s| s.pause = Some((method.into(), path.into(), reached_tx, release_rx)));
+        Gate { reached: Some(reached), release }
+    }
+
+    /// Returns once the server holds the request.
+    async fn arrived(&mut self) {
+        let reached = self.reached.take().unwrap();
+        tokio::task::spawn_blocking(move || reached.recv().unwrap()).await.unwrap();
+    }
+
+    fn open(self) {
+        self.release.send(()).unwrap();
+    }
+}
+
+/// Holds the request `method path`, locks the keyring while it is in flight,
+/// and then lets the request go. Returns what `op` returned.
+async fn lock_during<T: Send + 'static>(
+    v: &Vault,
+    method: &str,
+    path: &str,
+    op: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let mut gate = Gate::hold(&v.fake, method, path);
+    let running = tokio::spawn(op);
+    gate.arrived().await;
+    // `lock` drops the keys at once, then waits for the request in flight to
+    // log out.
+    let backend = v.backend.clone();
+    let locking = tokio::spawn(async move { backend.lock().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while v.backend.state.lock().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lock drops the keys");
+    gate.open();
+    let out = running.await.unwrap();
+    locking.await.unwrap();
+    out
+}
+
+async fn github() -> Vault {
+    let k = SymmetricKey::generate();
+    vault(vec![hand_marked(&k, "c1", "gh")], k).await
+}
+
+#[tokio::test]
+async fn a_server_that_cannot_take_a_write_now_gets_it_later() {
+    // 401: the session ended; 429 and 500: the server is busy or broken.
+    for status in [401u16, 429, 500] {
+        let v = github().await;
+        v.fake.fault("PUT", "/api/ciphers/c1", status, 1);
+        let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+        v.backend.put_item(&item).await.unwrap();
+        assert_eq!(v.queue_sizes().await, (1, 1), "{status}");
+        assert_eq!(v.item_offline("gh").await.label, "Mine", "{status}");
+        assert_eq!(v.logged_in().await, status != 401, "{status}: an ended session is dropped");
+
+        // Later it goes through, after a new login when one is needed.
+        v.backend.refresh().await.unwrap();
+        assert_eq!(v.queue_sizes().await, (0, 0), "{status}");
+        assert_eq!(v.marked("c1").item.label, "Mine", "{status}");
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_a_write_is_not_asked_again() {
+    for status in [400u16, 404] {
+        let v = github().await;
+        v.fake.fault("PUT", "/api/ciphers/c1", status, 1);
+        let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+        let err = v.backend.put_item(&item).await.unwrap_err();
+        let shown = format!("HTTP {status}");
+        assert!(matches!(&err, BackendError::Rejected(m) if m.contains(&shown)), "{err}");
+        assert_eq!(v.queue_sizes().await, (0, 0), "{status}");
+        assert!(!v.names("c1").iter().any(|n| n == "bwss:label"), "{status}: nothing was written");
+        assert_eq!(v.item_offline("gh").await.label, "GitHub", "{status}: the refused change is not shown");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_write_shows_the_server_copy_again() {
+    // Another device labelled the item; this one has not seen it yet.
+    let v = github().await;
+    v.add_field("c1", "bwss:label", "Elsewhere");
+    v.fake.fault("PUT", "/api/ciphers/c1", 400, 1);
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    assert!(matches!(v.backend.put_item(&item).await, Err(BackendError::Rejected(_))));
+    assert_eq!(v.item_offline("gh").await.label, "Elsewhere");
+
+    // The item was removed meanwhile.
+    let v = github().await;
+    v.fake.fault("PUT", "/api/ciphers/c1", 400, 1);
+    v.fake.fault("GET", "/api/ciphers/c1", 404, 1);
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    assert!(matches!(v.backend.put_item(&item).await, Err(BackendError::Rejected(_))));
+    assert!(!v.has_item("gh").await);
+
+    // The server cannot be asked again: the view stays as it was.
+    let v = github().await;
+    v.fake.fault("PUT", "/api/ciphers/c1", 400, 1);
+    v.fake.fault("GET", "/api/ciphers/c1", 500, 1);
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    assert!(matches!(v.backend.put_item(&item).await, Err(BackendError::Rejected(_))));
+    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keyring_locked_before_the_reread_stays_locked() {
+    let v = github().await;
+    v.fake.fault("PUT", "/api/ciphers/c1", 400, 1);
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    let backend = v.backend.clone();
+    let result = lock_during(&v, "GET", "/api/ciphers/c1", async move { backend.put_item(&item).await }).await;
+    assert!(matches!(&result, Err(BackendError::Rejected(m)) if m.contains("HTTP 400")), "{result:?}");
+    assert!(v.backend.state.lock().await.is_none(), "the reread does not bring the keyring back");
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_after_a_lock_is_told_the_keyring_is_locked() {
+    // The folder is created while the keyring locks; the note is not.
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    let backend = v.backend.clone();
+    let result =
+        lock_during(&v, "POST", "/api/folders", async move { backend.put_item(&new_item("n1", "login")).await }).await;
+    assert!(matches!(result, Err(BackendError::Locked)), "{result:?}");
+    assert_eq!(v.fake.count("POST", "/api/folders"), 1);
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_stops_when_the_keyring_locks_and_the_write_stays_on_disk() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    assert_eq!(v.queue_file(), 1);
+    v.fake.with(|s| s.down = false);
+
+    let backend = v.backend.clone();
+    let result = lock_during(&v, "POST", "/api/folders", async move { backend.refresh().await }).await;
+    assert!(matches!(result, Err(BackendError::Locked)), "{result:?}");
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0, "nothing was created");
+    assert_eq!(v.queue_file(), 1, "the create waits on disk for the next unlock");
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1, "and goes out then");
+}
+
+// --- deleting ----------------------------------------------------------------------
+
+const MARKS: [&str; 3] = ["bwss:id", "bwss:attr:service", "obsidian:id"];
+
+#[tokio::test]
+async fn a_delete_of_an_item_that_left_the_server_sends_nothing_more() {
+    let v = github().await;
+    // The save is out of date, and the item cannot be fetched any more.
+    v.fake.with(|s| s.stale_puts = 1);
+    v.fake.fault("GET", "/api/ciphers/c1", 404, 1);
+    let item = v.item_offline("gh").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1"), 1);
+    assert_eq!(v.names("c1"), MARKS, "the server's copy is not touched");
+}
+
+#[tokio::test]
+async fn a_delete_that_cannot_refetch_the_item_is_queued() {
+    let v = github().await;
+    v.fake.with(|s| s.stale_puts = 1);
+    v.fake.fault("GET", "/api/ciphers/c1", 500, 1);
+    let item = v.item_offline("gh").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    // Back to normal: the delete goes through.
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.names("c1"), ["obsidian:id"]);
+}
+
+#[tokio::test]
+async fn a_delete_whose_answer_cannot_be_read_keeps_the_item() {
+    let v = github().await;
+    let unreadable = json!({
+        "id": "c1", "type": 1, "revisionDate": REV,
+        "fields": [{ "type": 0, "name": "2.bad|bad|bad", "value": "2.bad|bad|bad" }],
+    });
+    v.fake.fault_reply("PUT", "/api/ciphers/c1", 200, unreadable);
+    let item = v.item_offline("gh").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1/delete"), 0, "what cannot be read is never trashed");
+    assert!(v.fake.cipher("c1")["deletedDate"].is_null());
+}
+
+#[tokio::test]
+async fn an_item_left_in_the_vault_when_the_trash_refuses_it_is_no_longer_the_keyrings() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    let cid = v.fake.with(|s| s.sync["ciphers"][0]["id"].as_str().unwrap().to_owned());
+    v.fake.fault("PUT", &format!("/api/ciphers/{cid}/delete"), 500, 1);
+    let item = v.item("n1").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert!(v.fake.cipher(&cid)["deletedDate"].is_null(), "still in the vault, as a bare note");
+    assert!(v.names(&cid).is_empty(), "with none of bwss's fields");
+    assert!(!v.has_item("n1").await);
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test]
+async fn a_delete_that_keeps_meeting_changes_is_told_to_try_again() {
+    let v = github().await;
+    v.fake.with(|s| s.stale_puts = 3);
+    let item = v.item_offline("gh").await;
+    let err = v.backend.delete_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.ends_with("try again")), "{err}");
+    assert_eq!((v.queued().await, v.names("c1")), (0, MARKS.map(String::from).to_vec()));
+}
+
+#[tokio::test]
+async fn a_delete_gives_way_to_what_another_device_did_to_the_item() {
+    // It was unmarked meanwhile: it has left the keyring by itself.
+    let v = github().await;
+    v.fake.with(|s| s.before_put = Some(Box::new(|c: &mut Value| c["fields"] = json!([]))));
+    let item = v.item_offline("gh").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1"), 1, "only the out-of-date save");
+    assert!(v.names("c1").is_empty());
+
+    // It cannot be read now: the app is told to try again, nothing is queued.
+    let v = github().await;
+    v.fake.with(|s| s.before_put = Some(Box::new(|c: &mut Value| c["key"] = json!("2.AAAA|AAAA|AAAA"))));
+    let item = v.item_offline("gh").await;
+    let err = v.backend.delete_item(&item).await.unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.contains("c1") && m.ends_with("try again later")),
+        "{err}"
+    );
+    assert_eq!(v.queued().await, 0);
+
+    // Its answer has no revision: it cannot be stripped safely.
+    let v = github().await;
+    v.fake.with(|s| s.stale_puts = 1);
+    let mut no_revision = v.fake.cipher("c1");
+    no_revision.as_object_mut().unwrap().remove("revisionDate");
+    v.fake.fault_reply("GET", "/api/ciphers/c1", 200, no_revision);
+    let item = v.item_offline("gh").await;
+    let err = v.backend.delete_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("no revisionDate")), "{err}");
+    assert_eq!(v.names("c1"), MARKS, "nothing was stripped");
+}
+
+#[tokio::test]
+async fn a_queued_delete_waits_for_an_item_that_cannot_be_read() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    let item = v.item_offline("gh").await;
+    v.backend.delete_item(&item).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+
+    // The key of the item no longer unwraps. The first flush finds out when
+    // its save is out of date; the second one knows the item as held.
+    let good_key = v.fake.cipher("c1")["key"].clone();
+    let puts = v.fake.count("PUT", "/api/ciphers/c1");
+    v.fake.with(|s| s.down = false);
+    v.edit_elsewhere("c1", |c| c["key"] = json!("2.AAAA|AAAA|AAAA"));
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1), "the delete waits");
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1") - puts, 1, "only the out-of-date save, never sent again");
+
+    v.edit_elsewhere("c1", |c| c["key"] = good_key);
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.names("c1"), ["obsidian:id"]);
+}
+
+#[tokio::test]
+async fn writes_to_an_item_that_cannot_be_read_wait() {
+    let v = github().await;
+    v.edit_elsewhere("c1", |c| c["key"] = json!("2.AAAA|AAAA|AAAA"));
+    v.backend.refresh().await.unwrap();
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be read now") && m.ends_with("try again later")),
+        "{err}"
+    );
+    assert_eq!(v.queued().await, 0);
+
+    // With the session gone and the server down, it is queued, to be applied
+    // once the item can be read.
+    v.backend.api.lock().await.logout();
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+}
+
+#[tokio::test]
+async fn a_queued_write_the_server_refuses_is_dropped_and_the_view_goes_back() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    v.fake.with(|s| s.down = false);
+    v.fake.fault("PUT", "/api/ciphers/c1", 400, 1);
+    let puts = v.fake.count("PUT", "/api/ciphers/c1");
+
+    // The vault did not change, but what is shown did: the change is gone.
+    let shown = v.backend.refresh().await.unwrap().expect("the view changed");
+    assert_eq!(shown.items[0].label, "GitHub");
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1") - puts, 1, "refused once, not sent again");
+    assert!(!v.names("c1").iter().any(|n| n == "bwss:label"));
+}
+
+#[tokio::test]
+async fn ops_that_were_done_before_send_nothing() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    let item = v.item("n1").await;
+    let (posts, puts) = (v.fake.count("POST", "/api/ciphers"), v.fake.count("PUT", "/api/ciphers"));
+
+    // A queued create that was accepted before (just before a lock).
+    let create = Op::Create { id: "n1".into(), collection: "login".into(), item };
+    let effect = v.backend.run(&create).await.unwrap();
+    assert!(matches!(effect, Effect::Nothing), "{effect:?}");
+
+    // A patch with no change.
+    let empty = Op::Patch(Patch {
+        id: "n1".into(),
+        base_revision: REV.into(),
+        set: vec![],
+        remove: vec![],
+        acl_add: vec![],
+        value: ValueChange::Keep,
+        cipher_id: None,
+    });
+    let effect = v.backend.run(&empty).await.unwrap();
+    assert!(matches!(effect, Effect::Nothing), "{effect:?}");
+    assert_eq!((v.fake.count("POST", "/api/ciphers"), v.fake.count("PUT", "/api/ciphers")), (posts, puts));
+}
+
+#[tokio::test]
+async fn a_new_item_the_server_refuses_is_rejected() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.fault("POST", "/api/ciphers", 400, 1);
+    let err = v.backend.put_item(&new_item("n1", "login")).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
+    assert!(!v.has_item("n1").await);
+    assert_eq!(v.queue_sizes().await, (0, 0));
+}
+
+#[tokio::test]
+async fn a_folder_the_server_creates_without_an_id_is_not_used_yet() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.fault_reply("POST", "/api/folders", 200, json!({ "name": "x" }));
+    // A server that answers oddly is treated as one that cannot be used now.
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1, "and the folder is made properly the next time");
+}
+
+#[tokio::test]
+async fn a_new_item_queued_offline_is_edited_and_dropped_in_the_queue() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.with(|s| s.down = true);
+    let mut item = new_item("n1", "login");
+    v.backend.put_item(&item).await.unwrap();
+
+    // The app edits it before it ever reached the server: one create, the last version.
+    item.label = "Renamed".into();
+    item.collection = "work".into();
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    let shown = v.item_offline("n1").await;
+    assert_eq!((shown.label.as_str(), shown.collection.as_str()), ("Renamed", "work"));
+
+    // A version that could never be written is refused, and the queue keeps the last good one.
+    item.attributes.insert("blob".into(), "x".repeat(5_000));
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(err, BackendError::Rejected(_)), "{err}");
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    assert!(!v.item_offline("n1").await.attributes.contains_key("blob"));
+
+    // A second item is created and deleted before the server was reachable.
+    let second = new_item("n2", "login");
+    v.backend.put_item(&second).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (2, 2));
+    v.backend.delete_item(&second).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    assert!(!v.has_item("n2").await);
+
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1, "n2 never reached the server");
+    let cid = v.fake.with(|s| s.sync["ciphers"][0]["id"].as_str().unwrap().to_owned());
+    let created = v.marked(&cid).item;
+    assert_eq!((created.id.as_str(), created.label.as_str(), created.collection.as_str()), ("n1", "Renamed", "work"));
+}
+
+// --- collections ---------------------------------------------------------------------
+
+const HOME: &str = r#"{"home":{"label":"Home","created":1}}"#;
+
+async fn with_registry() -> Vault {
+    let k = SymmetricKey::generate();
+    vault(vec![registry_note(&k, "r1", HOME)], k).await
+}
+
+/// The collections in the registry note that is not `r1`, the last cipher.
+fn newest_registry(v: &Vault) -> Registry {
+    let note = v.fake.with(|s| s.sync["ciphers"].as_array().unwrap().last().unwrap().clone());
+    Registry::try_parse(&v.dec(&note["notes"])).unwrap()
+}
+
+#[tokio::test]
+async fn a_collection_change_that_keeps_meeting_changes_is_told_to_try_again() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.stale_puts = 3);
+    let err = v.backend.create_collection("Work").await.unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.contains("registry keeps changing") && m.ends_with("try again")),
+        "{err}"
+    );
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test]
+async fn a_registry_note_that_left_the_server_is_written_anew() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.stale_puts = 1);
+    v.fake.fault("GET", "/api/ciphers/r1", 404, 1);
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+    let ids: Vec<_> = newest_registry(&v).0.into_keys().collect();
+    assert_eq!(ids, ["home", "work"]);
+}
+
+#[tokio::test]
+async fn a_collection_change_that_cannot_refetch_the_note_is_queued() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.stale_puts = 1);
+    v.fake.fault("GET", "/api/ciphers/r1", 500, 1);
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert!(Registry::try_parse(&v.dec(&v.fake.cipher("r1")["notes"])).unwrap().0.contains_key("work"));
+}
+
+#[tokio::test]
+async fn a_registry_note_changed_elsewhere_into_something_else_is_handled() {
+    // Its key no longer unwraps.
+    let v = with_registry().await;
+    v.fake.with(|s| s.before_put = Some(Box::new(|c: &mut Value| c["key"] = json!("2.AAAA|AAAA|AAAA"))));
+    let err = v.backend.create_collection("Work").await.unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.contains("r1") && m.ends_with("try again later")),
+        "{err}"
+    );
+
+    // Its notes are no longer a registry: never written over.
+    let v = with_registry().await;
+    let junk = v.keys.user.encrypt_str("not json");
+    v.fake.with(|s| s.before_put = Some(Box::new(move |c: &mut Value| c["notes"] = json!(junk))));
+    let err = v.backend.create_collection("Work").await.unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.starts_with("the collection registry cannot be read")),
+        "{err}"
+    );
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+
+    // It lost its marks: a new registry note is started, with what is known.
+    let v = with_registry().await;
+    v.fake.with(|s| s.before_put = Some(Box::new(|c: &mut Value| c["fields"] = json!([]))));
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+    assert_eq!(newest_registry(&v).0.into_keys().collect::<Vec<_>>(), ["home", "work"]);
+}
+
+#[tokio::test]
+async fn a_registry_note_with_a_password_field_is_never_rewritten() {
+    let k = SymmetricKey::generate();
+    let mut note = registry_note(&k, "r1", HOME);
+    note["fields"] = enc_fields(
+        &k,
+        &[("bwss:id", "_collections"), ("bwss:kind", "collections"), ("bwss:password", "binary registry")],
+    );
+    let v = vault(vec![note], k).await;
+    let err = v.backend.create_collection("Work").await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("bwss:password field")), "{err}");
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/"), 0);
+}
+
+#[tokio::test]
+async fn a_registry_note_the_server_refuses_is_rejected() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.fault("POST", "/api/ciphers", 400, 1);
+    let err = v.backend.create_collection("Work").await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test]
+async fn a_queued_collection_change_waits_for_a_registry_that_cannot_be_read() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.down = true);
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+
+    // Another device wrote something else into the registry note.
+    v.fake.with(|s| s.down = false);
+    let puts = v.fake.count("PUT", "/api/ciphers/r1");
+    let junk = v.keys.user.encrypt_str("not json");
+    v.edit_elsewhere("r1", |c| c["notes"] = json!(junk));
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1), "never written over, never dropped");
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/r1") - puts, 1, "only the out-of-date attempt");
+
+    // Fixed: the change goes through.
+    let fixed = v.keys.user.encrypt_str(HOME);
+    v.edit_elsewhere("r1", |c| c["notes"] = json!(fixed));
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert!(Registry::try_parse(&v.dec(&v.fake.cipher("r1")["notes"])).unwrap().0.contains_key("work"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registry_found_unreadable_while_its_folder_is_made_is_not_written() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    let mut gate = Gate::hold(&v.fake, "POST", "/api/folders");
+    let backend = v.backend.clone();
+    let creating = tokio::spawn(async move { backend.create_collection("Work").await });
+    gate.arrived().await;
+    // The keyring is rebuilt meanwhile, and the registry is now unreadable.
+    v.backend.state.lock().await.as_mut().unwrap().built.registry_unreadable = true;
+    gate.open();
+    let err = creating.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.starts_with("the collection registry cannot be read")),
+        "{err}"
+    );
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+}
+
+// --- unlocking -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unlock_that_cannot_go_on_says_why() {
+    let v = github().await;
+    let account_key = v.fake.with(|s| s.sync["profile"]["key"].clone());
+    v.backend.lock().await;
+
+    // A refusal is not an outage: the offline copy is not used.
+    v.fake.fault("POST", "/identity/accounts/prelogin", 400, 1);
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
+
+    v.fake.with(|s| s.sync["profile"]["key"] = Value::Null);
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("without account key")), "{err}");
+    v.fake.with(|s| s.sync["profile"]["key"] = account_key);
+
+    // A key derivation the client refuses to run.
+    v.fake.fault_reply("POST", "/identity/accounts/prelogin", 200, json!({ "kdf": 0, "kdfIterations": 0 }));
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(err, BackendError::Rejected(_)), "{err}");
+    assert!(v.backend.state.lock().await.is_none());
+
+    // Nothing is reachable and nothing is cached.
+    std::fs::remove_file(v.dir.join("cache/sync.json")).unwrap();
+    v.fake.with(|s| s.down = true);
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("no offline copy yet")), "{err}");
+
+    // Reachable again: all is well.
+    v.fake.with(|s| s.down = false);
+    assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
+}
+
+#[tokio::test]
+async fn a_cache_that_cannot_be_written_does_not_stop_the_unlock() {
+    let v = github().await;
+    v.backend.lock().await;
+    let cache = v.dir.join("cache/sync.json");
+    std::fs::remove_file(&cache).unwrap();
+    // The private write goes through this temporary name.
+    std::fs::create_dir_all(crate::fsutil::temp_path(&cache)).unwrap();
+    assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
+    assert!(!cache.exists(), "no offline copy was made");
+}
+
+#[tokio::test]
+async fn status_lists_items_that_are_not_supported() {
+    let k = SymmetricKey::generate();
+    let mut card = hand_marked(&k, "c4", "card");
+    card["type"] = json!(3);
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), card], k).await;
+    let status = v.backend.describe().await;
+    assert!(status.contains("\nskipped: c4: item type 3 is not supported"), "{status}");
+}
+
+#[tokio::test]
+async fn an_offline_unlock_uses_only_the_cache_of_its_own_account() {
+    let v = github().await;
+    v.backend.lock().await;
+    v.fake.with(|s| s.down = true);
+    assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1, "the cached vault opens");
+
+    v.backend.lock().await;
+    let cache = v.dir.join("cache/sync.json");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    doc["email"] = json!("other@example.org");
+    std::fs::write(&cache, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("no offline copy yet")), "{err}");
+}
+
+#[test]
+fn the_device_id_is_made_once_and_kept() {
+    let config = Config {
+        server_url: "http://127.0.0.1:1".into(),
+        email: EMAIL.into(),
+        profile: Some("p".into()),
+        ..Config::default()
+    };
+    let creds = || Credentials {
+        identity_origin: "http://127.0.0.1:1".into(),
+        client_id: "id".into(),
+        client_secret: Zeroizing::new("secret".into()),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let device = paths.device_id("p");
+    BitwardenBackend::new(&config, creds(), &paths).unwrap();
+    let first = std::fs::read_to_string(&device).unwrap();
+    assert_eq!(first.len(), 36, "a UUID: {first:?}");
+    BitwardenBackend::new(&config, creds(), &paths).unwrap();
+    assert_eq!(std::fs::read_to_string(&device).unwrap(), first, "the same device next time");
+
+    // A blank file is no id: a new one is made.
+    std::fs::write(&device, "  \n").unwrap();
+    BitwardenBackend::new(&config, creds(), &paths).unwrap();
+    assert_eq!(std::fs::read_to_string(&device).unwrap().len(), 36);
+}
+
+#[tokio::test]
+async fn a_server_answer_without_an_id_is_not_recorded() {
+    let v = github().await;
+    v.fake.fault_reply("PUT", "/api/ciphers/c1", 200, json!({ "object": "cipherDetails" }));
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    let cached = v.backend.state.lock().await.as_ref().unwrap().sync["ciphers"].as_array().unwrap().len();
+    assert_eq!(cached, 1, "nothing was added to the cached vault");
+    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+}
+
+#[tokio::test]
+async fn a_vault_sync_without_a_cipher_list_still_takes_writes() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.fake.with(|s| {
+        s.rev += 1;
+        s.sync.as_object_mut().unwrap().remove("ciphers");
+    });
+    v.backend.refresh().await.unwrap();
+    assert!(v.backend.state.lock().await.as_ref().unwrap().sync.get("ciphers").is_none());
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+    // The server's answer had nowhere to go in the cache: the next sync shows the item.
+    assert_eq!(v.item("n1").await.label, "App token");
+}
+
+#[tokio::test]
+async fn deleting_a_collection_that_only_items_name_leaves_no_registry_entry() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    v.backend.put_item(&new_item("n1", "work")).await.unwrap();
+    v.snapshot().await;
+    v.backend.delete_collection("work", &["n1".to_owned()]).await.unwrap();
+    let snap = v.snapshot().await;
+    assert!(snap.items.is_empty());
+    assert!(!snap.collections.iter().any(|c| c.id == "work"));
+    // The one cipher is the item's, now a bare note in the trash; no registry note was written.
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+}
+
+#[test]
+fn a_backend_needs_a_profile_to_serve() {
+    let config = Config { server_url: "http://127.0.0.1:1".into(), email: EMAIL.into(), ..Config::default() };
+    let creds = Credentials {
+        identity_origin: "http://127.0.0.1:1".into(),
+        client_id: "id".into(),
+        client_secret: Zeroizing::new("secret".into()),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let err = BitwardenBackend::new(&config, creds, &paths_in(dir.path())).err().unwrap();
+    assert_eq!(err.to_string(), "no profile to serve");
+}
+
+#[tokio::test]
+async fn a_new_item_too_large_for_bitwarden_is_rejected_when_it_is_sent() {
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    let mut item = new_item("n1", "login");
+    item.attributes.insert("blob".into(), "x".repeat(5_000));
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("too large")), "{err}");
+    assert_eq!((v.fake.count("POST", "/api/ciphers"), v.queued().await), (0, 0));
+    assert!(!v.has_item("n1").await);
+}
+
+#[tokio::test]
+async fn a_collection_too_large_for_the_registry_note_is_rejected() {
+    let big = "x".repeat(20_000);
+    // Changing the registry note that exists.
+    let v = with_registry().await;
+    let err = v.backend.create_collection(&big).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("too large")), "{err}");
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/r1"), 0);
+    // Writing the first one.
+    let v = vault(vec![], SymmetricKey::generate()).await;
+    let err = v.backend.create_collection(&big).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("too large")), "{err}");
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test]
+async fn a_collection_made_again_is_newer_than_its_tombstone() {
+    let k = SymmetricKey::generate();
+    let far = crate::model::now() + 1_000_000;
+    let tombstone = format!(r#"{{"work":{{"label":"Old","created":{far},"deleted":true}}}}"#);
+    let v = vault(vec![registry_note(&k, "r1", &tombstone)], k).await;
+    let work = v.backend.create_collection("Work").await.unwrap();
+    assert_eq!((work.id.as_str(), work.created), ("work", far + 1));
+    let registry = Registry::try_parse(&v.dec(&v.fake.cipher("r1")["notes"])).unwrap();
+    assert!(!registry.0["work"].deleted);
+    assert_eq!(registry.0["work"].created, far + 1);
+}
+
+#[tokio::test]
+async fn collections_are_written_to_the_registry_note_with_the_lowest_id() {
+    let k = SymmetricKey::generate();
+    let notes = [registry_note(&k, "r2", HOME), registry_note(&k, "r1", HOME)];
+    let v = vault(notes.to_vec(), k).await;
+    v.backend.create_collection("Work").await.unwrap();
+    let registry = |cid: &str| Registry::try_parse(&v.dec(&v.fake.cipher(cid)["notes"])).unwrap();
+    assert!(registry("r1").0.contains_key("work"));
+    assert!(!registry("r2").0.contains_key("work"), "the other note is left as it was");
+}
+
+#[tokio::test]
+async fn a_registry_that_cannot_be_inspected_keeps_its_collections_while_changes_wait() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.down = true);
+    v.backend.create_collection("Work").await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.edit_elsewhere("r1", |c| c["key"] = json!("2.AAAA|AAAA|AAAA"));
+    v.backend.refresh().await.unwrap();
+    let ids: Vec<_> = v.snapshot().await.collections.into_iter().map(|c| c.id).collect();
+    assert_eq!(ids, ["home", "login", "work"], "the registry as last read, with the queued collection");
+    assert_eq!(v.queue_sizes().await, (1, 1), "and the change waits");
+    assert!(v.backend.describe().await.contains("collection registry cannot be read"));
 }
