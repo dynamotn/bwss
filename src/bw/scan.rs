@@ -148,20 +148,23 @@ fn read_marked(
 
     // The value source: the first present one.
     let password_index = first_index(names, F_PASSWORD);
-    let (source, stored, text) = if let Some(i) = password_index {
-        (ValueSource::Field, stored_value(cipher, i), field_value(cipher, i, key)?)
+    let (source, stored) = if let Some(i) = password_index {
+        (ValueSource::Field, stored_value(cipher, i))
     } else if in_notes || ty == TYPE_SECURE_NOTE {
-        let stored = str_at(cipher, "/notes").unwrap_or_default();
         let source = if in_notes { ValueSource::BwssNotes } else { ValueSource::NoteBody };
-        (source, stored, dec_opt(Some(stored), key)?)
+        (source, str_at(cipher, "/notes").unwrap_or_default())
     } else {
-        let stored = str_at(cipher, "/login/password").unwrap_or_default();
-        (ValueSource::LoginPassword, stored, dec_opt(Some(stored), key)?)
+        (ValueSource::LoginPassword, str_at(cipher, "/login/password").unwrap_or_default())
+    };
+    // Never decrypt (or decode) a value the user owns when base64 is asked of it.
+    if base64 && matches!(source, ValueSource::LoginPassword | ValueSource::NoteBody) {
+        return Ok(Scan::Skipped(format!("{cipher_id}: {F_ENCODING}=base64 on a value bwss does not own")));
+    }
+    let text = match password_index {
+        Some(i) => field_value(cipher, i, key)?,
+        None => dec_opt(Some(stored), key)?,
     };
     let secret = if base64 {
-        if matches!(source, ValueSource::LoginPassword | ValueSource::NoteBody) {
-            return Ok(Scan::Skipped(format!("{cipher_id}: {F_ENCODING}=base64 on a value bwss does not own")));
-        }
         match B64.decode(text.as_bytes()) {
             Ok(b) => Zeroizing::new(b),
             Err(_) => return Ok(Scan::Skipped(format!("{cipher_id}: value is not valid base64"))),
@@ -192,12 +195,20 @@ fn read_marked(
     }
 
     let label = field(F_LABEL)?.filter(|l| !l.is_empty()).map_or_else(|| name.to_string(), |l| l.to_string());
-    let collection = field(F_COLLECTION)?.map_or_else(|| LOGIN_COLLECTION.to_owned(), |c| normalize_collection(&c));
+    let collection = match field(F_COLLECTION)? {
+        None => LOGIN_COLLECTION.to_owned(),
+        Some(c) => {
+            if c.trim().eq_ignore_ascii_case(SESSION_COLLECTION) {
+                tracing::warn!("{cipher_id}: {F_COLLECTION}=session is memory only; the item stays in login");
+            }
+            normalize_collection(&c)
+        }
+    };
     let content_type =
         field(F_CONTENT_TYPE)?.filter(|c| !c.is_empty()).map_or_else(|| "text/plain".to_owned(), |c| c.to_string());
     let revision_date = cipher.get("revisionDate").and_then(Value::as_str).unwrap_or_default().to_owned();
     let modified = parse_date(&revision_date);
-    let creation_date = cipher.get("creationDate").and_then(Value::as_str).map(parse_date);
+    let creation_date = cipher.get("creationDate").and_then(Value::as_str).map(parse_date).filter(|&d| d != 0);
     let created = field(F_CREATED)?.and_then(|s| s.trim().parse().ok()).or(creation_date).unwrap_or(0);
     let acl = field(F_ACL)?
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect())
@@ -355,6 +366,16 @@ mod tests {
     }
 
     #[test]
+    fn blank_marker_reads_nothing_else() {
+        let k = keys();
+        let mut c = login(&k, &[f("bwss:id", "  ")], Some("pw"), None);
+        c["name"] = json!("2.bad|bad|bad");
+        c["notes"] = json!("2.bad|bad|bad");
+        c["login"]["password"] = json!("2.bad|bad|bad");
+        assert!(matches!(scan(&c, &k), Scan::Unmarked));
+    }
+
+    #[test]
     fn collection_values_normalize() {
         assert_eq!(normalize_collection(" Default "), "login");
         assert_eq!(normalize_collection("Session"), "login");
@@ -377,10 +398,12 @@ mod tests {
         let c = login(&k, &[id.clone(), f("bwss:encoding", "hex")], Some("pw"), None);
         assert!(matches!(scan(&c, &k), Scan::Skipped(_)));
         // bwss:encoding = "base64" with source LoginPassword -> Skipped (ADR 0005)
-        let c = login(&k, &[id.clone(), f("bwss:encoding", "base64")], Some("AAE="), None);
+        let mut c = login(&k, &[id.clone(), f("bwss:encoding", "base64")], Some("AAE="), None);
+        c["login"]["password"] = json!("2.bad|bad|bad"); // proves the value is not decrypted
         assert!(matches!(scan(&c, &k), Scan::Skipped(_)));
         // bwss:encoding = "base64" with source NoteBody -> Skipped (ADR 0005)
-        let c = note(&k, &[id.clone(), f("bwss:encoding", "base64")], Some("AAE="));
+        let mut c = note(&k, &[id.clone(), f("bwss:encoding", "base64")], Some("AAE="));
+        c["notes"] = json!("2.bad|bad|bad"); // proves the value is not decrypted
         assert!(matches!(scan(&c, &k), Scan::Skipped(_)));
         // organizationId set -> Uninspectable (organizations are not read in v1)
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
@@ -397,6 +420,17 @@ mod tests {
         // "bwss:id" present but blank after trim -> Unmarked
         let c = login(&k, &[f("bwss:id", "  ")], Some("pw"), None);
         assert!(matches!(scan(&c, &k), Scan::Unmarked));
+        // empty bwss:location -> Skipped
+        let c = login(&k, &[id.clone(), f("bwss:location", "")], Some("pw"), None);
+        assert!(matches!(scan(&c, &k), Scan::Skipped(_)));
+        // undecryptable field names -> Uninspectable
+        let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
+        c["fields"][0]["name"] = json!("2.bad|bad|bad");
+        assert!(matches!(scan(&c, &k), Scan::Uninspectable(_)));
+        // unparseable creationDate -> no date, so it sorts last
+        let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
+        c["creationDate"] = json!("not a date");
+        assert_eq!(marked(scan(&c, &k)).creation_date, None);
         // reasons never carry item content
         let c = login(&k, &[id, f("bwss:location", "attachment")], Some("pw"), None);
         let Scan::Skipped(why) = scan(&c, &k) else { panic!() };
