@@ -472,10 +472,15 @@ pub enum PromptAction {
     CreateCollection { label: String },
 }
 
+/// What a prompt will do, until it runs, is dismissed or is cancelled. A
+/// started prompt's task shares it, so a departed client's action can still
+/// be dropped while the password is being asked for.
+type ActionSlot = Arc<std::sync::Mutex<Option<PromptAction>>>;
+
 pub struct PromptObj {
     daemon: Arc<Daemon>,
     path: String,
-    action: std::sync::Mutex<Option<PromptAction>>,
+    action: ActionSlot,
 }
 
 impl PromptAction {
@@ -521,7 +526,11 @@ impl PromptObj {
         if let Some(entry) = victim {
             PromptObj::dismiss_pending(daemon, &entry.path).await;
         }
-        let obj = PromptObj { daemon: daemon.clone(), path: path.clone(), action: std::sync::Mutex::new(Some(action)) };
+        let obj = PromptObj {
+            daemon: daemon.clone(),
+            path: path.clone(),
+            action: Arc::new(std::sync::Mutex::new(Some(action))),
+        };
         if let Err(e) = daemon.conn().object_server().at(path.as_str(), obj).await {
             lock(&daemon.prompts).retain(|p| p.seq != seq);
             return Err(SecretError::ZBus(e));
@@ -550,6 +559,16 @@ impl PromptObj {
         }
     }
 
+    /// Drops the action of a prompt whose client left the bus, started or
+    /// not, and removes the object. Nobody is left to tell.
+    pub async fn cancel(daemon: &Daemon, path: &str) {
+        let server = daemon.conn().object_server();
+        if let Ok(iface) = server.interface::<_, PromptObj>(path).await {
+            drop(lock(&iface.get().await.action).take());
+        }
+        let _ = server.remove::<PromptObj, _>(path).await;
+    }
+
     async fn finish(daemon: Arc<Daemon>, path: String, dismissed: bool, result: OwnedVariant) {
         lock(&daemon.prompts).retain(|p| p.path != path);
         if let Ok(e) = SignalEmitter::new(daemon.conn(), path.clone()) {
@@ -559,27 +578,46 @@ impl PromptObj {
     }
 }
 
+impl PromptObj {
+    fn check_owner(&self, owner: &str, header: &Header<'_>) -> Result<(), SecretError> {
+        if sender(header).as_deref() == Some(owner) {
+            Ok(())
+        } else {
+            Err(SecretError::AccessDenied("the prompt belongs to another client".into()))
+        }
+    }
+}
+
 #[interface(name = "org.freedesktop.Secret.Prompt")]
 impl PromptObj {
-    async fn prompt(&self, _window_id: &str) -> Result<(), SecretError> {
-        {
+    async fn prompt(&self, _window_id: &str, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
+        let dismissed = {
             let mut prompts = lock(&self.daemon.prompts);
             // An evicted prompt is no longer tracked and cannot start.
             let Some(entry) = prompts.iter_mut().find(|p| p.path == self.path) else {
                 return Err(SecretError::Failed("the prompt was dismissed".into()));
             };
+            // Prompt paths are predictable: only the client that asked may start it.
+            self.check_owner(&entry.owner, &header)?;
+            let unused = lock(&self.action).as_ref().filter(|_| !entry.started).map(PromptAction::dismissed_result);
+            let Some(dismissed) = unused else {
+                return Err(SecretError::Failed("the prompt was already used".into()));
+            };
             entry.started = true;
-        }
-        let Some(action) = lock(&self.action).take() else {
-            return Err(SecretError::Failed("the prompt was already used".into()));
+            dismissed
         };
         let daemon = self.daemon.clone();
         let path = self.path.clone();
-        let dismissed = action.dismissed_result();
+        let slot = self.action.clone();
         // The reply must not wait for the user; the outcome goes out as the
         // Completed signal.
         tokio::spawn(async move {
-            if !daemon.unlock_interactive().await {
+            let unlocked = daemon.unlock_interactive().await;
+            // Gone when the prompt was dismissed meanwhile (which signalled)
+            // or its client left the bus (nobody to tell): nothing runs.
+            let Some(action) = lock(&slot).take() else { return };
+            if !unlocked {
+                drop(action);
                 return PromptObj::finish(daemon, path, true, dismissed).await;
             }
             let result: SResult<OwnedVariant> = async {
@@ -609,7 +647,11 @@ impl PromptObj {
         Ok(())
     }
 
-    async fn dismiss(&self) -> Result<(), SecretError> {
+    async fn dismiss(&self, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
+        let owner = lock(&self.daemon.prompts).iter().find(|p| p.path == self.path).map(|p| p.owner.clone());
+        if let Some(owner) = owner {
+            self.check_owner(&owner, &header)?;
+        }
         if let Some(action) = lock(&self.action).take() {
             tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, action.dismissed_result()));
         }

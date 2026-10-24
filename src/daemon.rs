@@ -432,15 +432,22 @@ impl Daemon {
     }
 
     /// Like `unlock_with_password` for remote callers: password attempts take
-    /// turns and a failed one makes the next wait 2 s. This is a speed bump
-    /// against processes of the same user, and the penalty does not hold `unlock_gate`,
-    /// so the interactive unlock is never queued behind the penalty.
+    /// turns and a failed one makes the next wait 2 s. When the keyring is
+    /// already unlocked it succeeds at once without trying the password.
+    /// This is a speed bump against processes of the same user, and the
+    /// penalty does not hold `unlock_gate`, so the interactive unlock is never
+    /// queued behind the penalty.
     pub async fn unlock_with_password_throttled(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
         let _turn = self.failure_gate.lock().await;
         // The gate is held for the attempt only, never for the penalty, and it
         // keeps this from running at the same time as the interactive unlock.
         let result = {
             let _gate = self.unlock_gate.lock().await;
+            // Already unlocked: nothing to try, so nothing to penalize, and
+            // the backend does not decrypt everything again.
+            if self.keyring.lock().await.is_unlocked() {
+                return Ok(());
+            }
             self.unlock_with_password(password).await
         };
         if result.is_err() {
@@ -498,8 +505,10 @@ impl Daemon {
         sessions.values().map(|s| s.owner.clone()).chain(prompts.iter().map(|p| p.owner.clone())).collect()
     }
 
-    /// Frees everything a client held, once it left the bus. Prompts that
-    /// have not started drop their pending secret with their object.
+    /// Frees everything a client held, once it left the bus. Its prompts drop
+    /// their action (and any pending secret), started ones included: a
+    /// password still being asked for may unlock the keyring, but nothing
+    /// the client asked for runs.
     pub async fn drop_owner(&self, owner: &str) {
         self.identities.forget(owner);
         let sessions: Vec<String> = {
@@ -522,7 +531,7 @@ impl Daemon {
             let _ = server.remove::<crate::dbus::SessionObj, _>(p.as_str()).await;
         }
         for p in prompts {
-            let _ = server.remove::<crate::dbus::PromptObj, _>(p.as_str()).await;
+            crate::dbus::PromptObj::cancel(self, &p).await;
         }
     }
 
@@ -989,6 +998,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_password_attempts_take_turns_and_never_hold_the_unlock_gate() {
         let (d, _backend) = gated_daemon(None).await;
+        d.lock().await;
         let start = tokio::time::Instant::now();
         let attempts: Vec<_> = (0..2)
             .map(|_| {
@@ -1026,6 +1036,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_remote_password_for_an_unlocked_keyring_is_not_tried() {
+        let (d, backend) = gated_daemon(None).await;
+        let before = backend.unlocks.load(Ordering::Relaxed);
+        let start = tokio::time::Instant::now();
+        for password in ["wrong", "pw"] {
+            d.unlock_with_password_throttled(password).await.unwrap();
+        }
+        assert!(start.elapsed() < FAILED_UNLOCK_DELAY, "no penalty");
+        assert_eq!(backend.unlocks.load(Ordering::Relaxed), before, "the backend was not asked again");
+        assert!(d.keyring.lock().await.is_unlocked());
+        // Locked again, a password is tried as before.
+        d.lock().await;
+        assert!(d.unlock_with_password_throttled("wrong").await.is_err());
+        assert_eq!(backend.unlocks.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn interactive_unlock_of_an_unlocked_keyring_succeeds_without_delay() {
         let (d, _backend) = gated_daemon(None).await;
         let start = tokio::time::Instant::now();
@@ -1042,11 +1069,14 @@ mod tests {
         inner: MemoryBackend,
         entered: Notify,
         release: Notify,
+        /// How many times `unlock` ran.
+        unlocks: AtomicU64,
     }
 
     #[async_trait::async_trait]
     impl Backend for GatedBackend {
         async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+            self.unlocks.fetch_add(1, Ordering::Relaxed);
             self.inner.unlock(password).await
         }
         async fn lock(&self) {
@@ -1080,8 +1110,12 @@ mod tests {
     }
 
     async fn gated_daemon(seed: Option<ItemData>) -> (Arc<Daemon>, Arc<GatedBackend>) {
-        let backend =
-            Arc::new(GatedBackend { inner: MemoryBackend::new("pw"), entered: Notify::new(), release: Notify::new() });
+        let backend = Arc::new(GatedBackend {
+            inner: MemoryBackend::new("pw"),
+            entered: Notify::new(),
+            release: Notify::new(),
+            unlocks: AtomicU64::new(0),
+        });
         if let Some(item) = seed {
             backend.inner.unlock("pw").await.unwrap();
             backend.inner.put_item(&item).await.unwrap();

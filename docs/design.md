@@ -437,14 +437,20 @@ Unchanged from `legacy`:
   attempts) on the first request or `bwss unlock`. Failed CLI unlocks (a
   wrong `--password-stdin`, or a `bwss unlock` prompt that ends locked) are
   delayed 2 s: attempts take turns and the delay never holds the interactive
-  unlock. This is a speed bump against other processes of the
+  unlock. A `--password-stdin` while the keyring is already unlocked
+  succeeds at once: the password is not tried, so there is nothing to
+  delay. This is a speed bump against other processes of the
   same user, not a defence against one that can also read the bus.
 - Per bus client: at most 64 sessions (its oldest is closed first; 4096 in
   all) and 16 outstanding prompts (its oldest
   unstarted one is dismissed). Only the bus name that opened a session may
-  close it. When a client leaves the bus its sessions and prompts are freed; at
-  the global limit, departed clients are reaped first, then the oldest session
-  of the client holding the most is closed.
+  close it, and only the bus name that asked for a prompt may start or
+  dismiss it (prompt paths are predictable). When a client leaves the bus
+  its sessions and prompts are freed. A prompt it already started is
+  cancelled too: its action (an item to create, with its secret) is
+  dropped, while a password dialog already on screen may still unlock the
+  keyring. At the global limit, departed clients are reaped first, then the
+  oldest session of the client holding the most is closed.
 - Lock on request, after `lock_timeout_minutes` (default 60), and on SIGTERM: keys and
   decrypted items are zeroized, the API session is dropped.
   `lock_timeout_minutes = 0` turns off the idle lock only.

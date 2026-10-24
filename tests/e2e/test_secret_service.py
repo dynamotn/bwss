@@ -346,3 +346,78 @@ def test_sessions_and_prompts_of_a_departed_client_are_freed(memory_daemon, bus)
         time.sleep(0.1)
     assert not _object_exists(bus, session)
     assert not _object_exists(bus, prompt)
+
+
+# --- prompts belong to the client that asked (R7) -------------------------------------
+
+PROMPT_IFACE = "org.freedesktop.Secret.Prompt"
+
+
+def _error_name(reply):
+    from jeepney import HeaderFields
+
+    return reply.header.fields.get(HeaderFields.error_name)
+
+
+def _wait_until(check, tries=100):
+    for _ in range(tries):
+        if check():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_only_the_client_that_asked_may_start_its_prompt(memory_daemon, bus, other_bus):
+    d = memory_daemon
+    d.pinentry(pins=[PASSWORD], delay=1)
+    prompt = _call(bus, SVC, "org.freedesktop.Secret.Service", "Unlock", "ao", ([LOGIN],)).body[1]
+    for member in ("Prompt", "Dismiss"):
+        sig, body = ("s", ("",)) if member == "Prompt" else ("", ())
+        stolen = _call(other_bus, prompt, PROMPT_IFACE, member, sig, body)
+        assert stolen.header.message_type.name == "error", member
+        assert _error_name(stolen) == "org.freedesktop.Secret.Error.AccessDenied", stolen.body
+    assert not [p for p in d.prompts() if p.startswith("GETPIN")], "nothing was asked"
+    assert _object_exists(bus, prompt)
+    # The client that asked still can, once.
+    own = _call(bus, prompt, PROMPT_IFACE, "Prompt", "s", ("",))
+    assert own.header.message_type.name == "method_return", own.body
+    again = _call(bus, prompt, PROMPT_IFACE, "Prompt", "s", ("",))
+    assert again.header.message_type.name == "error" and "already used" in again.body[0], again.body
+    assert _wait_until(lambda: d.cli("status").stdout.startswith("unlocked"))
+
+
+def test_a_started_prompt_is_cancelled_when_its_client_leaves(memory_daemon, bus):
+    import secretstorage as ss
+
+    d = memory_daemon
+    # The user answers only after the client has gone.
+    d.pinentry(pins=[PASSWORD], delay=2)
+    gone = ss.dbus_init()
+    session = _open_plain(gone)
+    props = {
+        "org.freedesktop.Secret.Item.Label": ("s", "left behind"),
+        "org.freedesktop.Secret.Item.Attributes": ("a{ss}", {"cancel": "me"}),
+    }
+    created = _call(gone, LOGIN, "org.freedesktop.Secret.Collection", "CreateItem", "a{sv}(oayays)b",
+                    (props, (session, b"", b"pending", "text/plain"), False))
+    item, prompt = created.body
+    assert item == "/" and prompt != "/", created.body
+    started = _call(gone, prompt, PROMPT_IFACE, "Prompt", "s", ("",))
+    assert started.header.message_type.name == "method_return", started.body
+    gone.close()
+    # The password still unlocks the keyring, but the departed client's item
+    # is never written.
+    assert _wait_until(lambda: d.cli("status").stdout.startswith("unlocked"))
+    time.sleep(0.5)
+    assert not list(secretstorage.search_items(bus, {"cancel": "me"}))
+    assert not _object_exists(bus, prompt)
+
+
+def test_a_password_for_an_unlocked_keyring_is_not_tried(memory_daemon):
+    d = memory_daemon
+    unlock(d)
+    start = time.monotonic()
+    r = d.cli("unlock", "--password-stdin", input="wrong\n", check=False)
+    assert r.returncode == 0 and "unlocked" in r.stdout, r.stderr
+    assert time.monotonic() - start < 2, "no penalty"
+    assert d.cli("status").stdout.startswith("unlocked")
