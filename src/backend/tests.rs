@@ -446,7 +446,8 @@ async fn offline_writes_queue_merge_and_replay() {
     // Two changes of one item are one queued patch.
     assert_eq!((v.queued().await, v.queue_file()), (1, 1));
     let raw = std::fs::read_to_string(v.dir.join("state/queue.json")).unwrap();
-    assert!(!raw.contains("two") && !raw.contains("gh"));
+    // Quoted: a two-letter id may occur in base64 by chance.
+    assert!(!raw.contains("two") && !raw.contains("\"gh\""));
     // Too large: refused now, never queued.
     item.label = "x".repeat(4_000);
     assert!(matches!(v.backend.put_item(&item).await, Err(BackendError::Rejected(_))));
@@ -562,6 +563,32 @@ async fn queued_changes_wait_for_unreadable_items_and_drop_for_gone_ones() {
     v.backend.refresh().await.unwrap();
     assert_eq!(v.queued().await, 0);
     assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "queued");
+}
+
+#[tokio::test]
+async fn an_unrelated_unreadable_item_never_holds_the_queue() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k).await;
+    v.fake.with(|s| s.down = true);
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queued().await, 1);
+
+    // c1 is trashed elsewhere and c2, another item, becomes unreadable.
+    v.fake.with(|s| {
+        s.down = false;
+        s.rev += 1;
+        let rev = s.revision();
+        s.find("c1").unwrap()["deletedDate"] = json!(rev);
+        let c2 = s.find("c2").unwrap();
+        c2["key"] = json!("2.AAAA|AAAA|AAAA");
+        c2["revisionDate"] = json!(rev);
+    });
+    // Also after a new unlock, when nothing is held yet.
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!((v.queued().await, v.queue_file()), (0, 0), "the change to the trashed item is dropped");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

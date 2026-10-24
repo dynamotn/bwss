@@ -19,10 +19,12 @@ use super::registry::Entry;
 
 const FORMAT: u64 = 2;
 
+/// A queued write. A delete's `cipher_id` is the cipher it was read from,
+/// when known.
 pub enum Op {
     Create { id: String, collection: String, item: ItemData },
     Patch(Patch),
-    Delete { id: String, base_revision: String },
+    Delete { id: String, base_revision: String, cipher_id: Option<String> },
     Registry { collection: String, entry: Entry },
 }
 
@@ -86,10 +88,23 @@ impl From<SealedItem> for ItemData {
 
 #[derive(Serialize, Deserialize)]
 enum SealedOp {
-    Create { id: String, collection: String, item: SealedItem },
+    Create {
+        id: String,
+        collection: String,
+        item: SealedItem,
+    },
     Patch(Patch),
-    Delete { id: String, base_revision: String },
-    Registry { collection: String, entry: Entry },
+    Delete {
+        id: String,
+        base_revision: String,
+        /// Absent in queues written before it was recorded.
+        #[serde(default)]
+        cipher_id: Option<String>,
+    },
+    Registry {
+        collection: String,
+        entry: Entry,
+    },
 }
 
 impl From<&Op> for SealedOp {
@@ -99,7 +114,9 @@ impl From<&Op> for SealedOp {
                 Self::Create { id: id.clone(), collection: collection.clone(), item: item.into() }
             }
             Op::Patch(p) => Self::Patch(p.clone()),
-            Op::Delete { id, base_revision } => Self::Delete { id: id.clone(), base_revision: base_revision.clone() },
+            Op::Delete { id, base_revision, cipher_id } => {
+                Self::Delete { id: id.clone(), base_revision: base_revision.clone(), cipher_id: cipher_id.clone() }
+            }
             Op::Registry { collection, entry } => {
                 Self::Registry { collection: collection.clone(), entry: entry.clone() }
             }
@@ -112,7 +129,7 @@ impl From<SealedOp> for Op {
         match op {
             SealedOp::Create { id, collection, item } => Self::Create { id, collection, item: item.into() },
             SealedOp::Patch(p) => Self::Patch(p),
-            SealedOp::Delete { id, base_revision } => Self::Delete { id, base_revision },
+            SealedOp::Delete { id, base_revision, cipher_id } => Self::Delete { id, base_revision, cipher_id },
             SealedOp::Registry { collection, entry } => Self::Registry { collection, entry },
         }
     }
@@ -201,7 +218,7 @@ mod tests {
         let key = SymmetricKey::generate();
         let ops = vec![
             Op::Create { id: "id-7f3a-unique".into(), collection: "default".into(), item: item() },
-            Op::Delete { id: "id-7f3a-unique".into(), base_revision: "rev".into() },
+            Op::Delete { id: "id-7f3a-unique".into(), base_revision: "rev".into(), cipher_id: Some("c9".into()) },
             Op::Registry {
                 collection: "c".into(),
                 entry: Entry { label: "label-xyzzy-unique".into(), created: 3, deleted: false },
@@ -223,7 +240,9 @@ mod tests {
             }
             _ => panic!("wrong op"),
         }
-        assert!(matches!(&back[1], Op::Delete { base_revision, .. } if base_revision == "rev"));
+        assert!(
+            matches!(&back[1], Op::Delete { base_revision, cipher_id, .. } if base_revision == "rev" && cipher_id.as_deref() == Some("c9"))
+        );
         assert!(matches!(&back[2], Op::Registry { entry, .. } if entry.created == 3));
         assert!(unseal(&sealed, &SymmetricKey::generate()).is_err());
         assert!(matches!(unseal(&serde_json::json!({"ops": "x"}), &key), Err(CryptoError::Malformed)));
@@ -309,11 +328,13 @@ mod tests {
                 base_mark: [7; 32],
                 owned: false,
             },
+            cipher_id: Some("c1".into()),
         };
         let back = unseal(&seal(&[Op::Patch(patch)], &key), &key).unwrap();
         match &back[0] {
             Op::Patch(p) => {
                 assert_eq!((p.id.as_str(), p.base_revision.as_str()), ("pid", "r1"));
+                assert_eq!(p.cipher_id.as_deref(), Some("c1"));
                 assert_eq!(p.set, vec![("bwss:label".to_string(), "l".to_string(), false)]);
                 assert_eq!(p.acl_add, vec!["/bin/a".to_string()]);
                 assert!(
@@ -325,9 +346,20 @@ mod tests {
     }
 
     #[test]
+    fn ops_queued_before_cipher_ids_still_open() {
+        let key = SymmetricKey::generate();
+        let old = br#"[{"Delete":{"id":"a","base_revision":"r"}},
+            {"Patch":{"id":"b","base_revision":"r","set":[],"remove":[],"acl_add":[],"value":"Keep"}}]"#;
+        let file = serde_json::json!({ "format": 2, "ops": key.encrypt(old) });
+        let back = unseal(&file, &key).unwrap();
+        assert!(matches!(&back[0], Op::Delete { cipher_id: None, .. }));
+        assert!(matches!(&back[1], Op::Patch(p) if p.cipher_id.is_none()));
+    }
+
+    #[test]
     fn tampered_ciphertext_is_rejected() {
         let key = SymmetricKey::generate();
-        let mut sealed = seal(&[Op::Delete { id: "a".into(), base_revision: "r".into() }], &key);
+        let mut sealed = seal(&[Op::Delete { id: "a".into(), base_revision: "r".into(), cipher_id: None }], &key);
         let mut enc = sealed["ops"].as_str().unwrap().to_string();
         let last = enc.pop().unwrap();
         enc.push(if last == 'A' { 'B' } else { 'A' });

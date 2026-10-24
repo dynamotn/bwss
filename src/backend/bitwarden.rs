@@ -818,7 +818,7 @@ mod tests {
         new.id = "n".into();
         let queue = vec![
             Op::Create { id: "n".into(), collection: "login".into(), item: new },
-            Op::Delete { id: "b".into(), base_revision: REV.into() },
+            Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) },
         ];
         let b = build_fresh(&s, &queue, &k, None);
         assert_eq!(item_ids(&b), ["a", "n"]);

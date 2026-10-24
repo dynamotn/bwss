@@ -41,6 +41,10 @@ pub struct Patch {
     /// ACL lines, merged as a union.
     pub acl_add: Vec<String>,
     pub value: ValueChange,
+    /// The cipher the patch was read from; `None` in queues written before
+    /// it was recorded, or for an item not on the server yet.
+    #[serde(default)]
+    pub cipher_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -585,6 +589,7 @@ mod tests {
             remove: Vec::new(),
             acl_add: Vec::new(),
             value: ValueChange::Keep,
+            cipher_id: Some(m.cipher_id.clone()),
         }
     }
 

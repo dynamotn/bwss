@@ -85,7 +85,16 @@ pub(crate) fn plan_put(old: Option<&MarkedItem>, new: &ItemData) -> Op {
     } else {
         ValueChange::Set { source: old.source, secret: new.secret.to_vec(), base_mark: old.mark, owned: false }
     };
-    Op::Patch(Patch { id: old.item.id.clone(), base_revision: old.revision_date.clone(), set, remove, acl_add, value })
+    let cipher_id = Some(old.cipher_id.clone()).filter(|c| c != QUEUED);
+    Op::Patch(Patch {
+        id: old.item.id.clone(),
+        base_revision: old.revision_date.clone(),
+        set,
+        remove,
+        acl_add,
+        value,
+        cipher_id,
+    })
 }
 
 pub(super) fn is_empty(p: &Patch) -> bool {
@@ -121,7 +130,8 @@ pub(super) fn merge_patches(first: &Patch, mut later: Patch, server: Option<Base
         }
     }
     let value = merged_value(&first.value, std::mem::replace(&mut later.value, ValueChange::Keep), server);
-    Patch { id: first.id.clone(), base_revision: first.base_revision.clone(), set, remove, acl_add, value }
+    let cipher_id = first.cipher_id.clone().or(later.cipher_id.take());
+    Patch { id: first.id.clone(), base_revision: first.base_revision.clone(), set, remove, acl_add, value, cipher_id }
 }
 
 fn merged_value(first: &ValueChange, mut later: ValueChange, server: Option<Base>) -> ValueChange {
@@ -272,7 +282,8 @@ enum Target {
     Gone,
 }
 
-fn locate(state: &Unlocked, id: &str) -> Target {
+/// `cipher_id` is the cipher the op was read from, when the op records it.
+fn locate(state: &Unlocked, id: &str, cipher_id: Option<&str>) -> Target {
     let list = ciphers(&state.sync);
     if let Some(i) = find_marked(list, id, &state.keys, &state.built.unmarked) {
         return Target::Found(list[i].clone());
@@ -283,11 +294,13 @@ fn locate(state: &Unlocked, id: &str) -> Target {
         .marked
         .get(id)
         .is_some_and(|m| m.cipher_id != QUEUED && list.iter().any(|c| id_of(c) == m.cipher_id && live(c)));
-    // After an unlock nothing is held yet: any personal cipher that cannot be
-    // read may be the one. Only a target that is surely gone drops the op.
+    // After an unlock nothing is held yet: the op's own cipher, or for an op
+    // that does not record it any personal cipher, that cannot be read may
+    // be the one. Only a target that is surely gone drops the op.
     let maybe = || {
         list.iter().any(|c| {
-            live(c)
+            cipher_id.is_none_or(|cid| id_of(c) == cid)
+                && live(c)
                 && c.get("organizationId").is_none_or(Value::is_null)
                 && !cache_key(c).is_some_and(|k| state.built.unmarked.contains(&k))
                 && matches!(scan(c, &state.keys), Scan::Uninspectable(_))
@@ -298,7 +311,7 @@ fn locate(state: &Unlocked, id: &str) -> Target {
 
 /// The base of the cached server copy of item `id`, when it can be read.
 fn server_base(state: &Unlocked, id: &str) -> Option<Base> {
-    let Target::Found(cipher) = locate(state, id) else { return None };
+    let Target::Found(cipher) = locate(state, id, None) else { return None };
     match scan(&cipher, &state.keys) {
         Scan::Marked(m) => Some((m.source, m.mark)),
         _ => None,
@@ -378,7 +391,7 @@ impl BitwardenBackend {
         match op {
             Op::Create { item, .. } => self.run_create(item).await,
             Op::Patch(patch) => self.run_patch(patch).await,
-            Op::Delete { id, .. } => self.run_delete(id).await,
+            Op::Delete { id, cipher_id, .. } => self.run_delete(id, cipher_id.as_deref()).await,
             Op::Registry { collection, entry } => self.run_registry(collection, entry).await,
         }
     }
@@ -411,7 +424,7 @@ impl BitwardenBackend {
                 .with_state(|state| {
                     let cipher = match fresh.take() {
                         Some(c) => c,
-                        None => match locate(state, &patch.id) {
+                        None => match locate(state, &patch.id, patch.cipher_id.as_deref()) {
                             Target::Found(c) => c,
                             Target::Held => return Err(Failure::Wait(format!("item {} cannot be read now", patch.id))),
                             Target::Gone => return Err(Failure::Gone),
@@ -435,14 +448,14 @@ impl BitwardenBackend {
 
     /// Design §5.4: strip, save, then trash only what the server's answer
     /// shows to be bwss's alone.
-    async fn run_delete(&self, id: &str) -> Result<Effect, Failure> {
+    async fn run_delete(&self, id: &str, cipher_id: Option<&str>) -> Result<Effect, Failure> {
         let mut fresh: Option<Value> = None;
         for _ in 0..ATTEMPTS {
             let step = self
                 .with_state(|state| {
                     let cipher = match fresh.take() {
                         Some(c) => c,
-                        None => match locate(state, id) {
+                        None => match locate(state, id, cipher_id) {
                             Target::Found(c) => c,
                             Target::Held => return Err(Failure::Wait(format!("item {id} cannot be read now"))),
                             Target::Gone => return Ok(None),
@@ -543,6 +556,7 @@ impl BitwardenBackend {
                             base_mark: mark,
                             owned: false,
                         },
+                        cipher_id: Some(cid.clone()),
                     };
                     let body = apply(&note, &patch, &state.keys).map_err(|e| write_failure(e, &cid))?;
                     Ok(RegistryPlan::Update(cid, body))
@@ -718,7 +732,7 @@ impl BitwardenBackend {
             queue.retain(|op| target_is_not(op, id));
             return self.queue_changed(queue).await;
         }
-        self.submit_locked(queue, Op::Delete { id: id.to_owned(), base_revision }).await
+        self.submit_locked(queue, Op::Delete { id: id.to_owned(), base_revision, cipher_id: Some(cid) }).await
     }
 
     pub(super) async fn create_collection_locked(
@@ -1012,6 +1026,7 @@ mod tests {
             remove: vec![],
             acl_add: vec!["/bin/a".into()],
             value: set(ValueSource::LoginPassword, b"1", 1),
+            cipher_id: Some("c1".into()),
         };
         let later = Patch {
             id: "a".into(),
@@ -1020,8 +1035,10 @@ mod tests {
             remove: vec!["bwss:attr:".into(), "bwss:collection".into()],
             acl_add: vec!["/bin/a".into(), "/bin/b".into()],
             value: set(ValueSource::Field, b"2", 2),
+            cipher_id: Some("c1".into()),
         };
-        let mut queue = vec![Op::Patch(first), Op::Delete { id: "other".into(), base_revision: "r".into() }];
+        let mut queue =
+            vec![Op::Patch(first), Op::Delete { id: "other".into(), base_revision: "r".into(), cipher_id: None }];
         // The server still holds what the first change was based on.
         push_op(&mut queue, Op::Patch(later), Some((ValueSource::LoginPassword, [1; 32])));
         assert_eq!(queue.len(), 2);
@@ -1036,7 +1053,7 @@ mod tests {
         assert_eq!(value(&m.value), (ValueSource::LoginPassword, b"2".to_vec(), [1; 32], false));
 
         // Behind a delete of the same item, a patch is not merged.
-        let mut queue = vec![Op::Delete { id: "a".into(), base_revision: "r".into() }];
+        let mut queue = vec![Op::Delete { id: "a".into(), base_revision: "r".into(), cipher_id: None }];
         push_op(&mut queue, Op::Patch(patch(plan_put(Some(&old()), &old().item))), None);
         assert_eq!(queue.len(), 2);
     }
@@ -1053,7 +1070,15 @@ mod tests {
     }
 
     fn value_patch(v: ValueChange) -> Patch {
-        Patch { id: "a".into(), base_revision: "r".into(), set: vec![], remove: vec![], acl_add: vec![], value: v }
+        Patch {
+            id: "a".into(),
+            base_revision: "r".into(),
+            set: vec![],
+            remove: vec![],
+            acl_add: vec![],
+            value: v,
+            cipher_id: None,
+        }
     }
 
     #[test]
