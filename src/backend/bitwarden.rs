@@ -69,6 +69,16 @@ pub(crate) struct Built {
     pub unmarked: HashSet<(String, String)>,
 }
 
+/// Whether a message about `what` is logged for the first time in this
+/// process, so a rebuild does not repeat it. Only a hash is kept.
+fn first_report(what: impl std::hash::Hash) -> bool {
+    use std::hash::Hasher;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<u64>>> = std::sync::OnceLock::new();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    what.hash(&mut h);
+    SEEN.get_or_init(Default::default).lock().map_or(true, |mut seen| seen.insert(h.finish()))
+}
+
 /// Scan-cache key of a cipher; `None` when it has no revision to compare.
 pub(super) fn cache_key(cipher: &Value) -> Option<(String, String)> {
     let id = cipher.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
@@ -145,7 +155,12 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
             },
             Scan::Marked(m) => found.push(*m),
             Scan::Uninspectable(why) => {
-                tracing::warn!("{why}");
+                // Organization items are never read: not worth a warning.
+                if cipher.get("organizationId").is_some_and(|o| !o.is_null()) {
+                    tracing::debug!("{why}");
+                } else if first_report(("uninspectable", &key)) {
+                    tracing::warn!("{why}");
+                }
                 if cid.is_empty() {
                     continue;
                 }
@@ -280,7 +295,11 @@ pub(super) fn with_queue(
                         }
                         list[i] = Value::Object(body);
                     }
-                    Err(e) => tracing::warn!("a queued change cannot be shown: {e}"),
+                    Err(e) => {
+                        if first_report(("unshown", &patch.id, &patch.base_revision)) {
+                            tracing::warn!("a queued change cannot be shown: {e}");
+                        }
+                    }
                 }
             }
             Op::Delete { id, .. } => {
