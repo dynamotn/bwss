@@ -2,7 +2,7 @@
 name = "bwss"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "freedesktop Secret Service (org.freedesktop.secrets) backed by a Bitwarden vault"
 readme = "README.md"
 keywords = ["keyring", "secret-service", "bitwarden", "dbus", "libsecret"]
