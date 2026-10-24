@@ -684,7 +684,8 @@ pub async fn serve(daemon: &Arc<Daemon>) -> zbus::Result<()> {
     daemon.sync_objects().await
 }
 
-/// Frees the sessions and prompts of a client when it leaves the bus.
+/// Pins the process of a client when it joins the bus, and frees its
+/// sessions, prompts and pin when it leaves.
 async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
     use zbus::export::futures_core::Stream;
     let bus = zbus::fdo::DBusProxy::new(daemon.conn()).await?;
@@ -694,8 +695,16 @@ async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
         let mut stream = std::pin::pin!(stream);
         while let Some(signal) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
             let Ok(args) = signal.args() else { continue };
-            if args.new_owner().is_none() && args.name().as_str().starts_with(':') {
-                daemon.drop_owner(args.name().as_str()).await;
+            let name = args.name().as_str();
+            if !name.starts_with(':') {
+                continue;
+            }
+            if args.new_owner().is_none() {
+                daemon.drop_owner(name).await;
+            } else if args.old_owner().is_none() {
+                // A new connection: pin its process now, not at its first call.
+                let (daemon, name) = (daemon.clone(), name.to_owned());
+                tokio::spawn(async move { daemon.name_appeared(&name).await });
             }
         }
     });

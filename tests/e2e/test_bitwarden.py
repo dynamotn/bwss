@@ -340,7 +340,7 @@ def test_a_synced_acl_line_is_confirmed_once_on_this_device(account):
         unlock(d, account)
         # Another client granted secret-tool: the line syncs in, unconfirmed here.
         tool = os.path.realpath(shutil.which("secret-tool"))
-        account.add_login(FOLDER, "Synced grant", "syn-pw", {"bwss:id": "syn", "bwss:attr:syn": "1", "bwss:acl": tool})
+        account.add_login(FOLDER, "Synced grant", "syn-pw", {"bwss:id": "syn-7f3a", "bwss:attr:syn": "1", "bwss:acl": tool})
         d.cli("sync")
         d.pinentry(confirm="always")
         assert d.tool("lookup", "syn", "1").stdout == "syn-pw"
@@ -355,7 +355,7 @@ def test_a_synced_acl_line_is_confirmed_once_on_this_device(account):
         state = d.home / "state" / "dybw" / "tools" / "bwss" / "acl-confirmed"
         sealed = json.loads(state.read_text())
         assert sealed["format"] == 2 and sealed["set"].startswith("2.")
-        assert "secret-tool" not in state.read_text() and "syn" not in state.read_text()
+        assert "secret-tool" not in state.read_text() and "syn-7f3a" not in state.read_text()
         assert (state.stat().st_mode & 0o777) == 0o600
     finally:
         d.stop()

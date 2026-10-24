@@ -106,6 +106,19 @@ impl ConfirmSet {
         self.save();
     }
 
+    /// Keeps only the marks of `lines`, the (bwss:id, ACL line) pairs the
+    /// items hold now, and saves the set when that dropped any: a line
+    /// removed elsewhere and added back later is a new line.
+    pub fn retain<'a>(&mut self, lines: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let current: BTreeSet<String> = lines.into_iter().map(|(id, exe)| self.tag(id, exe)).collect();
+        let before = self.tags.confirmed.len() + self.tags.denied.len();
+        self.tags.confirmed.retain(|t| current.contains(t));
+        self.tags.denied.retain(|t| current.contains(t));
+        if self.tags.confirmed.len() + self.tags.denied.len() != before {
+            self.save();
+        }
+    }
+
     #[expect(clippy::expect_used, reason = "two sets of strings always serialize")]
     fn save(&self) {
         let Some(path) = &self.path else { return };
@@ -202,6 +215,23 @@ mod tests {
         set.set("i", "/x", Mark::Denied);
         assert_eq!(std::fs::read(path(&dir).with_file_name("acl-confirmed.corrupt")).unwrap(), b"not json");
         assert_eq!(ConfirmSet::open(Some(path(&dir)), key).mark("i", "/x"), Mark::Denied);
+    }
+
+    #[test]
+    fn retain_keeps_only_current_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SymmetricKey::generate();
+        let mut set = ConfirmSet::open(Some(path(&dir)), key.clone());
+        set.set("a", "/usr/bin/git", Mark::Confirmed);
+        set.set("a", "/usr/bin/ssh", Mark::Denied);
+        set.set("b", "/usr/bin/git", Mark::Confirmed);
+        set.retain([("a", "/usr/bin/git"), ("c", "/usr/bin/x")]);
+        assert_eq!(set.mark("a", "/usr/bin/git"), Mark::Confirmed);
+        assert_eq!(set.mark("a", "/usr/bin/ssh"), Mark::None, "a denial goes with its line");
+        assert_eq!(set.mark("b", "/usr/bin/git"), Mark::None, "same exe, other item");
+        let again = ConfirmSet::open(Some(path(&dir)), key);
+        assert_eq!(again.mark("a", "/usr/bin/git"), Mark::Confirmed);
+        assert_eq!(again.mark("b", "/usr/bin/git"), Mark::None, "saved");
     }
 
     #[test]

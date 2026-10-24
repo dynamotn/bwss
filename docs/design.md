@@ -324,22 +324,42 @@ changing are never clobbered. Then:
   checks the caller's executable against `bwss:acl`. Anyone else gets a
   fail-closed pinentry confirmation: "Allow / Deny", then "Always allow /
   Only this time". Only an explicit OK grants anything.
-- **Caller identity.** A unique bus name is pinned to the process first
-  seen behind it: pid, start time (`/proc/<pid>/stat` field 22) and
-  executable (`/proc/<pid>/exe`, a ` (deleted)` suffix dropped). The pid
-  comes from `GetConnectionCredentials`: through its `ProcessFD` (a pidfd,
-  read via `/proc/self/fdinfo`, which must still name the same live
-  process after the reads) when the bus provides one, otherwise from
-  `ProcessID`. Every later call re-reads all three; any difference (the
-  pid was reused, or the process exec'd another binary) makes the caller
-  an unknown application. The pin is dropped when the name leaves the bus.
-- **Unknown applications and interpreters** are asked every time with
-  "Allow / Deny" only, and the prompt says why. An interpreter is an
-  executable whose basename is `python*`, `perl*`, `ruby*`, `node`, `deno`,
-  `bun`, `sh`, `bash`, `zsh`, `fish`, `dash`, `lua*`, `php*` or `java`: a
-  grant to it would cover every script it runs. No ACL line ever counts
-  for these callers, they never get one when they create an item, and the
-  old shared `(unknown application)` line grants nothing.
+- **Caller identity.** A unique bus name is pinned to the process behind
+  it: pid, start time (`/proc/<pid>/stat` field 22) and identity (below).
+  The pid comes from `GetConnectionCredentials`: through its `ProcessFD`
+  (a pidfd, read via `/proc/self/fdinfo`, which must still name the same
+  live process after the reads) when the bus provides one, otherwise from
+  `ProcessID`. The pin is taken when the name appears on the bus
+  (`NameOwnerChanged` with no old owner), or at its first call if that
+  comes first. Every call re-reads all three; any difference (the pid was
+  reused, or the process exec'd another binary) makes the caller an
+  unknown application. The pin is dropped when the name leaves the bus;
+  `reap_departed` sweeps any left behind. Without a pidfd, a pid reused
+  between the client's connect and the daemon handling that signal is
+  still taken for the new process: a window of one bus round trip.
+- **Identity.** The executable (`/proc/<pid>/exe`, a ` (deleted)` suffix
+  dropped), unless it is an interpreter: an executable whose basename is
+  `python*`, `perl*`, `ruby*`, `node`, `nodejs`, `deno`, `bun`, `sh`,
+  `bash`, `zsh`, `fish`, `dash`, `busybox`, `lua*`, `php*` or `java`.
+  An interpreter running a script file is that script. The script is the
+  first argument in `/proc/<pid>/cmdline` after the interpreter that is
+  not an option, after `--`, or after value-less flags only (`-u -B -I -O
+  -OO -q -w -x -l`); it is resolved against `/proc/<pid>/cwd`,
+  canonicalized, and must be an existing regular file. The identity, and
+  ACL line, is then `<interpreter>/<script>`: both canonical absolute
+  paths joined by one `/`, so the line holds the only `//` (a canonical
+  path never contains one); prompts show "`<interpreter>` running
+  `<script>`". A script file is treated like an application: "Always
+  allow", creator lines and per-device confirmation all apply. The command
+  line is whatever the process says it is, so a same-user process can
+  claim any script: like the executable, this is a speed bump.
+- **Unknown applications and interpreters without a script file** (any
+  other option, such as `-c`, `-m`, `-e`, `-s`, `-` for stdin, an option
+  with a value, or no script argument) are asked every time with "Allow /
+  Deny" only, and the prompt says why: a grant would cover every such use.
+  No ACL line ever counts for these callers, they never get one when they
+  create an item, and the old shared `(unknown application)` line grants
+  nothing.
 - **Grants are confirmed per device.** "Always allow" appends to
   `bwss:acl` in the item, so it syncs, and a creating app gets the first
   line. But a line counts on a device only once that device confirmed it.
@@ -353,9 +373,14 @@ changing are never clobbered. Then:
   - A line found in the item but not in the set triggers a one-time
     "Allow `<exe>`, granted on another device?" (Allow / Deny). Allow
     records it; Deny records a denial, so that caller is refused on this
-    device without asking until the line changes.
-  - When the caller's line is gone from the item, so is whatever was
-    recorded about it: a line added again later is asked about again.
+    device without asking until the line changes. Only the user's own
+    answer is recorded: a prompt that fails or times out denies that one
+    request and records nothing.
+  - When a line is gone from the item, so is whatever was recorded about
+    it: every keyring rebuild (unlock, a refresh that brings changes)
+    keeps only the tags of the (`bwss:id`, line) pairs the items hold, and
+    a call by a caller whose line is absent drops its tag too. A line
+    revoked elsewhere and added back later is asked about again.
   - A file that is not `format: 2` is set aside. One that cannot be read
     or opened with `K` (another account, damage) reads as empty and is
     never overwritten; decisions then stay in memory until the daemon

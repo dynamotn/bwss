@@ -215,10 +215,10 @@ pub enum Decision {
 pub fn decide(kind: CallerKind, line: Line) -> Decision {
     match (kind, line) {
         (CallerKind::Unknown | CallerKind::Interpreter, _) => Decision::Ask { always: false },
-        (CallerKind::App, Line::Confirmed) => Decision::Allow,
-        (CallerKind::App, Line::Denied) => Decision::Deny,
-        (CallerKind::App, Line::Unconfirmed) => Decision::ConfirmLine,
-        (CallerKind::App, Line::Absent) => Decision::Ask { always: true },
+        (CallerKind::App | CallerKind::Script, Line::Confirmed) => Decision::Allow,
+        (CallerKind::App | CallerKind::Script, Line::Denied) => Decision::Deny,
+        (CallerKind::App | CallerKind::Script, Line::Unconfirmed) => Decision::ConfirmLine,
+        (CallerKind::App | CallerKind::Script, Line::Absent) => Decision::Ask { always: true },
     }
 }
 
@@ -229,13 +229,15 @@ fn ask_text(caller: &str, action: &str, label: &str, kind: CallerKind) -> String
         CallerKind::Interpreter => {
             "\n\nThis program runs scripts and bwss cannot tell them apart, so it asks every time."
         }
-        CallerKind::App => "",
+        CallerKind::App | CallerKind::Script => "",
     };
-    format!("{caller}\n\nwants to {action} the keyring item\n\n\"{label}\"{why}")
+    let who = crate::acl::describe(caller);
+    format!("{who}\n\nwants to {action} the keyring item\n\n\"{label}\"{why}")
 }
 
 /// The text of the one-time question about a line that synced in.
 fn confirm_line_text(caller: &str, action: &str, label: &str) -> String {
+    let caller = crate::acl::describe(caller);
     format!(
         "Allow {caller}, granted on another device?\n\nIt wants to {action} the keyring item\n\n\"{label}\"\n\n\
          This is asked once on this device; a denial is remembered."
@@ -303,6 +305,11 @@ impl Daemon {
     /// Keeps this device's ACL confirmations in `path` instead of memory.
     pub fn set_acl_state_path(&self, path: PathBuf) {
         let _ = self.acl_state_path.set(path);
+    }
+
+    /// Pins a unique name that just appeared on the bus.
+    pub async fn name_appeared(&self, name: &str) {
+        self.identities.appeared(self.conn(), name).await;
     }
 
     /// The executable behind the sender of `header`, or `acl::UNKNOWN`.
@@ -416,6 +423,7 @@ impl Daemon {
     pub async fn unlock_with_password(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
         let snap = self.backend.unlock(password).await?;
         let diff = self.keyring.lock().await.load(snap);
+        self.prune_confirmations().await;
         self.touch();
         self.publish(diff).await;
         tracing::info!("keyring unlocked");
@@ -520,7 +528,9 @@ impl Daemon {
     /// Drops the sessions and prompts of every client no longer on the bus.
     pub async fn reap_departed(&self) {
         let Ok(bus) = zbus::fdo::DBusProxy::new(self.conn()).await else { return };
-        for owner in self.known_owners() {
+        let mut names = self.known_owners();
+        names.extend(self.identities.names());
+        for owner in names {
             let Ok(name) = zbus::names::BusName::try_from(owner.as_str()) else { continue };
             if matches!(bus.name_has_owner(name).await, Ok(false)) {
                 self.drop_owner(&owner).await;
@@ -572,8 +582,9 @@ impl Daemon {
             before = k.item_refs();
             k.lock();
         }
-        *self.confirmed.lock().await = None;
         self.backend.lock().await;
+        // After the backend forgot its keys, so no reader can open the set again.
+        *self.confirmed.lock().await = None;
         let after: BTreeSet<(String, String)> = self.keyring.lock().await.item_refs().into_iter().collect();
         let diff = Diff { deleted: before.into_iter().filter(|r| !after.contains(r)).collect(), ..Default::default() };
         self.publish(diff).await;
@@ -587,6 +598,7 @@ impl Daemon {
         match self.backend.refresh().await {
             Ok(Some(snap)) => {
                 let diff = self.keyring.lock().await.load(snap);
+                self.prune_confirmations().await;
                 self.publish(diff).await;
             }
             Ok(None) => {}
@@ -612,31 +624,36 @@ impl Daemon {
         match decision {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(denied()),
-            Decision::ConfirmLine => {
-                let answer = self.ask(&confirm_line_text(caller, action, &label), false).await;
-                let allowed = answer != Confirm::Deny;
-                self.remember(item_id, caller, if allowed { Mark::Confirmed } else { Mark::Denied }).await;
-                if allowed { Ok(()) } else { Err(denied()) }
-            }
+            Decision::ConfirmLine => match self.ask(&confirm_line_text(caller, action, &label), false).await {
+                // Only the user's own answer is remembered; a prompt that
+                // failed or timed out denies this request and nothing more.
+                None => Err(denied()),
+                Some(Confirm::Deny) => {
+                    self.remember(item_id, caller, Mark::Denied).await;
+                    Err(denied())
+                }
+                Some(Confirm::Once | Confirm::Always) => {
+                    self.remember(item_id, caller, Mark::Confirmed).await;
+                    Ok(())
+                }
+            },
             Decision::Ask { always } => {
                 let text = ask_text(caller, action, &label, crate::acl::kind(caller));
                 match self.ask(&text, always).await {
-                    Confirm::Deny => Err(denied()),
-                    Confirm::Always if always => {
+                    None | Some(Confirm::Deny) => Err(denied()),
+                    Some(Confirm::Always) if always => {
                         self.grant(caller, item_id).await;
                         Ok(())
                     }
-                    Confirm::Once | Confirm::Always => Ok(()),
+                    Some(Confirm::Once | Confirm::Always) => Ok(()),
                 }
             }
         }
     }
 
-    async fn ask(&self, text: &str, offer_always: bool) -> Confirm {
-        self.prompter.confirm(text, offer_always).await.unwrap_or_else(|e| {
-            tracing::warn!("prompt failed: {e}");
-            Confirm::Deny
-        })
+    /// The user's answer; `None` when the prompt failed or timed out.
+    async fn ask(&self, text: &str, offer_always: bool) -> Option<Confirm> {
+        self.prompter.confirm(text, offer_always).await.inspect_err(|e| tracing::warn!("prompt failed: {e}")).ok()
     }
 
     /// The decision for `caller` on the item, and the item's label.
@@ -650,42 +667,66 @@ impl Daemon {
             return Ok((Decision::Allow, label));
         }
         let kind = crate::acl::kind(caller);
-        let line = if kind == CallerKind::App { self.line(caller, item_id, listed).await? } else { Line::Absent };
+        let line = match kind {
+            CallerKind::App | CallerKind::Script => self.line(caller, item_id, listed).await?,
+            CallerKind::Unknown | CallerKind::Interpreter => Line::Absent,
+        };
         Ok((decide(kind, line), label))
+    }
+
+    /// Runs `f` on this device's confirmation set, opening it if needed.
+    /// `Ok(None)` when the backend's lines need no confirmation. The key is
+    /// asked for under the set's lock, so a lock in between cannot leave a
+    /// set open behind it.
+    async fn with_confirmations<R>(&self, f: impl FnOnce(&mut ConfirmSet) -> R) -> Result<Option<R>, BackendError> {
+        let mut guard = self.confirmed.lock().await;
+        let key = match self.backend.acl_trust().await? {
+            AclTrust::Local => return Ok(None),
+            AclTrust::PerDevice(key) => key,
+        };
+        let set = guard.get_or_insert_with(|| ConfirmSet::open(self.acl_state_path.get().cloned(), key));
+        Ok(Some(f(set)))
     }
 
     /// The state of `caller`'s line in the item on this device. When the line
     /// is gone from the item, so is whatever this device decided about it.
     async fn line(&self, caller: &str, item_id: &str, listed: bool) -> SResult<Line> {
-        let key = match self.backend.acl_trust().await? {
-            AclTrust::Local => return Ok(if listed { Line::Confirmed } else { Line::Absent }),
-            AclTrust::PerDevice(key) => key,
-        };
-        let mut guard = self.confirmed.lock().await;
-        let set = guard.get_or_insert_with(|| ConfirmSet::open(self.acl_state_path.get().cloned(), key));
-        Ok(match (listed, set.mark(item_id, caller)) {
-            (true, Mark::Confirmed) => Line::Confirmed,
-            (true, Mark::Denied) => Line::Denied,
-            (true, Mark::None) => Line::Unconfirmed,
-            (false, Mark::None) => Line::Absent,
-            (false, Mark::Confirmed | Mark::Denied) => {
-                set.set(item_id, caller, Mark::None);
-                Line::Absent
-            }
-        })
+        let state = self
+            .with_confirmations(|set| match (listed, set.mark(item_id, caller)) {
+                (true, Mark::Confirmed) => Line::Confirmed,
+                (true, Mark::Denied) => Line::Denied,
+                (true, Mark::None) => Line::Unconfirmed,
+                (false, Mark::None) => Line::Absent,
+                (false, Mark::Confirmed | Mark::Denied) => {
+                    set.set(item_id, caller, Mark::None);
+                    Line::Absent
+                }
+            })
+            .await?;
+        Ok(state.unwrap_or(if listed { Line::Confirmed } else { Line::Absent }))
     }
 
     /// Records this device's decision about `caller`'s line in the item.
     async fn remember(&self, item_id: &str, caller: &str, mark: Mark) {
-        match self.backend.acl_trust().await {
-            Ok(AclTrust::PerDevice(key)) => {
-                let mut guard = self.confirmed.lock().await;
-                guard
-                    .get_or_insert_with(|| ConfirmSet::open(self.acl_state_path.get().cloned(), key))
-                    .set(item_id, caller, mark);
-            }
-            Ok(AclTrust::Local) => {}
-            Err(e) => tracing::info!("access decision not recorded: {e}"),
+        if let Err(e) = self.with_confirmations(|set| set.set(item_id, caller, mark)).await {
+            tracing::info!("access decision not recorded: {e}");
+        }
+    }
+
+    /// Drops the decisions about lines no item holds any more, after the
+    /// keyring was rebuilt from the backend.
+    async fn prune_confirmations(&self) {
+        let lines: Vec<(String, String)> = {
+            let k = self.keyring.lock().await;
+            k.item_refs()
+                .iter()
+                .filter_map(|(_, id)| k.item(id))
+                .flat_map(|i| i.acl.iter().map(|l| (i.id.clone(), l.clone())))
+                .collect()
+        };
+        let pruned = self.with_confirmations(|set| set.retain(lines.iter().map(|(i, l)| (i.as_str(), l.as_str()))));
+        if let Err(e) = pruned.await {
+            tracing::info!("access decisions not pruned: {e}");
         }
     }
 
@@ -776,9 +817,12 @@ impl Daemon {
                 content_type,
                 created: t,
                 modified: t,
-                // Only an identified executable gets a line: an interpreter's
-                // would cover every script it runs.
-                acl: if crate::acl::kind(caller) == CallerKind::App { vec![caller.to_owned()] } else { vec![] },
+                // Only an identified executable or script file gets a line: a
+                // bare interpreter's would cover every script it runs.
+                acl: match crate::acl::kind(caller) {
+                    CallerKind::App | CallerKind::Script => vec![caller.to_owned()],
+                    CallerKind::Unknown | CallerKind::Interpreter => vec![],
+                },
             },
         };
         let is_new = self.keyring.lock().await.item(&item.id).is_none();
@@ -1155,6 +1199,10 @@ mod tests {
         assert_eq!(decide(App, Line::Confirmed), Decision::Allow);
         assert_eq!(decide(App, Line::Denied), Decision::Deny);
         assert_eq!(decide(App, Line::Unconfirmed), Decision::ConfirmLine);
+        // A script file is an application of its own.
+        for line in [Line::Absent, Line::Confirmed, Line::Denied, Line::Unconfirmed] {
+            assert_eq!(decide(CallerKind::Script, line), decide(App, line), "{line:?}");
+        }
     }
 
     #[test]
@@ -1183,7 +1231,9 @@ mod tests {
             self.inner.lock().await;
         }
         async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
-            self.inner.refresh().await
+            // Every refresh brings a new snapshot, as a sync with changes would.
+            self.inner.refresh().await?;
+            Ok(Some(self.inner.unlock("pw").await?))
         }
         async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
             self.inner.create_collection(label).await
@@ -1214,26 +1264,32 @@ mod tests {
 
     impl ScriptedPinentry {
         fn new(allow: bool) -> Self {
+            let answer = if allow { "OK" } else { "ERR 83886179 Operation cancelled" };
+            Self::with_body(&format!(
+                "echo OK\nwhile IFS= read -r l; do\n  printf '%s\\n' \"$l\" >> \"$0.log\"\n  case \"$l\" in\n    CONFIRM*) echo '{answer}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n"
+            ))
+        }
+
+        /// A pinentry running the shell `body`; `$0.log` is its log.
+        fn with_body(body: &str) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("log");
-            let answer = if allow { "OK" } else { "ERR 83886179 Operation cancelled" };
-            let script = format!(
-                "#!/bin/sh\necho OK\nwhile IFS= read -r l; do\n  printf '%s\\n' \"$l\" >> '{}'\n  case \"$l\" in\n    CONFIRM*) echo '{answer}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n",
-                log.display()
-            );
             let path = dir.path().join("pinentry");
-            std::fs::write(&path, script).unwrap();
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             ScriptedPinentry { dir }
         }
 
         fn prompter(&self) -> Prompter {
-            Prompter::new(self.dir.path().join("pinentry").to_string_lossy(), Duration::from_secs(10))
+            self.prompter_with_timeout(Duration::from_secs(10))
+        }
+
+        fn prompter_with_timeout(&self, timeout: Duration) -> Prompter {
+            Prompter::new(self.dir.path().join("pinentry").to_string_lossy(), timeout)
         }
 
         fn log(&self) -> Vec<String> {
-            std::fs::read_to_string(self.dir.path().join("log"))
+            std::fs::read_to_string(self.dir.path().join("pinentry.log"))
                 .map(|t| t.lines().map(str::to_owned).collect())
                 .unwrap_or_default()
         }
@@ -1247,14 +1303,14 @@ mod tests {
 
     /// A daemon over a synced backend holding `stored_item("x")` with `acl`,
     /// keeping its confirmations in `state`.
-    async fn synced_daemon(acl: &[&str], pinentry: &ScriptedPinentry, state: &std::path::Path) -> Arc<Daemon> {
+    async fn synced_daemon(acl: &[&str], prompter: Prompter, state: &std::path::Path) -> Arc<Daemon> {
         let backend =
             SyncedBackend { inner: MemoryBackend::new("pw"), key: crate::bw::crypto::SymmetricKey::generate() };
         backend.inner.unlock("pw").await.unwrap();
         let mut item = stored_item("x");
         item.acl = acl.iter().map(|s| (*s).to_owned()).collect();
         backend.inner.put_item(&item).await.unwrap();
-        let d = Daemon::new(Keyring::new(None), Arc::new(backend), pinentry.prompter(), Config::default());
+        let d = Daemon::new(Keyring::new(None), Arc::new(backend), prompter, Config::default());
         d.set_acl_state_path(state.join("acl-confirmed"));
         d.unlock_with_password("pw").await.unwrap();
         d
@@ -1264,7 +1320,7 @@ mod tests {
     async fn a_synced_line_is_confirmed_once_per_device() {
         let state = tempfile::tempdir().unwrap();
         let pin = ScriptedPinentry::new(true);
-        let d = synced_daemon(&[GIT], &pin, state.path()).await;
+        let d = synced_daemon(&[GIT], pin.prompter(), state.path()).await;
         d.authorize(GIT, "x", "read").await.unwrap();
         assert_eq!(pin.confirms(), 1, "exactly one question, with no 'Always allow' step");
         assert!(pin.log().iter().any(|l| l.contains("granted on another device")), "{:?}", pin.log());
@@ -1274,16 +1330,80 @@ mod tests {
         assert!(state.path().join("acl-confirmed").exists());
         // Locking drops the set with its key; it comes back from the file.
         d.lock().await;
+        assert!(d.confirmed.lock().await.is_none(), "the set goes with the key");
         d.unlock_with_password("pw").await.unwrap();
         d.authorize(GIT, "x", "read").await.unwrap();
         assert_eq!(pin.confirms(), 1);
+    }
+
+    /// The test backend's stored copy of item "x" with its ACL set to `acl`.
+    async fn set_stored_acl(d: &Daemon, acl: &[&str]) {
+        let mut item = d.keyring.lock().await.item("x").cloned().unwrap();
+        item.acl = acl.iter().map(|s| (*s).to_owned()).collect();
+        d.backend.put_item(&item).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_line_removed_and_added_back_elsewhere_is_asked_about_again() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let d = synced_daemon(&[GIT], pin.prompter(), state.path()).await;
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 1);
+        // Another device revokes the grant, then someone adds it back; git
+        // makes no call in between.
+        set_stored_acl(&d, &[]).await;
+        d.refresh().await;
+        set_stored_acl(&d, &[GIT]).await;
+        d.refresh().await;
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2, "the re-added line is a new line");
+    }
+
+    #[tokio::test]
+    async fn a_failed_prompt_denies_without_recording_a_denial() {
+        let state = tempfile::tempdir().unwrap();
+        let exits = ScriptedPinentry::with_body("exit 3\n");
+        let hangs = ScriptedPinentry::with_body("echo OK\nsleep 30\n");
+        for prompter in [
+            Prompter::new("/nonexistent/bwss-pinentry", Duration::from_secs(5)),
+            exits.prompter(),
+            hangs.prompter_with_timeout(Duration::from_millis(300)),
+        ] {
+            let d = synced_daemon(&[GIT], prompter, state.path()).await;
+            assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
+            let mark = d.confirmed.lock().await.as_ref().map(|s| s.mark("x", GIT));
+            assert_eq!(mark, Some(Mark::None), "only the user's own Deny is remembered");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_script_file_gets_always_allow_and_its_own_line() {
+        let state = tempfile::tempdir().unwrap();
+        let script = "/usr/bin/python3//home/u/bin/backup.py";
+        let pin = ScriptedPinentry::new(true);
+        let d = synced_daemon(&[], pin.prompter(), state.path()).await;
+        d.authorize(script, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2, "allow, then remember");
+        assert!(pin.log().iter().any(|l| l == "SETOK Always allow"));
+        assert!(
+            pin.log().iter().any(|l| l.contains("/usr/bin/python3 running /home/u/bin/backup.py")),
+            "{:?}",
+            pin.log()
+        );
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().acl, [script]);
+        d.authorize(script, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2);
+        // Another script of the same interpreter is someone else.
+        d.authorize("/usr/bin/python3//home/u/bin/other.py", "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 4);
     }
 
     #[tokio::test]
     async fn a_denied_synced_line_stays_denied_without_asking_until_it_changes() {
         let state = tempfile::tempdir().unwrap();
         let pin = ScriptedPinentry::new(false);
-        let d = synced_daemon(&[GIT], &pin, state.path()).await;
+        let d = synced_daemon(&[GIT], pin.prompter(), state.path()).await;
         assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
         assert_eq!(pin.confirms(), 1);
         assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
@@ -1309,7 +1429,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let pin = ScriptedPinentry::new(true);
         let python = "/usr/bin/python3.13";
-        let d = synced_daemon(&[python, crate::acl::UNKNOWN], &pin, state.path()).await;
+        let d = synced_daemon(&[python, crate::acl::UNKNOWN], pin.prompter(), state.path()).await;
         for caller in [python, crate::acl::UNKNOWN] {
             let before = pin.confirms();
             d.authorize(caller, "x", "read").await.unwrap();
@@ -1327,7 +1447,7 @@ mod tests {
     async fn always_allow_lists_and_confirms_the_app_here() {
         let state = tempfile::tempdir().unwrap();
         let pin = ScriptedPinentry::new(true);
-        let d = synced_daemon(&[], &pin, state.path()).await;
+        let d = synced_daemon(&[], pin.prompter(), state.path()).await;
         d.authorize(GIT, "x", "read").await.unwrap();
         assert_eq!(pin.confirms(), 2, "allow, then remember");
         assert!(pin.log().iter().any(|l| l == "SETOK Always allow"));
@@ -1340,7 +1460,7 @@ mod tests {
     async fn the_creator_is_confirmed_unless_it_is_an_interpreter() {
         let state = tempfile::tempdir().unwrap();
         let pin = ScriptedPinentry::new(false);
-        let d = synced_daemon(&[], &pin, state.path()).await;
+        let d = synced_daemon(&[], pin.prompter(), state.path()).await;
         let new = |label: &str| NewItem {
             label: label.into(),
             attributes: Attributes::from([("app".to_owned(), label.to_owned())]),
@@ -1352,6 +1472,13 @@ mod tests {
         let (_, git_id) = parse_path(git_path.as_str()).unwrap();
         d.authorize(GIT, &git_id.unwrap(), "read").await.unwrap();
         assert_eq!(pin.confirms(), 0, "the creator needs no question");
+
+        let script = "/usr/bin/python3//home/u/tool.py";
+        let script_path = d.create_item(LOGIN_COLLECTION, new("script"), script).await.unwrap();
+        let script_id = parse_path(script_path.as_str()).unwrap().1.unwrap();
+        assert_eq!(d.keyring.lock().await.item(&script_id).unwrap().acl, [script]);
+        d.authorize(script, &script_id, "read").await.unwrap();
+        assert_eq!(pin.confirms(), 0, "a script file is recorded as the creator");
 
         let py_path = d.create_item(LOGIN_COLLECTION, new("py"), "/usr/bin/python3").await.unwrap();
         let py_id = parse_path(py_path.as_str()).unwrap().1.unwrap();

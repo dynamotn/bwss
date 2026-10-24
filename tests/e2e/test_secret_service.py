@@ -6,6 +6,7 @@ DH-encrypted session), and the bwss CLI.
 
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -174,6 +175,42 @@ def test_interpreters_are_never_offered_always_allow(memory_daemon, bus):
     with pytest.raises(Exception):
         item.get_secret()
     assert confirms(d) == 2
+
+
+SCRIPT = """
+import sys
+import secretstorage
+
+bus = secretstorage.dbus_init()
+coll = secretstorage.get_default_collection(bus)
+if sys.argv[-1] == "store":
+    coll.create_item("by script", {"script": "e2e"}, b"from-script")
+else:
+    item = next(iter(coll.search_items({"script": "e2e"})))
+    sys.stdout.write(item.get_secret().decode())
+"""
+
+
+def test_a_script_file_is_an_application_of_its_own(memory_daemon):
+    d = memory_daemon
+    unlock(d)
+    script = d.home / "keyring_script.py"
+    script.write_text(SCRIPT)
+    run = lambda *argv: subprocess.run([sys.executable, *argv], env=d.env, capture_output=True, text=True)
+
+    # The script creates the item, so it is the creator: later runs read it freely.
+    assert run(str(script), "store").returncode == 0
+    d.pinentry(confirm="deny")
+    read = run(str(script), "read")
+    assert read.returncode == 0 and read.stdout == "from-script", read.stderr
+    assert confirms(d) == 0, d.prompts()
+
+    # The same code from `python -c` is no script file: asked, and never "Always allow".
+    inline = run("-c", SCRIPT, "read")
+    assert inline.returncode != 0
+    assert confirms(d) == 1, d.prompts()
+    assert any(p.startswith("SETDESC") and "runs scripts" in p for p in d.prompts())
+    assert not any("Always allow" in p for p in d.prompts())
 
 
 def test_unlock_with_password_only_from_the_bwss_cli(memory_daemon, bus):
