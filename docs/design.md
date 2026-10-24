@@ -1,6 +1,6 @@
 # bwss — redesign
 
-This design follows the **dybw data model, version 1**
+This design follows the **dybw data model, version 1.1**
 (`docs/data-model.md` in the dybw umbrella repository). That spec is
 normative and wins over this document; this document adds the `bwss`
 namespace's own rules (its fields are registered in dybw's
@@ -92,7 +92,7 @@ These would make it a failure even if every test passed:
 | `bwss:attr:<name>` | text | One lookup attribute each. |
 | `bwss:collection` | text | Collection id; absent means `login` (alias `default`). |
 | `bwss:content-type` | text | Content type of the secret; absent means `text/plain`. |
-| `bwss:encoding` | text | `base64` when the stored secret is base64 of non-UTF-8 bytes. |
+| `bwss:encoding` | text | `base64` when the stored secret is base64 of non-UTF-8 bytes. Valid only with a source bwss owns: `bwss:password`, or the notes with `bwss:location=notes`. |
 | `bwss:location` | text | `notes` when bwss itself moved an oversize secret into the notes (§5.2). |
 | `bwss:acl` | hidden | Executables allowed without asking, one path per line. |
 | `bwss:created` | text | Unix seconds when the item joined the keyring. |
@@ -114,7 +114,11 @@ For a marked item:
   2. the notes, when `bwss:location=notes`;
   3. `login.password` for a login, the notes for a secure note.
 
-  Then base64-decode when `bwss:encoding=base64`. An empty result is a valid
+  Then base64-decode when `bwss:encoding=base64`. That is only valid with
+  source 1 or 2: an item whose source is its login password or a secure
+  note's own text and that carries `bwss:encoding=base64` is invalid. bwss
+  skips it, logs it, lists it in `bwss status`, and never decodes the
+  user's password (spec §5, ADR 0005). An empty result is a valid
   empty secret. bwss remembers the value source of each item; presence, not
   content, decides step 1, so the source does not change when a value
   becomes empty.
@@ -220,8 +224,20 @@ else passes through unchanged.
   So an app rotating the token of a hand-marked login updates that login,
   and the browser and the official clients see the new value. A user who
   wants an app-only value adds a `bwss:password` field to the item.
-- Non-UTF-8 bytes are stored as base64 with `bwss:encoding=base64`;
-  otherwise `bwss:encoding` is removed.
+- **Binary values** (bytes that are not UTF-8) only go where bwss owns the
+  storage (spec §6.1, ADR 0005):
+  - when the source is `bwss:password` or bwss's notes, the value is
+    stored as base64 with `bwss:encoding=base64`;
+  - when the source is the login password or a secure note's own text,
+    bwss instead adds a hidden `bwss:password` holding the base64, and
+    `bwss:encoding=base64`, and leaves the password, its history and the
+    notes untouched. That field is the source from then on (presence
+    rule), so later writes, text or binary, go to it. The size rules below
+    apply to it: a value too large for the field can only go to the notes
+    when they are empty or already hold bwss's secret, which for a
+    hand-marked note usually means the write fails.
+  - Writing text removes `bwss:encoding`; text keeps going back where it
+    was read.
 - **Size** (spec §6.4): Bitwarden limits a field value to 5,000 encrypted
   characters, the login password to 5,000 and the notes to 10,000. A
   value that does not fit `login.password` fails. When a value whose
@@ -511,10 +527,10 @@ No sync happens while locked: the user key and the API token are gone.
 - Concurrent edits of the same item merge field by field (§5.6); the
   registry and `bwss:acl` merge as unions; a value source changed on both
   sides fails the app's write rather than overwriting.
-- bwss keeps no local copy of values beyond the encrypted cache, so the
-  spec's guard against a sync clearing many local secrets at once
-  (spec §10) has nothing to protect here: an item leaving the keyring is
-  still in Bitwarden.
+- The mass-clear guard of spec §10 applies to tools that keep local
+  copies of values. bwss keeps none (it reads values from the encrypted
+  vault cache), so per the spec it has nothing to clear and nothing to
+  guard: an item leaving the keyring is still in Bitwarden.
 
 ## 9. Sessions, prompts and the bus
 
@@ -652,6 +668,13 @@ files that the folder-based bwss (branch `legacy`) wrote:
     `passwordRevisionDate`; everything else, `obsidian:*` and `dybw:*`
     fields included, untouched; a new item never uses the notes; size
     fallback to notes and its refusal when the notes hold user text;
+  - binary values (ADR 0005): a binary write to a hand-marked login
+    creates a hidden `bwss:password` with `bwss:encoding=base64` and
+    leaves `login.password` and its history unchanged; the same on a
+    hand-marked note leaves its text unchanged; a later text write goes to
+    that field and removes `bwss:encoding`; an item whose source is the
+    login password (or a note's text) and that carries
+    `bwss:encoding=base64` is skipped and reported, never decoded;
   - delete: trash versus strip, for each kind of foreign content,
     including another namespace's marker;
   - conflict re-apply keeps a concurrent foreign edit, and fails when the
@@ -665,6 +688,9 @@ files that the folder-based bwss (branch `legacy`) wrote:
     the old one in the history, and the other client sees it;
   - a login with a `bwss:password` field: the app write lands in the
     field and the login password stays;
+  - a binary secret stored on a hand-marked login lands in a new
+    `bwss:password`, and the other client still sees the old login
+    password with an unchanged history;
   - an item carrying both `bwss:id` and `obsidian:id` is not trashed by a
     delete;
   - deleting a hand-marked login strips bwss fields and keeps the item;
