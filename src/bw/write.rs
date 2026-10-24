@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
     A_ID, A_NAME, A_URI, A_USERNAME, F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID,
-    F_LOCATION, F_PASSWORD, field_names, first_index,
+    F_LOCATION, F_PASSWORD, PREFIX, field_names, first_index,
 };
 use super::items::{MAX_NOTES_ENC, MAX_PASSWORD_ENC, RESPONSE_ONLY, format_date, item_key};
 use super::scan::{Keys, Scan, ValueSource, normalize_collection, scan};
@@ -278,11 +278,7 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
     let Some(object) = cipher.as_object() else { return Err(WriteError::Unmarked) };
 
     // 2. Start from the cipher as returned, minus response-only metadata.
-    let mut body: Map<String, Value> = object
-        .iter()
-        .filter(|(k, _)| !RESPONSE_ONLY.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut body = pass_through(object);
     let key = item_key(cipher, &keys.user)?;
     let mut fields = Fields::read(cipher, &key)?;
 
@@ -322,13 +318,85 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
     }
 
     // 6. Everything new was encrypted under the item key above.
+    let revision = cipher.get("revisionDate").and_then(Value::as_str).unwrap_or(&patch.base_revision);
+    finish_body(&mut body, fields, revision);
+    Ok(body)
+}
+
+/// The cipher as returned, minus response-only metadata: the start of every
+/// update body. The item key and all unknown keys stay.
+fn pass_through(object: &Map<String, Value>) -> Map<String, Value> {
+    object.iter().filter(|(k, _)| !RESPONSE_ONLY.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// The end of every update body: the edited fields, a `passwordHistory`
+/// that is always an array, and the revision the write is based on.
+fn finish_body(body: &mut Map<String, Value>, fields: Fields, revision: &str) {
     body.insert("fields".into(), Value::Array(fields.raw));
     if !body.get("passwordHistory").is_some_and(Value::is_array) {
         body.insert("passwordHistory".into(), json!([]));
     }
-    let revision = cipher.get("revisionDate").and_then(Value::as_str).unwrap_or(&patch.base_revision);
     body.insert("lastKnownRevisionDate".into(), json!(revision));
+}
+
+/// Body of the update request that removes every bwss field from `cipher`
+/// (design §5.4 step 1). The notes are cleared when they held bwss's secret
+/// (`bwss:location=notes`); everything else passes through as in `apply`.
+pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteError> {
+    if cipher.get("deletedDate").is_some_and(|d| !d.is_null()) {
+        return Err(WriteError::Gone);
+    }
+    let Some(object) = cipher.as_object() else { return Err(WriteError::Unmarked) };
+    let Some(revision) = cipher.get("revisionDate").and_then(Value::as_str) else {
+        return Err(WriteError::Uninspectable("the item has no revisionDate".into()));
+    };
+    let mut body = pass_through(object);
+    let key = item_key(cipher, &keys.user)?;
+    let mut fields = Fields::read(cipher, &key)?;
+    if fields.value(F_LOCATION)?.is_some_and(|l| l.as_str() == "notes") {
+        body.insert("notes".into(), Value::Null);
+    }
+    fields.remove_prefix(PREFIX);
+    finish_body(&mut body, fields, revision);
     Ok(body)
+}
+
+/// Whether anything in `cipher` is not bwss's (design §5.4, spec §8.2). Only
+/// what the answer needs is decrypted. An item that cannot be read is an
+/// error, never `false`: it must not be trashed.
+pub fn has_foreign_content(cipher: &Value, keys: &Keys) -> Result<bool, WriteError> {
+    let non_empty_array = |v: Option<&Value>| v.and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if non_empty_array(cipher.get("attachments"))
+        || non_empty_array(cipher.get("passwordHistory"))
+        || non_empty_array(cipher.pointer("/login/fido2Credentials"))
+    {
+        return Ok(true);
+    }
+    let key = item_key(cipher, &keys.user)?;
+    if field_names(cipher, &key)?.iter().any(|n| n.as_deref().is_none_or(|n| !n.starts_with(PREFIX))) {
+        return Ok(true);
+    }
+    let filled = |v: Option<&Value>| -> Result<bool, CryptoError> {
+        match v.and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => Ok(!key.decrypt_str(s)?.is_empty()),
+            _ => Ok(false),
+        }
+    };
+    if filled(cipher.get("notes"))? {
+        return Ok(true);
+    }
+    let Some(login) = cipher.get("login").filter(|l| l.is_object()) else { return Ok(false) };
+    for k in ["username", "password", "totp"] {
+        if filled(login.get(k))? {
+            return Ok(true);
+        }
+    }
+    for uri in login.get("uris").and_then(Value::as_array).into_iter().flatten() {
+        if filled(uri.get("uri"))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Body of the create request for a new item: a personal secure note with
@@ -571,7 +639,7 @@ mod tests {
         let body = apply(&c, &set_secret(&c, &k, b"new"), &k).unwrap();
         assert_eq!(dec_with(&k.user, &body["notes"]), "new");
         assert_eq!(body["fields"], c["fields"]);
-        assert_rest_unchanged(&c, &body, &["notes", "passwordHistory"]);
+        assert_rest_unchanged(&c, &body, &["fields", "notes", "passwordHistory"]);
         assert_eq!(body["passwordHistory"], json!([]));
 
         // BwssNotes source: notes change, fields unchanged
@@ -924,5 +992,199 @@ mod tests {
         let m = marked(&as_server(&body), &k);
         assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::BwssNotes, big.as_slice()));
         assert!(matches!(new_note(&item(&[b'x'; 8_000]), None, &k), Err(WriteError::TooLarge)));
+    }
+
+    /// A secure note holding nothing but its name, as bwss leaves one after
+    /// a delete step 1.
+    fn bare(k: &Keys) -> Value {
+        let created = as_server(&new_note(&item(b"s"), Some("f1"), k).unwrap());
+        as_server(&strip(&created, k).unwrap())
+    }
+
+    fn with_field(c: &Value, k: &Keys, name: &str, value: &str) -> Value {
+        let mut c = c.clone();
+        let f = json!({ "type": 0, "name": k.user.encrypt_str(name), "value": k.user.encrypt_str(value), "linkedId": null });
+        c["fields"].as_array_mut().unwrap().push(f);
+        c
+    }
+
+    fn with_key(c: &Value, key: &str, v: Value) -> Value {
+        let mut c = c.clone();
+        c[key] = v;
+        c
+    }
+
+    /// `bare` turned into a login whose `login` object is `login`.
+    fn with_login(c: &Value, login: Value) -> Value {
+        let mut c = with_key(c, "type", json!(1));
+        c["login"] = login;
+        c
+    }
+
+    #[test]
+    fn foreign_content_decides_the_trash() {
+        let k = keys();
+        let e = |s: &str| k.user.encrypt_str(s);
+        let b = bare(&k);
+        assert!(!has_foreign_content(&b, &k).unwrap());
+        for (what, c) in [
+            ("username", with_login(&b, json!({ "username": e("me") }))),
+            ("password", with_login(&b, json!({ "password": e("pw") }))),
+            ("totp", with_login(&b, json!({ "totp": e("otpauth://totp/x") }))),
+            ("uri", with_login(&b, json!({ "uris": [{ "uri": e("https://a.b"), "match": null }] }))),
+            ("second uri", with_login(&b, json!({ "uris": [{ "uri": null }, { "uri": e("https://a.b") }] }))),
+            ("notes", with_key(&b, "notes", json!(e("x")))),
+            ("other namespace", with_field(&b, &k, "obsidian:id", "t")),
+            ("other namespace, empty value", with_field(&b, &k, "obsidian:id", "")),
+            ("no namespace", with_field(&b, &k, "pin", "1")),
+            ("attachment", with_key(&b, "attachments", json!([{}]))),
+            ("passkey", with_login(&b, json!({ "fido2Credentials": [{}] }))),
+            ("history", with_key(&b, "passwordHistory", history(&k.user, 1))),
+        ] {
+            assert!(has_foreign_content(&c, &k).unwrap(), "{what}");
+        }
+
+        // a null field name has no namespace
+        let mut nameless = b.clone();
+        nameless["fields"] = json!([{ "type": 0, "name": null, "value": null }]);
+        assert!(has_foreign_content(&nameless, &k).unwrap(), "null field name");
+
+        // the item name alone does not count, and neither do bwss fields
+        let renamed = with_key(&b, "name", json!(e("Something the user named")));
+        assert!(!has_foreign_content(&renamed, &k).unwrap(), "item name");
+        let mut still_marked = with_field(&b, &k, "bwss:id", "abc");
+        still_marked = with_field(&still_marked, &k, "bwss:attr:x", "y");
+        assert!(!has_foreign_content(&still_marked, &k).unwrap(), "bwss fields");
+
+        // empty after decryption is empty; so are null and absent, and empty lists
+        let empty_login = json!({
+            "username": e(""), "password": null, "totp": e(""),
+            "uris": [{ "uri": e(""), "match": null }, { "uri": null }], "fido2Credentials": [],
+        });
+        let mut c = with_login(&b, empty_login);
+        c["notes"] = json!(e(""));
+        c["attachments"] = json!([]);
+        c["passwordHistory"] = json!([]);
+        assert!(!has_foreign_content(&c, &k).unwrap(), "encrypted empty strings");
+        c["attachments"] = Value::Null;
+        c["passwordHistory"] = Value::Null;
+        c["login"] = Value::Null;
+        assert!(!has_foreign_content(&c, &k).unwrap(), "nulls");
+        let mut no_keys = c.clone();
+        no_keys.as_object_mut().unwrap().remove("login");
+        no_keys.as_object_mut().unwrap().remove("fields");
+        assert!(!has_foreign_content(&no_keys, &k).unwrap(), "absent keys");
+    }
+
+    #[test]
+    fn unreadable_items_are_never_reported_bare() {
+        let k = keys();
+        let other = keys();
+        let b = bare(&k);
+        // each needed value is under a key that is not ours
+        for (what, c) in [
+            ("notes", with_key(&b, "notes", json!(other.user.encrypt_str("x")))),
+            ("username", with_login(&b, json!({ "username": other.user.encrypt_str("x") }))),
+            ("password", with_login(&b, json!({ "password": other.user.encrypt_str("x") }))),
+            ("totp", with_login(&b, json!({ "totp": other.user.encrypt_str("x") }))),
+            ("uri", with_login(&b, json!({ "uris": [{ "uri": other.user.encrypt_str("x") }] }))),
+            (
+                "field name",
+                with_key(
+                    &b,
+                    "fields",
+                    json!([{ "type": 0, "name": other.user.encrypt_str("bwss:id"), "value": null }]),
+                ),
+            ),
+            ("item key", with_key(&b, "key", json!("2.garbage|x|y"))),
+        ] {
+            assert!(matches!(has_foreign_content(&c, &k), Err(WriteError::Crypto(_))), "{what}");
+        }
+        // foreign content found without decrypting wins over an unreadable value
+        let c = with_key(&with_key(&b, "notes", json!(other.user.encrypt_str("x"))), "attachments", json!([{}]));
+        assert!(has_foreign_content(&c, &k).unwrap());
+    }
+
+    #[test]
+    fn strip_removes_bwss_fields_and_bwss_notes_only() {
+        let k = keys();
+
+        // a login the user marked by hand: password and notes are theirs
+        let mut c = login(
+            &k,
+            &[
+                ("bwss:id", "x", false),
+                ("obsidian:id", "t", false),
+                ("bwss:attr:a", "1", false),
+                ("pin", "1", false),
+                ("bwss:id", "dup", false),
+                ("bwss:acl", "/bin/x", true),
+            ],
+            Some("pw"),
+            Some("user text"),
+        );
+        c["passwordHistory"] = history(&k.user, 2);
+        let body = strip(&c, &k).unwrap();
+        assert_eq!(names(&body, &k.user), ["obsidian:id", "pin"]);
+        assert_eq!(body["fields"][0], c["fields"][1], "kept fields are byte for byte");
+        assert_eq!(body["fields"][1], c["fields"][3]);
+        assert_eq!(body["lastKnownRevisionDate"], c["revisionDate"]);
+        assert_rest_unchanged(&c, &body, &["fields"]);
+        assert_eq!(body["notes"], c["notes"]);
+        assert!(has_foreign_content(&as_server(&body), &k).unwrap(), "the user's login stays");
+
+        // bwss:location=notes: the notes held bwss's secret
+        let c = note(
+            &k,
+            &[("bwss:id", "x", false), ("bwss:location", "notes", false), ("pin", "1", false)],
+            Some("secret"),
+        );
+        let body = strip(&c, &k).unwrap();
+        assert_eq!(body["notes"], Value::Null);
+        assert_eq!(names(&body, &k.user), ["pin"]);
+        assert_eq!(body["passwordHistory"], json!([]), "history is always sent");
+        assert_rest_unchanged(&c, &body, &["fields", "notes", "passwordHistory"]);
+
+        // any other location, or an unreadable-looking value, keeps the notes
+        let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", "login", false)], Some("text"));
+        assert_eq!(strip(&c, &k).unwrap()["notes"], c["notes"]);
+
+        // the first bwss:location decides
+        let c = note(
+            &k,
+            &[("bwss:id", "x", false), ("bwss:location", "field", false), ("bwss:location", "notes", false)],
+            Some("text"),
+        );
+        assert_eq!(strip(&c, &k).unwrap()["notes"], c["notes"]);
+
+        // a notes-located item with a value in the notes and nothing else is bare after
+        let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", "notes", false)], Some("secret"));
+        assert!(!has_foreign_content(&as_server(&strip(&c, &k).unwrap()), &k).unwrap());
+
+        // the item key and unknown keys pass through; fields are read with the item key
+        let ik = SymmetricKey::generate();
+        let mut c = note(&k, &[], None);
+        c["key"] = json!(k.user.encrypt(&ik.to_bytes()));
+        c["somethingNew"] = json!({ "a": 1 });
+        c["fields"] = enc_fields(&ik, &[("bwss:id", "x", false), ("pin", "1", false)]);
+        let body = strip(&c, &k).unwrap();
+        assert_eq!(body["key"], c["key"]);
+        assert_eq!(body["somethingNew"], c["somethingNew"]);
+        assert_eq!(names(&body, &ik), ["pin"]);
+    }
+
+    #[test]
+    fn strip_refuses_trashed_and_unreadable_items() {
+        let k = keys();
+        let c = note(&k, &[("bwss:id", "x", false)], None);
+        assert!(matches!(
+            strip(&with_key(&c, "deletedDate", json!("2026-05-05T00:00:00Z")), &k),
+            Err(WriteError::Gone)
+        ));
+        let other = keys();
+        assert!(matches!(strip(&c, &other), Err(WriteError::Crypto(_))));
+        let mut located = note(&k, &[("bwss:location", "notes", false)], Some("s"));
+        located["fields"][0]["value"] = json!(other.user.encrypt_str("notes"));
+        assert!(matches!(strip(&located, &k), Err(WriteError::Crypto(_))));
     }
 }
