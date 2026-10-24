@@ -4,15 +4,17 @@
 Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL, re-read on
 every run so tests can change it between prompts:
 
-    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny", "release": "/path"}
+    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny", "release": "/path",
+     "confirm_release": "/path"}
 
 A confirmation is two CONFIRM questions in one conversation (allow?, then
 remember?), answered according to "confirm".
 
 "pins" is consumed one entry per GETPIN (the file is rewritten); an empty
 list cancels. With "release", a GETPIN is answered only once that file
-exists, as a user who takes their time would (the test creates it). Every
-command received is appended to $FAKE_PINENTRY_LOG.
+exists, as a user who takes their time would (the test creates it);
+"confirm_release" does the same for a CONFIRM. Every command received is
+appended to $FAKE_PINENTRY_LOG.
 """
 
 import json
@@ -46,6 +48,14 @@ def out(line):
     sys.stdout.flush()
 
 
+def wait_for(key):
+    release = load().get(key)
+    for _ in range(600):
+        if not release or os.path.exists(release):
+            break
+        time.sleep(0.05)
+
+
 out("OK fake pinentry")
 confirms = 0
 for raw in sys.stdin:
@@ -54,11 +64,7 @@ for raw in sys.stdin:
     # One log line per command, even when the text has line breaks.
     log(f"{cmd} {urllib.parse.unquote(arg)}".rstrip().replace("\n", " "))
     if cmd == "GETPIN":
-        release = load().get("release")
-        for _ in range(600):
-            if not release or os.path.exists(release):
-                break
-            time.sleep(0.05)
+        wait_for("release")
         ctl = load()
         pins = ctl.get("pins", [])
         if not pins:
@@ -69,6 +75,7 @@ for raw in sys.stdin:
         out("D " + pin.replace("%", "%25").replace("\n", "%0A"))
         out("OK")
     elif cmd == "CONFIRM":
+        wait_for("confirm_release")
         confirms += 1
         answer = load().get("confirm", "deny")
         ok = answer in ("once", "always") if confirms == 1 else answer == "always"

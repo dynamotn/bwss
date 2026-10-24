@@ -41,6 +41,12 @@ pub fn no_prompt() -> OwnedObjectPath {
     op("/")
 }
 
+/// The emitter of signals from the object at `path`.
+#[expect(clippy::expect_used, reason = "callers pass only paths built from constants and escaped segments")]
+pub fn emitter(conn: &Connection, path: &str) -> SignalEmitter<'static> {
+    SignalEmitter::new(conn, path.to_owned()).expect("valid object path")
+}
+
 /// Splits an object path into (collection, item).
 pub fn parse_path(path: &str) -> Option<(String, Option<String>)> {
     if path == DEFAULT_ALIAS_PATH {
@@ -278,6 +284,19 @@ pub struct Daemon {
     /// This device's ACL confirmations; loaded on first use after an unlock,
     /// dropped at lock with the key that seals them.
     confirmed: Mutex<Option<ConfirmSet>>,
+    /// Test seam: while set, adding a session or prompt object to the bus
+    /// waits at it, so a test can make the client leave in between.
+    #[cfg(test)]
+    pub adding: std::sync::Mutex<Option<Arc<Gate>>>,
+}
+
+/// Where a task stops until a test lets it go on.
+#[cfg(test)]
+#[derive(Default)]
+pub struct Gate {
+    /// Notified when a task reaches the gate.
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl Daemon {
@@ -299,7 +318,19 @@ impl Daemon {
             identities: Identities::default(),
             acl_state_path: OnceLock::new(),
             confirmed: Mutex::new(None),
+            #[cfg(test)]
+            adding: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Waits at the test gate for adding objects, when one is set.
+    #[cfg(test)]
+    pub async fn before_adding(&self) {
+        let gate = lock(&self.adding).clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
     }
 
     pub fn set_connection(&self, conn: Connection) {
@@ -377,14 +408,15 @@ impl Daemon {
             registered.remove(&path);
         }
         for path in wanted.difference(&registered.clone()).cloned().collect::<Vec<_>>() {
-            match parse_path(&path) {
-                Some((_, Some(i))) => {
+            // Every wanted path was made by collection_path or item_path.
+            let Some((c, item)) = parse_path(&path) else { continue };
+            match item {
+                Some(i) => {
                     server.at(path.as_str(), ItemObj { daemon: self.clone(), id: i }).await?;
                 }
-                Some((c, None)) => {
+                None => {
                     server.at(path.as_str(), CollectionObj { daemon: self.clone(), id: c }).await?;
                 }
-                None => continue,
             }
             registered.insert(path);
         }
@@ -398,20 +430,16 @@ impl Daemon {
         if let Err(e) = self.sync_objects().await {
             tracing::warn!("could not update D-Bus objects: {e}");
         }
-        let service = SignalEmitter::new(conn, SERVICE_PATH).ok();
+        let service = emitter(conn, SERVICE_PATH);
         for c in &diff.collections_created {
-            if let Some(s) = &service {
-                let _ = ServiceObj::collection_created(s, op(&collection_path(c))).await;
-            }
+            let _ = ServiceObj::collection_created(&service, op(&collection_path(c))).await;
         }
         for c in &diff.collections_deleted {
-            if let Some(s) = &service {
-                let _ = ServiceObj::collection_deleted(s, op(&collection_path(c))).await;
-            }
+            let _ = ServiceObj::collection_deleted(&service, op(&collection_path(c))).await;
         }
         for (list, kind) in [(&diff.created, 0), (&diff.changed, 1), (&diff.deleted, 2)] {
             for (c, i) in list.iter() {
-                let Ok(e) = SignalEmitter::new(conn, collection_path(c)) else { continue };
+                let e = emitter(conn, &collection_path(c));
                 let path = op(&item_path(c, i));
                 let _ = match kind {
                     0 => CollectionObj::item_created(&e, path).await,
@@ -936,7 +964,13 @@ mod path_tests {
     #[test]
     fn parse_path_unescapes_ids() {
         assert_eq!(parse_path(&item_path("work/keys", "a b")), Some(("work/keys".into(), Some("a b".into()))));
+        assert_eq!(parse_path(&collection_path("")), Some((String::new(), None)), "an empty id is `_`");
+        assert_eq!(parse_path(DEFAULT_ALIAS_PATH), Some((LOGIN_COLLECTION.into(), None)));
         assert_eq!(parse_path(&format!("{SERVICE_PATH}/collection/_zz")), None);
+        assert_eq!(parse_path(&format!("{SERVICE_PATH}/collection/login/_zz")), None, "a bad item segment");
+        assert_eq!(parse_path(&format!("{}/more", item_path("login", "x"))), None, "below an item");
+        assert_eq!(parse_path(&format!("{SERVICE_PATH}/collection/")), None, "no collection");
+        assert_eq!(parse_path(&format!("{SERVICE_PATH}/session/s1")), None);
     }
 }
 
@@ -1066,28 +1100,71 @@ mod tests {
 
     use crate::backend::memory::MemoryBackend;
     use crate::model::{CollectionData, Snapshot};
+    use std::sync::atomic::AtomicBool;
     use tokio::sync::Notify;
 
-    /// A memory backend whose `put_item` stops until the test lets it go.
-    struct GatedBackend {
+    /// A memory backend with the switches the daemon tests need.
+    struct TestBackend {
         inner: MemoryBackend,
+        /// `put_item` stores the item, then holds its answer back until the
+        /// test notifies `release` (it notifies `entered` first).
+        gated: bool,
         entered: Notify,
         release: Notify,
-        /// How many times `unlock` ran.
+        /// ACL lines may come from other devices, as Bitwarden's do, and every
+        /// refresh brings a new snapshot, as a sync with changes would.
+        per_device: Option<crate::bw::crypto::SymmetricKey>,
+        /// How many times `unlock` and `refresh` ran.
         unlocks: AtomicU64,
+        refreshes: AtomicU64,
+        /// How many of the next unlocks fail as if the server were unreachable.
+        unreachable_unlocks: AtomicU64,
+        /// Writes and the ACL trust fail as if the server were unreachable.
+        failing_puts: AtomicBool,
+        failing_trust: AtomicBool,
+    }
+
+    fn unreachable() -> BackendError {
+        BackendError::Unavailable("the server is unreachable".into())
+    }
+
+    impl TestBackend {
+        fn new(gated: bool, per_device: bool) -> Self {
+            TestBackend {
+                inner: MemoryBackend::new("pw"),
+                gated,
+                entered: Notify::new(),
+                release: Notify::new(),
+                per_device: per_device.then(crate::bw::crypto::SymmetricKey::generate),
+                unlocks: AtomicU64::new(0),
+                refreshes: AtomicU64::new(0),
+                unreachable_unlocks: AtomicU64::new(0),
+                failing_puts: AtomicBool::new(false),
+                failing_trust: AtomicBool::new(false),
+            }
+        }
     }
 
     #[async_trait::async_trait]
-    impl Backend for GatedBackend {
+    impl Backend for TestBackend {
         async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
             self.unlocks.fetch_add(1, Ordering::Relaxed);
+            if self.unreachable_unlocks.load(Ordering::Relaxed) > 0 {
+                self.unreachable_unlocks.fetch_sub(1, Ordering::Relaxed);
+                return Err(unreachable());
+            }
             self.inner.unlock(password).await
         }
         async fn lock(&self) {
             self.inner.lock().await;
         }
         async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
-            self.inner.refresh().await
+            self.refreshes.fetch_add(1, Ordering::Relaxed);
+            let changed = self.inner.refresh().await?;
+            match self.per_device {
+                Some(_) => Ok(Some(self.inner.unlock("pw").await?)),
+                None => Ok(changed),
+            }
         }
         async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
             self.inner.create_collection(label).await
@@ -1096,30 +1173,34 @@ mod tests {
             self.inner.delete_collection(id, items).await
         }
         async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-            // Stored, but the answer is held back until the test says so.
+            if self.failing_puts.load(Ordering::Relaxed) {
+                return Err(unreachable());
+            }
             self.inner.put_item(item).await?;
-            self.entered.notify_one();
-            self.release.notified().await;
+            if self.gated {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             Ok(())
         }
         async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
             self.inner.delete_item(item).await
         }
         async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
-            self.inner.acl_trust().await
+            if self.failing_trust.load(Ordering::Relaxed) {
+                return Err(unreachable());
+            }
+            let local = self.inner.acl_trust().await?;
+            Ok(self.per_device.clone().map_or(local, AclTrust::PerDevice))
         }
         async fn describe(&self) -> String {
             self.inner.describe().await
         }
     }
 
-    async fn gated_daemon(seed: Option<ItemData>) -> (Arc<Daemon>, Arc<GatedBackend>) {
-        let backend = Arc::new(GatedBackend {
-            inner: MemoryBackend::new("pw"),
-            entered: Notify::new(),
-            release: Notify::new(),
-            unlocks: AtomicU64::new(0),
-        });
+    /// A daemon over a gated test backend that already holds `seed`.
+    async fn gated_daemon(seed: Option<ItemData>) -> (Arc<Daemon>, Arc<TestBackend>) {
+        let backend = Arc::new(TestBackend::new(true, false));
         if let Some(item) = seed {
             backend.inner.unlock("pw").await.unwrap();
             backend.inner.put_item(&item).await.unwrap();
@@ -1176,7 +1257,7 @@ mod tests {
         let (d, backend) = gated_daemon(Some(stored_item("x"))).await;
         let task = tokio::spawn({
             let d = d.clone();
-            async move { d.update_item("x", |i| i.label = "new".into()).await }
+            async move { rename(&d, "x", "new").await }
         });
         backend.entered.notified().await;
         d.lock().await;
@@ -1281,46 +1362,6 @@ mod tests {
         assert!(text.starts_with("/usr/bin/python3//tmp/a\u{fffd}b.py\n\nwants"), "{text:?}");
     }
 
-    /// A memory backend whose ACL lines may come from elsewhere, like Bitwarden's.
-    struct SyncedBackend {
-        inner: MemoryBackend,
-        key: crate::bw::crypto::SymmetricKey,
-    }
-
-    #[async_trait::async_trait]
-    impl Backend for SyncedBackend {
-        async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
-            self.inner.unlock(password).await
-        }
-        async fn lock(&self) {
-            self.inner.lock().await;
-        }
-        async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
-            // Every refresh brings a new snapshot, as a sync with changes would.
-            self.inner.refresh().await?;
-            Ok(Some(self.inner.unlock("pw").await?))
-        }
-        async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
-            self.inner.create_collection(label).await
-        }
-        async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
-            self.inner.delete_collection(id, items).await
-        }
-        async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-            self.inner.put_item(item).await
-        }
-        async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
-            self.inner.delete_item(item).await
-        }
-        async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
-            self.inner.acl_trust().await?;
-            Ok(AclTrust::PerDevice(self.key.clone()))
-        }
-        async fn describe(&self) -> String {
-            self.inner.describe().await
-        }
-    }
-
     /// A pinentry that answers every CONFIRM with `confirm` ("OK" or a
     /// cancel) and logs the commands it gets.
     struct ScriptedPinentry {
@@ -1340,6 +1381,42 @@ mod tests {
             Self::with_body(&format!(
                 "echo OK\nwhile IFS= read -r l; do\n  case \"$l\" in\n    CONFIRM*) echo '{reply}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n"
             ))
+        }
+
+        /// A pinentry that logs what it gets and answers every GETPIN with
+        /// the shell commands `getpin` (e.g. `echo 'D pw'; echo OK`).
+        fn answering_getpin(getpin: &str) -> Self {
+            Self::with_body(&format!(
+                "echo OK\nwhile IFS= read -r l; do\n  printf '%s\\n' \"$l\" >> \"$0.log\"\n  case \"$l\" in\n    GETPIN*) {getpin} ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n"
+            ))
+        }
+
+        /// A pinentry whose first CONFIRM waits for the test: it writes to the
+        /// FIFO `$0.entered` (returned by `entered`) and then answers once the
+        /// test writes to the FIFO `$0.release` (see `release`). Every CONFIRM
+        /// is answered OK.
+        fn with_gated_confirm() -> Self {
+            let pin = Self::with_body(
+                "echo OK\ngated=1\nwhile IFS= read -r l; do\n  case \"$l\" in\n    CONFIRM*)\n      if [ -n \"$gated\" ]; then gated=; echo in > \"$0.entered\"; read -r go < \"$0.release\"; fi\n      echo OK ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n",
+            );
+            for fifo in ["pinentry.entered", "pinentry.release"] {
+                let made = std::process::Command::new("mkfifo").arg(pin.dir.path().join(fifo)).status().unwrap();
+                assert!(made.success());
+            }
+            pin
+        }
+
+        /// Waits until the gated pinentry shows its first CONFIRM.
+        async fn entered(&self) {
+            let fifo = self.dir.path().join("pinentry.entered");
+            let got = tokio::task::spawn_blocking(move || std::fs::read_to_string(fifo)).await.unwrap().unwrap();
+            assert_eq!(got, "in\n");
+        }
+
+        /// Lets the gated pinentry answer its first CONFIRM.
+        async fn release(&self) {
+            let fifo = self.dir.path().join("pinentry.release");
+            tokio::task::spawn_blocking(move || std::fs::write(fifo, "go\n")).await.unwrap().unwrap();
         }
 
         /// A pinentry running the shell `body`; `$0.log` is its log.
@@ -1367,7 +1444,12 @@ mod tests {
         }
 
         fn confirms(&self) -> usize {
-            self.log().iter().filter(|l| l.starts_with("CONFIRM")).count()
+            self.count("CONFIRM")
+        }
+
+        /// How many logged lines start with `prefix`.
+        fn count(&self, prefix: &str) -> usize {
+            self.log().iter().filter(|l| l.starts_with(prefix)).count()
         }
     }
 
@@ -1376,16 +1458,23 @@ mod tests {
     /// A daemon over a synced backend holding `stored_item("x")` with `acl`,
     /// keeping its confirmations in `state`.
     async fn synced_daemon(acl: &[&str], prompter: Prompter, state: &std::path::Path) -> Arc<Daemon> {
-        let backend =
-            SyncedBackend { inner: MemoryBackend::new("pw"), key: crate::bw::crypto::SymmetricKey::generate() };
+        synced_daemon_and_backend(acl, prompter, state).await.0
+    }
+
+    async fn synced_daemon_and_backend(
+        acl: &[&str],
+        prompter: Prompter,
+        state: &std::path::Path,
+    ) -> (Arc<Daemon>, Arc<TestBackend>) {
+        let backend = Arc::new(TestBackend::new(false, true));
         backend.inner.unlock("pw").await.unwrap();
         let mut item = stored_item("x");
         item.acl = acl.iter().map(|s| (*s).to_owned()).collect();
         backend.inner.put_item(&item).await.unwrap();
-        let d = Daemon::new(Keyring::new(None, None), Arc::new(backend), prompter, Config::default());
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, Config::default());
         d.set_acl_state_path(state.join("acl-confirmed"));
         d.unlock_with_password("pw").await.unwrap();
-        d
+        (d, backend)
     }
 
     #[tokio::test]
@@ -1472,11 +1561,8 @@ mod tests {
         d.authorize(script, "x", "read").await.unwrap();
         assert_eq!(pin.confirms(), 2, "allow, then remember");
         assert!(pin.log().iter().any(|l| l == "SETOK Always allow"));
-        assert!(
-            pin.log().iter().any(|l| l.contains("/usr/bin/python3 running /home/u/bin/backup.py")),
-            "{:?}",
-            pin.log()
-        );
+        let log = pin.log();
+        assert!(log.iter().any(|l| l.contains("/usr/bin/python3 running /home/u/bin/backup.py")), "{log:?}");
         assert_eq!(d.keyring.lock().await.item("x").unwrap().acl, [script]);
         d.authorize(script, "x", "read").await.unwrap();
         assert_eq!(pin.confirms(), 2);
@@ -1587,11 +1673,289 @@ mod tests {
     }
 
     #[test]
-    fn conflict_maps_to_a_retry_message() {
-        match SecretError::from(BackendError::Conflict("the secret was changed elsewhere".into())) {
-            SecretError::Failed(m) => assert_eq!(m, "the secret was changed elsewhere; try again"),
-            other => panic!("unexpected {other:?}"),
+    fn backend_errors_map_to_secret_service_errors() {
+        let mapped = |e: BackendError| format!("{:?}", SecretError::from(e));
+        let conflict = BackendError::Conflict("the secret was changed elsewhere".into());
+        assert_eq!(mapped(conflict), r#"Failed("the secret was changed elsewhere; try again")"#);
+        assert_eq!(mapped(BackendError::Rejected("no".into())), r#"Failed("no")"#);
+        assert_eq!(mapped(BackendError::Locked), r#"IsLocked("the keyring is locked")"#);
+    }
+
+    /// Renames an item through `update_item`, always with the same closure.
+    async fn rename(d: &Arc<Daemon>, id: &str, label: &str) -> SResult<()> {
+        let label = label.to_owned();
+        d.update_item(id, move |i| i.label = label).await
+    }
+
+    /// An unlocked daemon over `backend` (memory, no ACL lines from elsewhere).
+    async fn daemon_over(backend: &Arc<TestBackend>, prompter: Prompter, config: Config) -> Arc<Daemon> {
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, config);
+        d.unlock_with_password("pw").await.unwrap();
+        d
+    }
+
+    fn new_item(label: &str, replace: bool) -> NewItem {
+        NewItem {
+            label: label.into(),
+            attributes: Attributes::from([("k".to_owned(), "v".to_owned())]),
+            secret: Zeroizing::new(b"new".to_vec()),
+            content_type: "text/plain".into(),
+            replace,
         }
-        assert!(matches!(SecretError::from(BackendError::Rejected("no".into())), SecretError::Failed(_)));
+    }
+
+    /// What the backend has stored for item `id`.
+    async fn stored(backend: &TestBackend, id: &str) -> Option<ItemData> {
+        backend.inner.unlock("pw").await.unwrap().items.into_iter().find(|i| i.id == id)
+    }
+
+    fn err<T: std::fmt::Debug>(r: SResult<T>) -> String {
+        format!("{:?}", r.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn an_interactive_unlock_gives_up_after_three_wrong_passwords() {
+        let pin = ScriptedPinentry::answering_getpin("echo 'D wrong'; echo OK");
+        let backend = Arc::new(TestBackend::new(false, false));
+        let config = Config { backend: crate::config::BackendKind::Memory, ..Config::default() };
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), pin.prompter(), config);
+        assert!(!d.unlock_interactive().await);
+        assert!(!d.keyring.lock().await.is_unlocked());
+        assert_eq!(backend.unlocks.load(Ordering::Relaxed), 3);
+        assert_eq!(pin.count("GETPIN"), 3);
+        assert_eq!(pin.count("SETDESC An application wants to use your keyring."), 3, "{:?}", pin.log());
+        // Each retry says why; the last failure is not shown in a fourth dialog.
+        assert_eq!(pin.count("SETERROR Wrong password, try again."), 2);
+        assert_eq!(pin.count("SETERROR"), 2);
+    }
+
+    #[tokio::test]
+    async fn an_interactive_unlock_shows_a_backend_failure_and_asks_again() {
+        let pin = ScriptedPinentry::answering_getpin("echo 'D pw'; echo OK");
+        let backend = Arc::new(TestBackend::new(false, false));
+        backend.unreachable_unlocks.store(1, Ordering::Relaxed);
+        let config = Config { email: "me@example.com".into(), ..Config::default() };
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), pin.prompter(), config);
+        assert!(d.unlock_interactive().await);
+        assert!(d.keyring.lock().await.is_unlocked());
+        assert_eq!(pin.count("GETPIN"), 2);
+        assert_eq!(
+            pin.log().iter().filter(|l| l.ends_with("Bitwarden master password for me@example.com.")).count(),
+            2
+        );
+        assert_eq!(pin.count("SETERROR"), 1);
+        assert_eq!(pin.count("SETERROR the server is unreachable"), 1, "{:?}", pin.log());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_password_dialog_leaves_the_keyring_locked() {
+        let pin = ScriptedPinentry::answering_getpin("echo 'ERR 83886179 Operation cancelled'");
+        let backend = Arc::new(TestBackend::new(false, false));
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), pin.prompter(), Config::default());
+        assert!(!d.unlock_interactive().await);
+        assert_eq!(pin.count("GETPIN"), 1, "no second dialog after a cancel");
+        assert_eq!(backend.unlocks.load(Ordering::Relaxed), 0, "no password was tried");
+        assert!(!d.keyring.lock().await.is_unlocked());
+    }
+
+    #[tokio::test]
+    async fn refresh_pulls_only_while_unlocked_and_keeps_the_keyring_when_it_fails() {
+        let state = tempfile::tempdir().unwrap();
+        let (d, backend) =
+            synced_daemon_and_backend(&[], Prompter::new("false", Duration::from_secs(1)), state.path()).await;
+        // A change made elsewhere shows after a refresh.
+        let mut item = stored_item("x");
+        item.label = "renamed elsewhere".into();
+        backend.inner.put_item(&item).await.unwrap();
+        d.refresh().await;
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().label, "renamed elsewhere");
+        // The server cannot be reached: the keyring keeps what it has.
+        backend.inner.lock().await;
+        d.refresh().await;
+        assert_eq!(backend.refreshes.load(Ordering::Relaxed), 2);
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().label, "renamed elsewhere");
+        // Locked, nothing is pulled.
+        d.lock().await;
+        d.refresh().await;
+        assert_eq!(backend.refreshes.load(Ordering::Relaxed), 2, "the backend was not asked");
+        assert!(!d.keyring.lock().await.is_unlocked());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_changes_keeps_the_keyring() {
+        let (d, backend) = gated_daemon(Some(stored_item("x"))).await;
+        let mut item = stored_item("x");
+        item.label = "not pulled".into();
+        backend.inner.put_item(&item).await.unwrap();
+        d.refresh().await;
+        assert_eq!(backend.refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().label, "l", "the backend reported no change");
+    }
+
+    #[tokio::test]
+    async fn access_to_an_unknown_item_is_refused_as_locked() {
+        let (d, _backend) = gated_daemon(None).await;
+        assert_eq!(err(d.authorize(GIT, "nope", "read").await), r#"IsLocked("the item is locked")"#);
+    }
+
+    #[tokio::test]
+    async fn decisions_about_removed_lines_survive_a_failed_prune_until_the_next_refresh() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let (d, backend) = synced_daemon_and_backend(&[GIT], pin.prompter(), state.path()).await;
+        d.authorize(GIT, "x", "read").await.unwrap();
+        let mark = || async { d.confirmed.lock().await.as_ref().map(|s| s.mark("x", GIT)) };
+        assert_eq!(mark().await, Some(Mark::Confirmed));
+        // Another device takes the line out, and the decisions cannot be opened.
+        set_stored_acl(&d, &[]).await;
+        backend.failing_trust.store(true, Ordering::Relaxed);
+        d.refresh().await;
+        assert!(d.keyring.lock().await.item("x").unwrap().acl.is_empty(), "the item itself is current");
+        assert_eq!(mark().await, Some(Mark::Confirmed), "not pruned");
+        backend.failing_trust.store(false, Ordering::Relaxed);
+        d.refresh().await;
+        assert_eq!(mark().await, Some(Mark::None), "pruned once it can be");
+    }
+
+    #[tokio::test]
+    async fn always_allow_still_grants_access_when_the_rule_cannot_be_saved() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let (d, backend) = synced_daemon_and_backend(&[], pin.prompter(), state.path()).await;
+        backend.failing_puts.store(true, Ordering::Relaxed);
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2, "allow, then remember");
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().acl, [GIT], "listed here");
+        assert!(stored(&backend, "x").await.unwrap().acl.is_empty(), "but not saved");
+        let mark = d.confirmed.lock().await.as_ref().map(|s| s.mark("x", GIT));
+        assert_eq!(mark, Some(Mark::Confirmed));
+    }
+
+    #[tokio::test]
+    async fn an_item_is_created_only_in_an_unlocked_collection_that_exists() {
+        let backend = Arc::new(TestBackend::new(false, false));
+        let d = daemon_over(&backend, Prompter::new("false", Duration::from_secs(1)), Config::default()).await;
+        assert_eq!(
+            err(d.create_item("nope", new_item("a", false), GIT).await),
+            r#"NoSuchObject("no collection nope")"#
+        );
+        d.lock().await;
+        let locked = d.create_item(LOGIN_COLLECTION, new_item("a", false), GIT).await;
+        assert_eq!(err(locked), r#"IsLocked("the collection is locked")"#);
+        assert_eq!(backend.describe().await, "memory backend, 0 item(s)");
+    }
+
+    #[tokio::test]
+    async fn session_items_stay_in_memory() {
+        let backend = Arc::new(TestBackend::new(false, false));
+        let d = daemon_over(&backend, Prompter::new("false", Duration::from_secs(1)), Config::default()).await;
+        let path = d.create_item(SESSION_COLLECTION, new_item("a", false), GIT).await.unwrap();
+        let (_, id) = parse_path(path.as_str()).unwrap();
+        let id = id.unwrap();
+        rename(&d, &id, "renamed").await.unwrap();
+        assert_eq!(d.keyring.lock().await.item(&id).unwrap().label, "renamed");
+        assert_eq!(backend.describe().await, "memory backend, 0 item(s)", "never written to the backend");
+        // A lock keeps it; a delete drops it.
+        d.lock().await;
+        assert!(d.keyring.lock().await.item(&id).is_some());
+        d.delete_item(&id).await.unwrap();
+        assert!(d.keyring.lock().await.item(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn items_are_changed_and_deleted_in_the_backend() {
+        let backend = Arc::new(TestBackend::new(false, false));
+        let d = daemon_over(&backend, Prompter::new("false", Duration::from_secs(1)), Config::default()).await;
+        let path = d.create_item(LOGIN_COLLECTION, new_item("a", false), GIT).await.unwrap();
+        let id = parse_path(path.as_str()).unwrap().1.unwrap();
+        rename(&d, &id, "renamed").await.unwrap();
+        assert_eq!(stored(&backend, &id).await.unwrap().label, "renamed");
+        assert_eq!(d.keyring.lock().await.item(&id).unwrap().label, "renamed");
+        d.delete_item(&id).await.unwrap();
+        assert_eq!(backend.describe().await, "memory backend, 0 item(s)");
+        assert!(d.keyring.lock().await.item(&id).is_none());
+        // Gone (or locked) items cannot be changed or deleted.
+        assert_eq!(err(rename(&d, &id, "again").await), r#"IsLocked("the item is locked")"#);
+        assert_eq!(err(d.delete_item(&id).await), r#"IsLocked("the item is locked")"#);
+    }
+
+    #[tokio::test]
+    async fn collections_are_created_and_deleted_while_unlocked_except_the_built_in_ones() {
+        let backend = Arc::new(TestBackend::new(false, false));
+        let d = daemon_over(&backend, Prompter::new("false", Duration::from_secs(1)), Config::default()).await;
+        let path = d.create_collection("Work").await.unwrap();
+        assert_eq!(path.as_str(), collection_path("work"));
+        assert_eq!(d.keyring.lock().await.collection("work").unwrap().label, "Work");
+        let item = d.create_item("work", new_item("vpn", false), GIT).await.unwrap();
+        let id = parse_path(item.as_str()).unwrap().1.unwrap();
+        for built_in in [LOGIN_COLLECTION, SESSION_COLLECTION] {
+            let refused = d.delete_collection(built_in, &[]).await;
+            assert_eq!(err(refused), r#"NotSupported("built-in collections cannot be deleted")"#);
+        }
+        // An item the caller was not allowed to delete keeps the collection.
+        let changed = d.delete_collection("work", &[]).await;
+        assert_eq!(err(changed), r#"Failed("the collection changed meanwhile; try again")"#);
+        assert!(d.keyring.lock().await.collection("work").is_some());
+        d.delete_collection("work", std::slice::from_ref(&id)).await.unwrap();
+        let k = d.keyring.lock().await;
+        assert!(k.collection("work").is_none() && k.item(&id).is_none());
+        drop(k);
+        assert_eq!(backend.describe().await, "memory backend, 0 item(s)");
+        d.lock().await;
+        assert_eq!(err(d.create_collection("Home").await), r#"IsLocked("the keyring is locked")"#);
+        assert_eq!(err(d.delete_collection("home", &[]).await), r#"IsLocked("the keyring is locked")"#);
+    }
+
+    #[tokio::test]
+    async fn a_replace_whose_item_locks_during_the_access_prompt_writes_nothing() {
+        let pin = ScriptedPinentry::with_gated_confirm();
+        let backend = Arc::new(TestBackend::new(false, false));
+        backend.inner.unlock("pw").await.unwrap();
+        backend.inner.put_item(&stored_item("x")).await.unwrap();
+        let d = daemon_over(&backend, pin.prompter(), Config::default()).await;
+        // git is not listed in the item, so replacing it asks first.
+        let replace = tokio::spawn({
+            let d = d.clone();
+            async move { d.create_item(LOGIN_COLLECTION, new_item("replaced", true), GIT).await }
+        });
+        pin.entered().await;
+        d.lock().await;
+        pin.release().await;
+        assert_eq!(err(replace.await.unwrap()), r#"IsLocked("locked")"#);
+        assert_eq!(&*stored(&backend, "x").await.unwrap().secret, b"s", "the stored item is unchanged");
+    }
+
+    fn plain_session(seq: u64, owner: &str) -> Arc<OpenSession> {
+        Arc::new(OpenSession { seq, owner: owner.into(), session: Session::open("plain", &[]).unwrap().0 })
+    }
+
+    #[test]
+    fn sessions_are_capped_per_client_and_in_total() {
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        let d = Daemon::new(
+            Keyring::new(None, None),
+            backend,
+            Prompter::new("false", Duration::from_secs(1)),
+            Config::default(),
+        );
+        let admit =
+            |seq: u64, owner: &str, force: bool| d.admit_session(plain_session(seq, owner), &format!("/s{seq}"), force);
+        for seq in 0..64 {
+            assert_eq!(admit(seq, ":1.1", false), (vec![], true));
+        }
+        // At its own cap a client gives up its oldest session.
+        assert_eq!(admit(64, ":1.1", false), (vec!["/s0".to_owned()], true));
+        // Fill up the total with other clients.
+        for seq in 100..(100 + SESSIONS_TOTAL as u64 - 64) {
+            admit(seq, &format!(":2.{}", seq % 63), false);
+        }
+        assert_eq!(lock(&d.sessions).len(), SESSIONS_TOTAL);
+        assert_eq!(admit(9000, ":3.1", false), (vec![], false), "full: not added unless forced");
+        assert_eq!(lock(&d.sessions).len(), SESSIONS_TOTAL);
+        // Forced, the client with the most sessions (ties: the lowest name)
+        // loses its oldest.
+        assert_eq!(admit(9001, ":3.1", true), (vec!["/s1".to_owned()], true));
+        assert_eq!(lock(&d.sessions).len(), SESSIONS_TOTAL);
+        assert!(lock(&d.sessions).contains_key("/s9001"));
     }
 }

@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::daemon::{
     Daemon, NewItem, OpenSession, PROMPTS_PER_OWNER, PromptEntry, PromptSlot, SERVICE_PATH, SResult, SecretError,
-    WireSecret, collection_path, item_path, no_prompt, op, parse_path, prompt_slot,
+    WireSecret, collection_path, emitter, item_path, no_prompt, op, parse_path, prompt_slot,
 };
 use crate::model::{Attributes, LOGIN_COLLECTION, SESSION_COLLECTION};
 use crate::session::Session;
@@ -70,33 +70,8 @@ impl ServiceObj {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedVariant, OwnedObjectPath), SecretError> {
         let bytes: Vec<u8> = Vec::<u8>::try_from(input.try_clone().map_err(SecretError::ZBus)?).unwrap_or_default();
-        let (session, output) =
-            Session::open(algorithm, &bytes).map_err(|e| SecretError::NotSupported(e.to_string()))?;
-        let seq = self.daemon.next_id();
-        let path = format!("{SERVICE_PATH}/session/s{seq}");
         let owner = sender(&header).unwrap_or_default();
-        let open = Arc::new(OpenSession { seq, owner, session });
-        let (mut dropped, admitted) = self.daemon.admit_session(open.clone(), &path, false);
-        if !admitted {
-            // Full: free what departed clients left behind before pushing
-            // out a live one.
-            self.daemon.reap_departed().await;
-            dropped.extend(self.daemon.admit_session(open, &path, true).0);
-        }
-        for p in dropped {
-            let _ = self.daemon.conn().object_server().remove::<SessionObj, _>(p.as_str()).await;
-        }
-        let server = self.daemon.conn().object_server();
-        if let Err(e) = server.at(path.as_str(), SessionObj { daemon: self.daemon.clone(), path: path.clone() }).await {
-            lock(&self.daemon.sessions).remove(&path);
-            return Err(SecretError::ZBus(e));
-        }
-        // Evicted or dropped with its client while the object was being added:
-        // it is no longer tracked, so it must not stay on the bus.
-        if !lock(&self.daemon.sessions).contains_key(&path) {
-            let _ = server.remove::<SessionObj, _>(path.as_str()).await;
-            return Err(SecretError::Failed("the session was closed while opening".into()));
-        }
+        let (output, path) = open_tracked_session(&self.daemon, algorithm, &bytes, owner).await?;
         let out = if output.is_empty() {
             empty_variant()
         } else {
@@ -230,6 +205,45 @@ impl ServiceObj {
     pub async fn collection_deleted(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
     #[zbus(signal)]
     pub async fn collection_changed(emitter: &SignalEmitter<'_>, collection: OwnedObjectPath) -> zbus::Result<()>;
+}
+
+/// Opens a session for the bus name `owner` and puts its object on the bus.
+/// Returns what the client needs to complete the key exchange (empty for
+/// `plain`) and the session's path.
+async fn open_tracked_session(
+    daemon: &Arc<Daemon>,
+    algorithm: &str,
+    input: &[u8],
+    owner: String,
+) -> SResult<(Vec<u8>, String)> {
+    let (session, output) = Session::open(algorithm, input).map_err(|e| SecretError::NotSupported(e.to_string()))?;
+    let seq = daemon.next_id();
+    let path = format!("{SERVICE_PATH}/session/s{seq}");
+    let open = Arc::new(OpenSession { seq, owner, session });
+    let (mut dropped, admitted) = daemon.admit_session(open.clone(), &path, false);
+    if !admitted {
+        // Full: free what departed clients left behind before pushing
+        // out a live one.
+        daemon.reap_departed().await;
+        dropped.extend(daemon.admit_session(open, &path, true).0);
+    }
+    let server = daemon.conn().object_server();
+    for p in dropped {
+        let _ = server.remove::<SessionObj, _>(p.as_str()).await;
+    }
+    #[cfg(test)]
+    daemon.before_adding().await;
+    // Adding fails only for an invalid path; it is cleaned up like a session
+    // that was evicted or dropped with its client while the object was being
+    // added, which is no longer tracked and so must not stay on the bus.
+    let added = server.at(path.as_str(), SessionObj { daemon: daemon.clone(), path: path.clone() }).await;
+    if added.is_err() || !lock(&daemon.sessions).contains_key(&path) {
+        lock(&daemon.sessions).remove(&path);
+        let _ = server.remove::<SessionObj, _>(path.as_str()).await;
+        let closed = SecretError::Failed("the session was closed while opening".into());
+        return Err(added.err().map_or(closed, SecretError::ZBus));
+    }
+    Ok((output, path))
 }
 
 // --- Collection -----------------------------------------------------------------
@@ -427,10 +441,9 @@ impl ItemObj {
         action: &str,
         f: impl FnOnce(&mut crate::model::ItemData),
     ) -> zbus::fdo::Result<()> {
-        let caller = match &header {
-            Some(h) => self.daemon.caller(h).await,
-            None => crate::acl::UNKNOWN.to_owned(),
-        };
+        // Properties.Set always passes its header; without one there is no caller to check.
+        let Some(header) = header else { return Err(zbus::fdo::Error::AccessDenied("no caller".into())) };
+        let caller = self.daemon.caller(&header).await;
         let to_fdo = |e: SecretError| zbus::fdo::Error::Failed(format!("{e:?}"));
         self.daemon.authorize(&caller, &self.id, action).await.map_err(to_fdo)?;
         self.daemon.update_item(&self.id, f).await.map_err(to_fdo)
@@ -531,19 +544,22 @@ impl PromptObj {
             path: path.clone(),
             action: Arc::new(std::sync::Mutex::new(Some(action))),
         };
-        if let Err(e) = daemon.conn().object_server().at(path.as_str(), obj).await {
-            lock(&daemon.prompts).retain(|p| p.seq != seq);
-            return Err(SecretError::ZBus(e));
-        }
-        // Dropped with its client while the object was being added: no longer
-        // tracked, so remove it again (dropping what it holds).
-        let tracked = {
+        #[cfg(test)]
+        daemon.before_adding().await;
+        let server = daemon.conn().object_server();
+        // Adding fails only for an invalid path; it is cleaned up like a prompt
+        // dropped with its client while the object was being added, which is
+        // no longer tracked and so is removed again (dropping what it holds).
+        let added = server.at(path.as_str(), obj).await;
+        let tracked = added.is_ok() && {
             let mut prompts = lock(&daemon.prompts);
             prompts.iter_mut().find(|p| p.seq == seq).map(|e| e.registered = true).is_some()
         };
         if !tracked {
-            let _ = daemon.conn().object_server().remove::<PromptObj, _>(path.as_str()).await;
-            return Err(SecretError::Failed("the prompt was dismissed".into()));
+            lock(&daemon.prompts).retain(|p| p.seq != seq);
+            let _ = server.remove::<PromptObj, _>(path.as_str()).await;
+            let dismissed = SecretError::Failed("the prompt was dismissed".into());
+            return Err(added.err().map_or(dismissed, SecretError::ZBus));
         }
         Ok(op(&path))
     }
@@ -571,19 +587,22 @@ impl PromptObj {
 
     async fn finish(daemon: Arc<Daemon>, path: String, dismissed: bool, result: OwnedVariant) {
         lock(&daemon.prompts).retain(|p| p.path != path);
-        if let Ok(e) = SignalEmitter::new(daemon.conn(), path.clone()) {
-            let _ = PromptObj::completed(&e, dismissed, result).await;
-        }
+        let _ = PromptObj::completed(&emitter(daemon.conn(), &path), dismissed, result).await;
         let _ = daemon.conn().object_server().remove::<PromptObj, _>(path.as_str()).await;
     }
 }
 
-/// Whether `sender` may start or dismiss the prompt at `path`: only the bus
-/// name that asked for it, and only while it is tracked.
-fn may_control(prompts: &[PromptEntry], path: &str, sender: Option<&str>) -> Result<(), SecretError> {
-    match prompts.iter().find(|p| p.path == path) {
+/// The prompt at `path`, when `sender` may start or dismiss it: only the bus
+/// name that asked for it (prompt paths are predictable), and only while it
+/// is tracked (an evicted prompt cannot start).
+fn controlled<'a>(
+    prompts: &'a mut [PromptEntry],
+    path: &str,
+    sender: Option<&str>,
+) -> Result<&'a mut PromptEntry, SecretError> {
+    match prompts.iter_mut().find(|p| p.path == path) {
         None => Err(SecretError::Failed("the prompt was dismissed".into())),
-        Some(p) if Some(p.owner.as_str()) == sender => Ok(()),
+        Some(p) if Some(p.owner.as_str()) == sender => Ok(p),
         Some(_) => Err(SecretError::AccessDenied("the prompt belongs to another client".into())),
     }
 }
@@ -604,14 +623,7 @@ impl PromptObj {
     async fn prompt(&self, _window_id: &str, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
         let dismissed = {
             let mut prompts = lock(&self.daemon.prompts);
-            // An evicted prompt is no longer tracked and cannot start.
-            let Some(entry) = prompts.iter_mut().find(|p| p.path == self.path) else {
-                return Err(SecretError::Failed("the prompt was dismissed".into()));
-            };
-            // Prompt paths are predictable: only the client that asked may start it.
-            if Some(entry.owner.as_str()) != sender(&header).as_deref() {
-                return Err(SecretError::AccessDenied("the prompt belongs to another client".into()));
-            }
+            let entry = controlled(&mut prompts, &self.path, sender(&header).as_deref())?;
             let unused = lock(&self.action).as_ref().filter(|_| !entry.started).map(PromptAction::dismissed_result);
             let Some(dismissed) = unused else {
                 return Err(SecretError::Failed("the prompt was already used".into()));
@@ -661,7 +673,7 @@ impl PromptObj {
     }
 
     async fn dismiss(&self, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
-        may_control(&lock(&self.daemon.prompts), &self.path, sender(&header).as_deref())?;
+        controlled(&mut lock(&self.daemon.prompts), &self.path, sender(&header).as_deref())?;
         if let Some(action) = lock(&self.action).take() {
             tokio::spawn(PromptObj::finish(self.daemon.clone(), self.path.clone(), true, action.dismissed_result()));
         }
@@ -753,8 +765,9 @@ async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
             }
             if args.new_owner().is_none() {
                 daemon.drop_owner(name).await;
-            } else if args.old_owner().is_none() {
-                // A new connection: pin its process now, not at its first call.
+            } else {
+                // A new connection (a unique name never changes owner): pin
+                // its process now, not at its first call.
                 let (daemon, name) = (daemon.clone(), name.to_owned());
                 tokio::spawn(async move { daemon.name_appeared(&name).await });
             }
@@ -764,6 +777,7 @@ async fn watch_departures(daemon: &Arc<Daemon>) -> zbus::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -777,12 +791,18 @@ mod tests {
 
     #[test]
     fn only_the_owner_of_a_tracked_prompt_may_control_it() {
-        let prompts = [entry("/p1", ":1.1")];
-        assert!(may_control(&prompts, "/p1", Some(":1.1")).is_ok());
-        assert!(matches!(may_control(&prompts, "/p1", Some(":1.2")), Err(SecretError::AccessDenied(_))));
-        assert!(matches!(may_control(&prompts, "/p1", None), Err(SecretError::AccessDenied(_))));
+        let mut prompts = [entry("/p0", ":1.1"), entry("/p1", ":1.1")];
+        let own = controlled(&mut prompts, "/p1", Some(":1.1")).unwrap();
+        assert_eq!(own.path, "/p1", "the entry at that path");
+        own.started = false;
+        let started: Vec<bool> = prompts.iter().map(|p| p.started).collect();
+        assert_eq!(started, [true, false], "and it can be changed in place");
+        let mut tried = |path: &str, sender| format!("{:?}", controlled(&mut prompts, path, sender).map(|p| p.seq));
+        for sender in [Some(":1.2"), None] {
+            assert_eq!(tried("/p1", sender), r#"Err(AccessDenied("the prompt belongs to another client"))"#);
+        }
         // No longer tracked (finished, evicted, or its client left): nobody may.
-        assert!(may_control(&prompts, "/p2", Some(":1.1")).is_err());
+        assert_eq!(tried("/p2", Some(":1.1")), r#"Err(Failed("the prompt was dismissed"))"#);
     }
 
     #[test]
@@ -798,5 +818,288 @@ mod tests {
         lock(&prompts).retain(|p| p.owner != ":1.1");
         assert!(claim_action(&prompts, "/p1", &held).is_none());
         assert!(lock(&held).is_none(), "and the action is dropped");
+    }
+
+    use crate::backend::memory::MemoryBackend;
+    use crate::config::Config;
+    use crate::daemon::{Gate, SESSIONS_PER_OWNER, SESSIONS_TOTAL};
+    use crate::keyring::Keyring;
+    use crate::prompter::Prompter;
+    use std::time::Duration;
+    use zbus::Connection;
+    use zbus::export::futures_core::Stream;
+
+    /// The bus driver as far as the daemon asks it: which names are gone.
+    struct Driver {
+        gone: Vec<String>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.DBus")]
+    impl Driver {
+        async fn name_has_owner(&self, name: &str) -> bool {
+            !self.gone.iter().any(|g| g == name)
+        }
+    }
+
+    /// An unlocked daemon (memory backend) on one end of a socket pair. The
+    /// other end plays the bus driver, with the names in `gone` no longer on
+    /// the bus, and gets the daemon's signals.
+    async fn daemon_on_a_socket(gone: &[&str]) -> (Arc<Daemon>, Connection) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let driver = Driver { gone: gone.iter().map(|g| (*g).to_owned()).collect() };
+        let peer = zbus::connection::Builder::unix_stream(a)
+            .server(zbus::Guid::generate())
+            .p2p()
+            .serve_at("/org/freedesktop/DBus", driver)
+            .build();
+        let (peer, conn) = tokio::try_join!(peer, zbus::connection::Builder::unix_stream(b).p2p().build()).unwrap();
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        let d = Daemon::new(
+            Keyring::new(None, None),
+            backend,
+            Prompter::new("false", Duration::from_secs(1)),
+            Config::default(),
+        );
+        d.set_connection(conn);
+        d.unlock_with_password("pw").await.unwrap();
+        (d, peer)
+    }
+
+    /// The next message the peer got.
+    async fn next_message(stream: &mut zbus::MessageStream) -> zbus::Message {
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_next(cx)).await.unwrap().unwrap()
+    }
+
+    /// The next message the peer got, a signal naming one object: (member, path).
+    async fn next_signal(stream: &mut zbus::MessageStream) -> (String, String) {
+        let msg = next_message(stream).await;
+        assert_eq!(msg.header().message_type(), zbus::message::Type::Signal);
+        let (path,): (OwnedObjectPath,) = msg.body().deserialize().unwrap();
+        (msg.header().member().unwrap().to_string(), path.to_string())
+    }
+
+    async fn on_bus<I: zbus::object_server::Interface>(d: &Daemon, path: &str) -> bool {
+        d.conn().object_server().interface::<_, I>(path).await.is_ok()
+    }
+
+    fn the_err<T: std::fmt::Debug>(r: SResult<T>) -> String {
+        format!("{:?}", r.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn sessions_are_put_on_the_bus_and_capped_per_client() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        let refused = open_tracked_session(&d, "rot13", &[], ":1.7".into()).await;
+        assert!(the_err(refused).starts_with("NotSupported("));
+        let (output, first) = open_tracked_session(&d, "plain", &[], ":1.7".into()).await.unwrap();
+        assert!(output.is_empty(), "plain needs no key exchange");
+        assert!(on_bus::<SessionObj>(&d, &first).await);
+        let mut newest = String::new();
+        for _ in 0..SESSIONS_PER_OWNER {
+            newest = open_tracked_session(&d, "plain", &[], ":1.7".into()).await.unwrap().1;
+        }
+        // The client's oldest session made room, and its object is gone too.
+        assert!(!lock(&d.sessions).contains_key(&first));
+        assert!(!on_bus::<SessionObj>(&d, &first).await);
+        assert!(on_bus::<SessionObj>(&d, &newest).await);
+        assert_eq!(lock(&d.sessions).len(), SESSIONS_PER_OWNER);
+    }
+
+    #[tokio::test]
+    async fn a_full_daemon_frees_the_sessions_and_prompts_of_departed_clients_first() {
+        let (d, _peer) = daemon_on_a_socket(&[":2.5"]).await;
+        // Every other client holds as many sessions as it may, filling the
+        // total; one of them has left the bus, and one has no bus name.
+        let owners: Vec<String> = std::iter::once(String::new()).chain((1..64).map(|n| format!(":2.{n}"))).collect();
+        for (n, owner) in owners.iter().enumerate() {
+            for k in 0..SESSIONS_PER_OWNER {
+                let seq = (n * SESSIONS_PER_OWNER + k) as u64;
+                let session = crate::session::Session::open("plain", &[]).unwrap().0;
+                let open = Arc::new(OpenSession { seq, owner: owner.clone(), session });
+                assert!(d.admit_session(open, &format!("/held/s{seq}"), false).1);
+            }
+        }
+        let left =
+            PromptEntry { seq: 1, path: "/held/p1".into(), owner: ":2.5".into(), started: false, registered: false };
+        lock(&d.prompts).push(left);
+        assert_eq!(lock(&d.sessions).len(), SESSIONS_TOTAL);
+        assert!(d.known_owners().contains(":2.5") && d.known_owners().contains(""));
+
+        let (_, path) = open_tracked_session(&d, "plain", &[], ":1.9".into()).await.unwrap();
+        let sessions = lock(&d.sessions);
+        assert!(sessions.contains_key(&path));
+        assert!(!sessions.values().any(|s| s.owner == ":2.5"), "the departed client's sessions are freed");
+        assert_eq!(sessions.len(), SESSIONS_TOTAL - SESSIONS_PER_OWNER + 1, "and nobody else lost one");
+        drop(sessions);
+        assert!(lock(&d.prompts).is_empty(), "and its prompt");
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_client_leaves_while_its_object_is_added_is_removed_again() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        let gate = Arc::new(Gate::default());
+        *lock(&d.adding) = Some(gate.clone());
+        let opening = tokio::spawn({
+            let d = d.clone();
+            async move { open_tracked_session(&d, "plain", &[], ":1.7".into()).await }
+        });
+        gate.entered.notified().await;
+        assert_eq!(lock(&d.sessions).len(), 1, "admitted, its object not yet added");
+        d.drop_owner(":1.7").await;
+        gate.release.notify_one();
+        assert_eq!(the_err(opening.await.unwrap()), r#"Failed("the session was closed while opening")"#);
+        assert!(lock(&d.sessions).is_empty());
+        let path = format!("{SERVICE_PATH}/session/s{}", d.next_id() - 1);
+        assert!(!on_bus::<SessionObj>(&d, &path).await, "no object is left behind");
+    }
+
+    fn unlock_action() -> PromptAction {
+        PromptAction::Unlock { objects: vec![] }
+    }
+
+    #[tokio::test]
+    async fn the_oldest_idle_prompt_of_a_client_at_its_cap_is_dismissed() {
+        let (d, peer) = daemon_on_a_socket(&[]).await;
+        let mut signals = zbus::MessageStream::from(&peer);
+        let mut paths = vec![];
+        for _ in 0..PROMPTS_PER_OWNER {
+            paths.push(PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap().to_string());
+        }
+        let other = PromptObj::register(&d, Some(":1.8".into()), unlock_action()).await.unwrap();
+        let newest = PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap();
+        // The oldest told its client it was dismissed, with an empty unlock result.
+        let oldest = paths.first().unwrap();
+        let completed = next_message(&mut signals).await;
+        assert_eq!(completed.header().member().unwrap().as_str(), "Completed");
+        assert_eq!(completed.header().path().unwrap().as_str(), oldest);
+        let (dismissed, result): (bool, OwnedVariant) = completed.body().deserialize().unwrap();
+        assert!(dismissed);
+        assert_eq!(Vec::<OwnedObjectPath>::try_from(result).unwrap(), Vec::<OwnedObjectPath>::new());
+        assert!(!on_bus::<PromptObj>(&d, oldest).await);
+        for p in [paths.last().unwrap().as_str(), other.as_str(), newest.as_str()] {
+            assert!(on_bus::<PromptObj>(&d, p).await, "{p}");
+        }
+        assert_eq!(lock(&d.prompts).iter().filter(|p| p.owner == ":1.7").count(), PROMPTS_PER_OWNER);
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_prompts_all_run_gets_no_more() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        for _ in 0..PROMPTS_PER_OWNER {
+            PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap();
+        }
+        for p in lock(&d.prompts).iter_mut() {
+            p.started = true;
+        }
+        let refused = PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await;
+        assert_eq!(the_err(refused), r#"Failed("too many outstanding prompts")"#);
+        assert_eq!(lock(&d.prompts).len(), PROMPTS_PER_OWNER);
+    }
+
+    #[tokio::test]
+    async fn an_evicted_prompt_already_being_dismissed_is_not_signalled_twice() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        let mut paths = vec![];
+        for _ in 0..PROMPTS_PER_OWNER {
+            paths.push(PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap().to_string());
+        }
+        // `Dismiss` took the oldest's action; its own `finish` has not run yet.
+        let oldest = paths.first().unwrap();
+        let iface = d.conn().object_server().interface::<_, PromptObj>(oldest.as_str()).await.unwrap();
+        let taken = lock(&iface.get().await.action).take();
+        assert!(taken.is_some());
+        PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap();
+        // Evicted, but left to the pending `finish`: no second Completed.
+        assert!(!lock(&d.prompts).iter().any(|p| &p.path == oldest));
+        assert!(on_bus::<PromptObj>(&d, oldest).await, "only that finish removes it");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_whose_client_leaves_while_its_object_is_added_is_removed_again() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        let others = PromptObj::register(&d, Some(":1.8".into()), unlock_action()).await.unwrap();
+        let gate = Arc::new(Gate::default());
+        *lock(&d.adding) = Some(gate.clone());
+        let registering = tokio::spawn({
+            let d = d.clone();
+            async move { PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await }
+        });
+        gate.entered.notified().await;
+        assert_eq!(lock(&d.prompts).len(), 2, "a slot is reserved, the object not yet added");
+        d.drop_owner(":1.7").await;
+        gate.release.notify_one();
+        assert_eq!(the_err(registering.await.unwrap()), r#"Failed("the prompt was dismissed")"#);
+        let path = format!("{SERVICE_PATH}/prompt/p{}", d.next_id() - 1);
+        assert!(!on_bus::<PromptObj>(&d, &path).await, "no object is left behind");
+        // Another client's prompt is untouched.
+        let tracked: Vec<String> = lock(&d.prompts).iter().map(|p| p.path.clone()).collect();
+        assert_eq!(tracked, [others.to_string()]);
+        assert!(on_bus::<PromptObj>(&d, others.as_str()).await);
+    }
+
+    #[tokio::test]
+    async fn a_departed_clients_prompts_are_cancelled_and_removed() {
+        let (d, _peer) = daemon_on_a_socket(&[]).await;
+        let path = PromptObj::register(&d, Some(":1.7".into()), unlock_action()).await.unwrap();
+        let iface = d.conn().object_server().interface::<_, PromptObj>(path.as_str()).await.unwrap();
+        d.drop_owner(":1.7").await;
+        assert!(lock(&iface.get().await.action).is_none(), "its action is dropped");
+        assert!(!on_bus::<PromptObj>(&d, path.as_str()).await);
+        assert!(lock(&d.prompts).is_empty());
+    }
+
+    fn item(label: &str) -> NewItem {
+        NewItem {
+            label: label.into(),
+            attributes: [("k".to_owned(), label.to_owned())].into_iter().collect(),
+            secret: Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            replace: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn objects_and_signals_follow_the_keyring() {
+        let (d, peer) = daemon_on_a_socket(&[]).await;
+        let mut signals = zbus::MessageStream::from(&peer);
+        let git = "/usr/bin/git";
+        d.sync_objects().await.unwrap();
+        for c in [
+            collection_path(LOGIN_COLLECTION),
+            collection_path(SESSION_COLLECTION),
+            crate::daemon::DEFAULT_ALIAS_PATH.into(),
+        ] {
+            assert!(on_bus::<CollectionObj>(&d, &c).await, "{c}");
+        }
+
+        let work = d.create_collection("Work").await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("CollectionCreated".into(), work.to_string()));
+        assert!(on_bus::<CollectionObj>(&d, work.as_str()).await);
+        let vpn = d.create_item("work", item("vpn"), git).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemCreated".into(), vpn.to_string()));
+        assert!(on_bus::<ItemObj>(&d, vpn.as_str()).await);
+        let vpn_id = parse_path(vpn.as_str()).unwrap().1.unwrap();
+        d.update_item(&vpn_id, |i| i.label = "VPN".into()).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemChanged".into(), vpn.to_string()));
+        d.delete_item(&vpn_id).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemDeleted".into(), vpn.to_string()));
+        assert!(!on_bus::<ItemObj>(&d, vpn.as_str()).await);
+
+        let wifi = d.create_item("work", item("wifi"), git).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemCreated".into(), wifi.to_string()));
+        let wifi_id = parse_path(wifi.as_str()).unwrap().1.unwrap();
+        d.delete_collection("work", std::slice::from_ref(&wifi_id)).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("CollectionDeleted".into(), work.to_string()));
+        assert_eq!(next_signal(&mut signals).await, ("ItemDeleted".into(), wifi.to_string()));
+        assert!(!on_bus::<CollectionObj>(&d, work.as_str()).await && !on_bus::<ItemObj>(&d, wifi.as_str()).await);
+
+        // An object update that fails does not hold back the signals.
+        let mail = d.create_item(LOGIN_COLLECTION, item("mail"), git).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemCreated".into(), mail.to_string()));
+        d.conn().object_server().remove::<ItemObj, _>(mail.as_str()).await.unwrap();
+        d.delete_item(&parse_path(mail.as_str()).unwrap().1.unwrap()).await.unwrap();
+        assert_eq!(next_signal(&mut signals).await, ("ItemDeleted".into(), mail.to_string()));
     }
 }

@@ -15,11 +15,19 @@ import urllib.parse
 
 import pytest
 import secretstorage
+from jeepney import DBusAddress, HeaderFields, new_method_call
 
 from bwclient import Account
 from conftest import Daemon
 
 URL = os.environ.get("BW_E2E_URL")
+SVC = "/org/freedesktop/secrets"
+
+
+def _call(conn, path, interface, member, sig="", body=()):
+    addr = DBusAddress(path, bus_name="org.freedesktop.secrets", interface=interface)
+    return conn.send_and_get_reply(new_method_call(addr, member, sig, body))
+
 pytestmark = pytest.mark.skipif(not URL, reason="BW_E2E_URL not set")
 FOLDER = "secret-service"
 
@@ -92,6 +100,19 @@ def test_restart_finds_locked_items_and_unlocks_on_demand(account):
     d.start()
     try:
         assert d.cli("status").stdout.startswith("locked")
+        # Its object is on the bus, but its secret cannot be read while locked.
+        conn = secretstorage.dbus_init()
+        try:
+            unlocked, locked = _call(conn, SVC, "org.freedesktop.Secret.Service", "SearchItems", "a{ss}",
+                                     ({"restart": "yes"},)).body
+            assert unlocked == [] and len(locked) == 1, (unlocked, locked)
+            session = _call(conn, SVC, "org.freedesktop.Secret.Service", "OpenSession", "sv", ("plain", ("s", ""))).body[1]
+            reply = _call(conn, locked[0], "org.freedesktop.Secret.Item", "GetSecret", "o", (session,))
+            assert reply.header.message_type.name == "error"
+            assert reply.header.fields.get(HeaderFields.error_name) == "org.freedesktop.Secret.Error.IsLocked"
+            assert reply.body == ("the item is locked",)
+        finally:
+            conn.close()
         # libsecret sees the locked item through the locked index and unlocks it via the prompt.
         d.pinentry(pins=[account.password])
         assert d.tool("lookup", "restart", "yes").stdout == "persisted"

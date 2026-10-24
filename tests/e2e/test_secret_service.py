@@ -437,3 +437,260 @@ def test_a_password_for_an_unlocked_keyring_is_not_tried(memory_daemon):
     assert r.returncode == 0 and "unlocked" in r.stdout, r.stderr
     assert time.monotonic() - start < 2, "no penalty"
     assert d.cli("status").stdout.startswith("unlocked")
+
+
+# --- every Secret Service method, over raw D-Bus --------------------------------------
+
+SERVICE = "org.freedesktop.Secret.Service"
+COLLECTION = "org.freedesktop.Secret.Collection"
+ITEM = "org.freedesktop.Secret.Item"
+SESSION_COLL = "/org/freedesktop/secrets/collection/session"
+LABEL = "org.freedesktop.Secret.Collection.Label"
+ITEM_LABEL = "org.freedesktop.Secret.Item.Label"
+ITEM_ATTRS = "org.freedesktop.Secret.Item.Attributes"
+
+
+def _ok(reply):
+    assert reply.header.message_type.name == "method_return", (_error_name(reply), reply.body)
+    return reply.body
+
+
+def _refused(reply, name, message=None):
+    """Asserts that `reply` is the error org.freedesktop.Secret.Error.<name> (or a full error name)."""
+    assert reply.header.message_type.name == "error", reply.body
+    full = name if "." in name else f"org.freedesktop.Secret.Error.{name}"
+    assert _error_name(reply) == full, (_error_name(reply), reply.body)
+    if message is not None:
+        assert reply.body[0] == message, reply.body
+    return reply.body[0]
+
+
+def _get(conn, path, interface, prop):
+    return _ok(_call(conn, path, "org.freedesktop.DBus.Properties", "Get", "ss", (interface, prop)))[0][1]
+
+
+def _set(conn, path, interface, prop, sig, value):
+    return _call(conn, path, "org.freedesktop.DBus.Properties", "Set", "ssv", (interface, prop, (sig, value)))
+
+
+def _status(d):
+    """"locked" or "unlocked", from the first word of `bwss status`."""
+    return d.cli("status").stdout.split()[0].rstrip(",")
+
+
+def _run_prompt(conn, prompt, during=None):
+    """Starts `prompt` and returns its Completed signal's (dismissed, (signature, result)).
+
+    `during(conn)` runs after the prompt was started, before the signal is awaited.
+    """
+    from jeepney import MatchRule
+    from jeepney.bus_messages import message_bus as bus_driver
+
+    rule = MatchRule(type="signal", interface=PROMPT_IFACE, member="Completed", path=prompt)
+    _ok(conn.send_and_get_reply(bus_driver.AddMatch(rule)))
+    with conn.filter(rule) as queue:
+        _ok(_call(conn, prompt, PROMPT_IFACE, "Prompt", "s", ("",)))
+        if during:
+            during(conn)
+        return conn.recv_until_filtered(queue, timeout=60).body
+
+
+def _item_of(conn, attributes):
+    unlocked, locked = _ok(_call(conn, SVC, SERVICE, "SearchItems", "a{ss}", (attributes,)))
+    return (unlocked + locked)[0]
+
+
+def _create_item(conn, collection, session, attributes, value, replace=False, label="e2e"):
+    props = {ITEM_LABEL: ("s", label), ITEM_ATTRS: ("a{ss}", attributes)}
+    return _call(conn, collection, COLLECTION, "CreateItem", "a{sv}(oayays)b",
+                 (props, (session, b"", value, "text/plain"), replace))
+
+
+def test_aliases_name_the_built_in_collections(memory_daemon, bus):
+    unlock(memory_daemon)
+    for name, path in [("default", LOGIN), ("login", LOGIN), ("session", SESSION_COLL), ("nope", "/")]:
+        assert _ok(_call(bus, SVC, SERVICE, "ReadAlias", "s", (name,))) == (path,), name
+    # Creating the "default" collection gives the existing login collection.
+    created = _ok(_call(bus, SVC, SERVICE, "CreateCollection", "a{sv}s", ({LABEL: ("s", "Other")}, "default")))
+    assert created == (LOGIN, "/")
+    assert sorted(_get(bus, SVC, SERVICE, "Collections")) == sorted([LOGIN, SESSION_COLL])
+    # Re-asserting default -> login is accepted; nothing else is.
+    assert _ok(_call(bus, SVC, SERVICE, "SetAlias", "so", ("default", LOGIN))) == ()
+    for name, path in [("default", SESSION_COLL), ("work", LOGIN)]:
+        _refused(_call(bus, SVC, SERVICE, "SetAlias", "so", (name, path)), "NotSupported",
+                 "aliases other than default → login are not supported")
+    assert _ok(_call(bus, SVC, SERVICE, "ReadAlias", "s", ("work",))) == ("/",)
+
+
+def test_a_collection_asked_for_while_locked_is_created_once_the_prompt_unlocks(memory_daemon, bus):
+    d = memory_daemon
+    d.pinentry(pins=[PASSWORD])
+    coll, prompt = _ok(_call(bus, SVC, SERVICE, "CreateCollection", "a{sv}s", ({LABEL: ("s", "Work")}, "")))
+    assert coll == "/" and prompt.startswith("/org/freedesktop/secrets/prompt/"), (coll, prompt)
+    work = "/org/freedesktop/secrets/collection/work"
+    assert _run_prompt(bus, prompt) == (False, ("o", work))
+    assert _status(d) == "unlocked"
+    assert _ok(_call(bus, SVC, SERVICE, "ReadAlias", "s", ("work",))) == (work,)
+    assert work in _get(bus, SVC, SERVICE, "Collections")
+    assert _get(bus, work, COLLECTION, "Label") == "Work"
+    created, modified = _get(bus, work, COLLECTION, "Created"), _get(bus, work, COLLECTION, "Modified")
+    assert created > 1_600_000_000 and modified >= created
+    assert _ok(_set(bus, work, COLLECTION, "Label", "s", "Renamed")) == ()
+    assert _get(bus, work, COLLECTION, "Label") == "Renamed"
+    assert _get(bus, work, COLLECTION, "Modified") >= modified
+    assert _get(bus, work, COLLECTION, "Locked") is False
+    assert _get(bus, LOGIN, COLLECTION, "Created") > 0 and _get(bus, LOGIN, COLLECTION, "Modified") > 0
+
+
+def test_lock_and_unlock_leave_the_session_collection_alone(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    assert _ok(_call(bus, SVC, SERVICE, "Lock", "ao", ([SESSION_COLL],))) == ([], "/")
+    assert _status(d) == "unlocked", "the session collection never locks"
+    assert _ok(_call(bus, SVC, SERVICE, "Lock", "ao", ([LOGIN, SESSION_COLL],))) == ([LOGIN], "/")
+    assert _status(d) == "locked"
+    # The session collection is always open: unlocking it needs no prompt.
+    assert _ok(_call(bus, SVC, SERVICE, "Unlock", "ao", ([SESSION_COLL],))) == ([SESSION_COLL], "/")
+    assert _status(d) == "locked"
+    unlock(d)
+    assert _ok(_call(bus, SVC, SERVICE, "LockService")) == ()
+    assert _status(d) == "locked"
+    _refused(_call(bus, SVC, SERVICE, "ChangeLock", "o", (LOGIN,)), "NotSupported",
+             "the keyring password is the Bitwarden master password; change it in Bitwarden")
+
+
+def test_get_secrets_returns_only_the_items_it_can_read(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=a", "multi", "known", input="one")
+    item = _item_of(bus, {"multi": "known"})
+    session = _open_plain(bus)
+    d.pinentry(confirm="once")
+    secrets = _ok(_call(bus, SVC, SERVICE, "GetSecrets", "aoo", ([LOGIN + "/nope", item], session)))[0]
+    assert secrets == {item: (session, b"", b"one", "text/plain")}
+
+
+def test_a_session_serves_only_the_client_that_opened_it(memory_daemon, bus, other_bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=a", "owned", "session", input="mine")
+    item = _item_of(bus, {"owned": "session"})
+    theirs = _open_plain(other_bus)
+    _refused(_call(bus, item, ITEM, "GetSecret", "o", (theirs,)), "NoSession", "the session belongs to another client")
+    _refused(_create_item(bus, LOGIN, theirs, {"owned": "other"}, b"x"), "NoSession",
+             "the session belongs to another client")
+    assert not _ok(_call(bus, SVC, SERVICE, "SearchItems", "a{ss}", ({"owned": "other"},)))[0]
+
+
+def test_a_secret_that_does_not_decrypt_is_refused(memory_daemon, bus):
+    from secretstorage.util import open_session
+
+    unlock(memory_daemon)
+    session = open_session(bus)
+    assert session.encrypted
+    props = {ITEM_LABEL: ("s", "bad"), ITEM_ATTRS: ("a{ss}", {"cipher": "bad"})}
+    reply = _call(bus, LOGIN, COLLECTION, "CreateItem", "a{sv}(oayays)b",
+                  (props, (session.object_path, b"short iv", b"0123456789abcdef", "text/plain"), False))
+    _refused(reply, "Failed", "invalid encrypted secret")
+    assert not _ok(_call(bus, SVC, SERVICE, "SearchItems", "a{ss}", ({"cipher": "bad"},)))[0]
+
+
+def test_a_property_change_without_access_fails(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=private", "prop", "acl", input="mine")
+    item = _item_of(bus, {"prop": "acl"})
+    d.pinentry(confirm="deny")
+    for prop, sig, value in [("Label", "s", "stolen"), ("Attributes", "a{ss}", {"prop": "stolen"})]:
+        message = _refused(_set(bus, item, ITEM, prop, sig, value), "org.freedesktop.DBus.Error.Failed")
+        assert message.startswith("AccessDenied(") and "was denied access to" in message, message
+    assert _get(bus, item, ITEM, "Label") == "private"
+    assert _get(bus, item, ITEM, "Attributes") == {"prop": "acl"}
+
+
+def test_a_prompt_whose_action_fails_completes_as_dismissed(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=mine", "replace", "denied", input="mine")
+    attributes = _get(bus, _item_of(bus, {"replace": "denied"}), ITEM, "Attributes")
+    d.cli("lock")
+    session = _open_plain(bus)
+    # The password unlocks the keyring, then replacing secret-tool's item is denied.
+    d.pinentry(pins=[PASSWORD], confirm="deny")
+    item, prompt = _ok(_create_item(bus, LOGIN, session, attributes, b"other", replace=True))
+    assert item == "/"
+    assert _run_prompt(bus, prompt) == (True, ("o", "/"))
+    assert _status(d) == "unlocked"
+    assert d.tool("lookup", "replace", "denied").stdout == "mine"
+    assert "prompt action failed" in (d.home / "daemon.log").read_text()
+    assert not _object_exists(bus, prompt)
+
+
+def test_a_dismissed_prompt_completes_once_and_goes(memory_daemon, bus):
+    from jeepney import MatchRule
+    from jeepney.bus_messages import message_bus as bus_driver
+
+    prompt = _ok(_call(bus, SVC, SERVICE, "Unlock", "ao", ([LOGIN],)))[1]
+    rule = MatchRule(type="signal", interface=PROMPT_IFACE, member="Completed", path=prompt)
+    _ok(bus.send_and_get_reply(bus_driver.AddMatch(rule)))
+    with bus.filter(rule) as queue:
+        assert _ok(_call(bus, prompt, PROMPT_IFACE, "Dismiss")) == ()
+        assert bus.recv_until_filtered(queue, timeout=30).body == (True, ("ao", []))
+    assert _wait_until(lambda: not _object_exists(bus, prompt))
+    _refused(_call(bus, prompt, PROMPT_IFACE, "Dismiss"), "org.freedesktop.DBus.Error.UnknownObject")
+    assert _status(memory_daemon) == "locked"
+
+
+def test_a_prompt_whose_action_already_runs_is_not_dismissed(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=mine", "replace", "running", input="mine")
+    mine = _item_of(bus, {"replace": "running"})
+    attributes = _get(bus, mine, ITEM, "Attributes")
+    d.cli("lock")
+    session = _open_plain(bus)
+    release = d.home / "release-confirm"
+    d.pinentry(pins=[PASSWORD], confirm="once", confirm_release=str(release))
+    item, prompt = _ok(_create_item(bus, LOGIN, session, attributes, b"replaced", replace=True))
+
+    def dismiss_while_asking(conn):
+        # Unlocked; the action runs and asks whether python may replace the item.
+        assert _wait_until(lambda: any(p.startswith("CONFIRM") for p in d.prompts()))
+        assert _ok(_call(conn, prompt, PROMPT_IFACE, "Dismiss")) == ()
+        release.touch()
+
+    assert _run_prompt(bus, prompt, during=dismiss_while_asking) == (False, ("o", mine)), "the item was replaced"
+    assert d.tool("lookup", "replace", "running").stdout == "replaced"
+
+
+def _confirms_asked(d):
+    return sum(1 for p in d.prompts() if p.startswith("CONFIRM"))
+
+
+def test_an_item_deleted_during_its_access_prompt_is_not_read(memory_daemon, bus):
+    import threading
+
+    d = memory_daemon
+    unlock(d)
+    session = _open_plain(bus)
+    replies = {}
+    for name in ("GetSecret", "GetSecrets"):
+        d.tool("store", f"--label={name}", "deleted", name, input="gone")
+        item = _item_of(bus, {"deleted": name})
+        if name == "GetSecret":
+            call = (item, ITEM, name, "o", (session,))
+        else:
+            call = (SVC, SERVICE, name, "aoo", ([item], session))
+        release = d.home / f"release-{name}"
+        d.pinentry(confirm="once", confirm_release=str(release))
+        before = _confirms_asked(d)
+        reader = threading.Thread(target=lambda c=call, n=name: replies.update({n: _call(bus, *c)}))
+        reader.start()
+        # python is asked about; meanwhile secret-tool, which created the
+        # item, deletes it without being asked.
+        assert _wait_until(lambda: _confirms_asked(d) > before)
+        d.tool("clear", "deleted", name)
+        release.touch()
+        reader.join(60)
+    _refused(replies["GetSecret"], "IsLocked", "the item is locked")
+    assert _ok(replies["GetSecrets"]) == ({},)
