@@ -321,19 +321,58 @@ changing are never clobbered. Then:
 
 - Every read of a secret (`GetSecret(s)`), every change (`SetSecret`,
   `Label`, `Attributes`, `CreateItem` with `replace`) and every delete
-  checks the caller's executable (`/proc/<pid>/exe` of the bus peer)
-  against `bwss:acl`. Anyone else gets a fail-closed pinentry confirmation:
-  "Allow / Deny", then "Always allow / Only this time". Only an explicit OK
-  grants anything.
-- "Always allow" appends to `bwss:acl` in the item, so it syncs. A
-  hand-marked item starts with no ACL: every app is asked the first time.
+  checks the caller's executable against `bwss:acl`. Anyone else gets a
+  fail-closed pinentry confirmation: "Allow / Deny", then "Always allow /
+  Only this time". Only an explicit OK grants anything.
+- **Caller identity.** A unique bus name is pinned to the process first
+  seen behind it: pid, start time (`/proc/<pid>/stat` field 22) and
+  executable (`/proc/<pid>/exe`, a ` (deleted)` suffix dropped). The pid
+  comes from `GetConnectionCredentials`: through its `ProcessFD` (a pidfd,
+  read via `/proc/self/fdinfo`, which must still name the same live
+  process after the reads) when the bus provides one, otherwise from
+  `ProcessID`. Every later call re-reads all three; any difference (the
+  pid was reused, or the process exec'd another binary) makes the caller
+  an unknown application. The pin is dropped when the name leaves the bus.
+- **Unknown applications and interpreters** are asked every time with
+  "Allow / Deny" only, and the prompt says why. An interpreter is an
+  executable whose basename is `python*`, `perl*`, `ruby*`, `node`, `deno`,
+  `bun`, `sh`, `bash`, `zsh`, `fish`, `dash`, `lua*`, `php*` or `java`: a
+  grant to it would cover every script it runs. No ACL line ever counts
+  for these callers, they never get one when they create an item, and the
+  old shared `(unknown application)` line grants nothing.
+- **Grants are confirmed per device.** "Always allow" appends to
+  `bwss:acl` in the item, so it syncs, and a creating app gets the first
+  line. But a line counts on a device only once that device confirmed it.
+  The set of confirmed lines is device state
+  (`$XDG_STATE_HOME/dybw/tools/bwss/acl-confirmed`, mode 0600, never
+  synced): tags `HMAC(K, bwss:id ‖ 0x00 ‖ exe)` with
+  `K = user_key.derive("acl-confirm")` (MAC half), sealed as a whole under
+  `K` as `{ "format": 2, "set": "<EncString>" }`, like the write queue.
+  - A grant made on this device (an "Always allow", or the creator's line)
+    is recorded when it is made.
+  - A line found in the item but not in the set triggers a one-time
+    "Allow `<exe>`, granted on another device?" (Allow / Deny). Allow
+    records it; Deny records a denial, so that caller is refused on this
+    device without asking until the line changes.
+  - When the caller's line is gone from the item, so is whatever was
+    recorded about it: a line added again later is asked about again.
+  - A file that is not `format: 2` is set aside. One that cannot be read
+    or opened with `K` (another account, damage) reads as empty and is
+    never overwritten; decisions then stay in memory until the daemon
+    exits, with a warning in the log.
+  - The memory backend's items never leave the daemon, so its lines count
+    without confirmation.
 - `acl = "off"` disables checks (gnome-keyring behaviour). The `session`
   collection is exempt.
 - Labels and attributes of marked items are readable by any process on the
   bus while unlocked; that is how the Secret Service API works. This is why
   marking is opt-in: the user decides which items' metadata apps may see.
-- Limits, as before: same-user processes can ptrace each other, and
-  interpreters share one identity. This is a speed bump, not a sandbox.
+- Limits: this is a speed bump, not a sandbox. Same-user processes can
+  ptrace each other (§10, §11). Pinning stops pid reuse and an exec after
+  the first call, but not a process that connects, forks, and execs an
+  allowed binary in the parent before its child's first call: the bus
+  still reports the parent, which now runs that binary. A check based on
+  the process cannot close this.
 
 ## 7. Unlocking, locking and the locked index
 
@@ -578,6 +617,13 @@ own pinentry, so no password crosses the bus; throttled like a failed
 password), `UnlockWithPassword(s)`, `Lock()`, `Sync()` and
 `Status() -> (b, u, s)`.
 
+`UnlockWithPassword` is refused, before the password is tried, unless the
+caller (identified as in §6) runs the daemon's own executable
+(`current_exe()`, canonical paths, ` (deleted)` ignored): it exists for
+`bwss unlock --password-stdin` only. This is a speed bump with the
+same-user limits of §10: a process of the user can exec the bwss binary or
+ptrace it.
+
 ## 10. Configuration and CLI
 
 ```toml
@@ -638,7 +684,7 @@ boundary for `--password-stdin`.
 | User data in marked items | Writes touch bwss fields and the value source only; a new secret never goes into the user's password or notes; trash only when no foreign content (other tools' fields included) is left |
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 file, https only except loopback, redirects disabled |
-| Disk | Bitwarden ciphertext only (cache, queue); hashed locked index |
+| Disk | Bitwarden ciphertext only (cache, queue, ACL confirmations); hashed locked index |
 | Server input | KDF bounds, MAC checked before decrypt, error text clipped |
 
 Notes:
@@ -654,9 +700,10 @@ Notes:
   but not a process of the same user that forks and execs a real
   `bwss daemon`, nor one that can ptrace. Same-user processes are not a
   security boundary for `--password-stdin`.
-- `bwss:acl` comes from the item. Anyone who can edit the item in
-  Bitwarden can grant an executable access; for personal items that is the
-  user.
+- `bwss:acl` comes from the item, and anyone who can edit the item in
+  Bitwarden can add a line. A line counts on a device only after that
+  device granted or confirmed it (§6), so a line slipped in elsewhere
+  asks first.
 
 ## 12. Later: organization items
 
@@ -698,7 +745,8 @@ config, fsutil), since none of those change in substance.
 | `backend/bitwarden.rs` | Snapshot built from marked items and the collection registry; no sub-folders, no `whole_vault`, no `vault-acl` |
 | `model.rs` | No `read_only`; reversible path escape |
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
-| `keyring.rs`, `session.rs`, `prompter.rs`, `acl.rs`, `config.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault` |
+| `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
+| `keyring.rs`, `session.rs`, `prompter.rs`, `config.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault` |
 
 ## 14. Compatibility with `legacy`
 

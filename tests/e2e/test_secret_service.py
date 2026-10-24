@@ -4,6 +4,8 @@ Clients used: libsecret (`secret-tool`), python-secretstorage (which speaks the
 DH-encrypted session), and the bwss CLI.
 """
 
+import shutil
+import subprocess
 import time
 
 import pytest
@@ -63,6 +65,8 @@ def test_cancelled_prompt_leaves_the_keyring_locked(memory_daemon):
 def test_dh_session_round_trip_with_secretstorage(memory_daemon, bus):
     d = memory_daemon
     unlock(d)
+    # python is an interpreter: it is asked every time, even for its own items.
+    d.pinentry(confirm="once")
     coll = secretstorage.get_default_collection(bus)
     assert not coll.is_locked()
     # secretstorage negotiates dh-ietf1024-sha256-aes128-cbc-pkcs7 by default.
@@ -83,6 +87,7 @@ def test_dh_session_round_trip_with_secretstorage(memory_daemon, bus):
 def test_replace_updates_instead_of_duplicating(memory_daemon, bus):
     d = memory_daemon
     unlock(d)
+    d.pinentry(confirm="once")
     coll = secretstorage.get_default_collection(bus)
     coll.create_item("a", {"id": "same"}, b"1")
     coll.create_item("a", {"id": "same"}, b"2", replace=True)
@@ -113,37 +118,83 @@ def test_dismissed_unlock(memory_daemon, bus):
     assert coll.unlock() is True  # dismissed
 
 
-def test_acl_denies_other_applications_until_allowed(memory_daemon, bus):
+def other_tool(d):
+    """A copy of secret-tool: a different executable, and not an interpreter."""
+    path = d.home / "other-tool"
+    shutil.copy(shutil.which("secret-tool"), path)
+    return lambda *args, check=True: subprocess.run([str(path), *args], env=d.env, capture_output=True, text=True,
+                                                   check=check)
+
+
+def confirms(d):
+    return sum(1 for p in d.prompts() if p.startswith("CONFIRM"))
+
+
+def test_acl_denies_other_applications_until_allowed(memory_daemon):
     d = memory_daemon
     unlock(d)
-    # Created by secret-tool: python (this test) is a different executable.
     d.tool("store", "--label=private", "acl", "test", input="mine")
-    item = next(iter(secretstorage.get_default_collection(bus).search_items({"acl": "test"})))
+    other = other_tool(d)
 
     d.pinentry(confirm="deny")
-    with pytest.raises(Exception):
-        item.get_secret()
-    assert any(p.startswith("SETDESC") and "secret-tool" not in p and "private" in p for p in d.prompts())
+    assert other("lookup", "acl", "test", check=False).stdout == ""
+    assert any(p.startswith("SETDESC") and "other-tool" in p and "private" in p for p in d.prompts())
 
     d.pinentry(confirm="once")
-    assert item.get_secret() == b"mine"
+    assert other("lookup", "acl", "test").stdout == "mine"
+    d.pinentry(confirm="deny")
+    assert other("lookup", "acl", "test", check=False).stdout == ""
+
+    d.pinentry(confirm="always")
+    assert other("lookup", "acl", "test").stdout == "mine"
+    assert "SETOK Always allow" in d.prompts()
+    d.pinentry(confirm="deny")
+    before = confirms(d)
+    assert other("lookup", "acl", "test").stdout == "mine"  # remembered, no prompt
+    # The creator never needed a prompt.
+    assert d.tool("lookup", "acl", "test").stdout == "mine"
+    assert confirms(d) == before
+
+
+def test_interpreters_are_never_offered_always_allow(memory_daemon, bus):
+    d = memory_daemon
+    unlock(d)
+    d.tool("store", "--label=scripted", "acl", "interp", input="s3cret")
+    item = next(iter(secretstorage.get_default_collection(bus).search_items({"acl": "interp"})))
+
+    # The pinentry would answer "Always allow" if it were asked.
+    d.pinentry(confirm="always")
+    assert item.get_secret() == b"s3cret"
+    assert confirms(d) == 1, d.prompts()
+    assert not any("Always allow" in p for p in d.prompts()), d.prompts()
+    assert any(p.startswith("SETDESC") and "runs scripts" in p for p in d.prompts())
+
+    # Nothing was remembered: the next read is asked again.
     d.pinentry(confirm="deny")
     with pytest.raises(Exception):
         item.get_secret()
+    assert confirms(d) == 2
 
-    d.pinentry(confirm="always")
-    assert item.get_secret() == b"mine"
-    d.pinentry(confirm="deny")
-    assert item.get_secret() == b"mine"  # remembered, no prompt
-    # The creator never needed a prompt.
-    before = len(d.prompts())
-    assert d.tool("lookup", "acl", "test").stdout == "mine"
-    assert len(d.prompts()) == before
+
+def test_unlock_with_password_only_from_the_bwss_cli(memory_daemon, bus):
+    from jeepney import DBusAddress, new_method_call
+
+    d = memory_daemon
+    ctl = DBusAddress("/io/github/dynamotn/bwss", bus_name="io.github.dynamotn.bwss",
+                      interface="io.github.dynamotn.bwss.Control1")
+    reply = bus.send_and_get_reply(new_method_call(ctl, "UnlockWithPassword", "s", (PASSWORD,)))
+    assert reply.header.message_type.name == "error"
+    assert "only the bwss CLI" in reply.body[0], reply.body
+    assert d.cli("status").stdout.startswith("locked")
+    # The CLI is bwss's own executable, so it still may.
+    unlock(d)
+    assert d.cli("status").stdout.startswith("unlocked")
 
 
 def test_collections(memory_daemon, bus):
     d = memory_daemon
     unlock(d)
+    d.pinentry(confirm="once")
     work = secretstorage.create_collection(bus, "Work")
     work.create_item("vpn", {"svc": "vpn"}, b"pw")
     assert "Work" in [c.get_label() for c in secretstorage.get_all_collections(bus)]

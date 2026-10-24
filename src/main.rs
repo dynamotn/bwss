@@ -1,6 +1,7 @@
 //! bwss — a freedesktop Secret Service backed by a Bitwarden vault.
 
 mod acl;
+mod acl_confirm;
 mod backend;
 mod bw;
 mod config;
@@ -207,6 +208,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     };
     let prompter = Prompter::new(config.prompter.clone(), Duration::from_secs(120));
     let daemon = Daemon::new(Keyring::new(index), backend, prompter, config.clone());
+    daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
 
     let conn = zbus::connection::Builder::session().build().await?;
     daemon.set_connection(conn.clone());

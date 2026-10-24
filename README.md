@@ -100,7 +100,10 @@ offline writes before upgrading. See
 - **Per-app access control, like the macOS Keychain.** The app that created
   an item can use it freely. Any other executable triggers
   *Allow / Deny*, then *Always allow / Only this time*. The check fails
-  closed: only an explicit "Allow" grants access.
+  closed: only an explicit "Allow" grants access. Interpreters (`python3`,
+  `bash`, `node`, ...) and apps bwss cannot identify are asked every time
+  and are never offered *Always allow*. A grant syncs with the item, but
+  each device asks once before it honours a grant made elsewhere.
 - **Offline-first.** The last sync is cached, still encrypted. The keyring
   unlocks and reads with no network; writes are queued in order and
   replayed when you are back online.
@@ -218,11 +221,19 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
   index holds salted attribute hashes, never secrets; this is the same
   trade-off gnome-keyring makes.
 
+- Only the `bwss` CLI itself may send the master password to the daemon
+  (`Control1.UnlockWithPassword`); any other executable is refused.
+- Access grants (`bwss:acl`) sync, but a device honours one only after it
+  granted or confirmed it. Its decisions live in
+  `~/.local/state/dybw/tools/bwss/acl-confirmed`, sealed with your vault
+  key and never synced. Deleting that file makes bwss ask again.
+
 What bwss is **not**: a sandbox. Per-app control identifies apps by
-executable path (`/proc/<pid>/exe`), so all Python scripts share
-`/usr/bin/python3`. Any process running as your user can still inspect
-other processes. It stops quiet cross-app reads, not a determined local
-attacker.
+executable path (`/proc/<pid>/exe`), pinned to the process first seen on
+each bus connection. That is why scripts are asked every time: all Python
+scripts share `/usr/bin/python3`. Any process running as your user can
+still inspect other processes, or fork and exec an allowed binary to pose
+as it. It stops quiet cross-app reads, not a determined local attacker.
 
 ## 🧪 Status
 

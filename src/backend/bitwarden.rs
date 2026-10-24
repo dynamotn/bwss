@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use super::ops::{Loaded, Op, read_versioned, seal, set_aside, unseal};
 use super::registry::{REGISTRY_ID, Registry};
 use super::runner::{Effect, status_lines};
-use super::{Backend, BackendError};
+use super::{AclTrust, Backend, BackendError};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::{F_KIND, field_names, field_value, first_index};
@@ -724,6 +724,12 @@ impl Backend for BitwardenBackend {
         let result = self.delete_locked(&mut queue, &item.id).await;
         self.forget_if_locked(&mut queue).await;
         result
+    }
+
+    async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        Ok(AclTrust::PerDevice(state.keys.user.derive("acl-confirm")))
     }
 
     async fn describe(&self) -> String {

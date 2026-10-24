@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{Backend, BackendError};
+use super::{AclTrust, Backend, BackendError};
 use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now};
 use crate::sync::lock;
 
@@ -84,6 +84,11 @@ impl Backend for MemoryBackend {
         self.check()?;
         lock(&self.data).items.retain(|i| i.id != item.id);
         Ok(())
+    }
+
+    async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+        self.check()?;
+        Ok(AclTrust::Local)
     }
 
     async fn describe(&self) -> String {

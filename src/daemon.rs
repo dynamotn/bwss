@@ -1,15 +1,18 @@
 //! Shared daemon state and the operations behind the D-Bus objects.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use zbus::{Connection, OwnedObjectPath, object_server::SignalEmitter};
+use zbus::{Connection, OwnedObjectPath, message::Header, object_server::SignalEmitter};
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, BackendError};
+use crate::acl::{CallerKind, Identities};
+use crate::acl_confirm::{ConfirmSet, Mark};
+use crate::backend::{AclTrust, Backend, BackendError};
 use crate::config::{AclMode, Config};
 use crate::dbus::{CollectionObj, ItemObj, ServiceObj};
 use crate::keyring::{Diff, Keyring};
@@ -180,6 +183,65 @@ impl PromptEntry {
     }
 }
 
+/// The state of the caller's line in an item's ACL, on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Line {
+    /// The caller is not listed.
+    Absent,
+    /// Listed and granted or confirmed on this device.
+    Confirmed,
+    /// Listed, and the user refused the line on this device.
+    Denied,
+    /// Listed, but synced in and not yet confirmed here.
+    Unconfirmed,
+}
+
+/// How an access request is settled (design §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny,
+    /// Ask the user; "Always allow" is offered only when `always`.
+    Ask {
+        always: bool,
+    },
+    /// Ask once whether a line that synced in counts on this device.
+    ConfirmLine,
+}
+
+/// The decision for a caller of `kind` whose line is in state `line`, when
+/// the ACL applies at all. Unknown callers and interpreters are always
+/// asked, never offered "Always allow", and no line ever counts for them.
+pub fn decide(kind: CallerKind, line: Line) -> Decision {
+    match (kind, line) {
+        (CallerKind::Unknown | CallerKind::Interpreter, _) => Decision::Ask { always: false },
+        (CallerKind::App, Line::Confirmed) => Decision::Allow,
+        (CallerKind::App, Line::Denied) => Decision::Deny,
+        (CallerKind::App, Line::Unconfirmed) => Decision::ConfirmLine,
+        (CallerKind::App, Line::Absent) => Decision::Ask { always: true },
+    }
+}
+
+/// The text of an access prompt, saying why "Always allow" is missing when it is.
+fn ask_text(caller: &str, action: &str, label: &str, kind: CallerKind) -> String {
+    let why = match kind {
+        CallerKind::Unknown => "\n\nbwss cannot tell which application this is, so it asks every time.",
+        CallerKind::Interpreter => {
+            "\n\nThis program runs scripts and bwss cannot tell them apart, so it asks every time."
+        }
+        CallerKind::App => "",
+    };
+    format!("{caller}\n\nwants to {action} the keyring item\n\n\"{label}\"{why}")
+}
+
+/// The text of the one-time question about a line that synced in.
+fn confirm_line_text(caller: &str, action: &str, label: &str) -> String {
+    format!(
+        "Allow {caller}, granted on another device?\n\nIt wants to {action} the keyring item\n\n\"{label}\"\n\n\
+         This is asked once on this device; a denial is remembered."
+    )
+}
+
 pub struct OpenSession {
     pub seq: u64,
     pub owner: String,
@@ -203,6 +265,13 @@ pub struct Daemon {
     /// Serializes remote password attempts and spaces out the failed ones.
     failure_gate: Mutex<()>,
     confirm_gate: Mutex<()>,
+    /// The processes behind the bus names that called.
+    identities: Identities,
+    /// Where this device's ACL confirmations are kept (`None`: memory only).
+    acl_state_path: OnceLock<PathBuf>,
+    /// This device's ACL confirmations; loaded on first use after an unlock,
+    /// dropped at lock with the key that seals them.
+    confirmed: Mutex<Option<ConfirmSet>>,
 }
 
 impl Daemon {
@@ -221,11 +290,24 @@ impl Daemon {
             unlock_gate: Mutex::new(()),
             failure_gate: Mutex::new(()),
             confirm_gate: Mutex::new(()),
+            identities: Identities::default(),
+            acl_state_path: OnceLock::new(),
+            confirmed: Mutex::new(None),
         })
     }
 
     pub fn set_connection(&self, conn: Connection) {
         let _ = self.conn.set(conn);
+    }
+
+    /// Keeps this device's ACL confirmations in `path` instead of memory.
+    pub fn set_acl_state_path(&self, path: PathBuf) {
+        let _ = self.acl_state_path.set(path);
+    }
+
+    /// The executable behind the sender of `header`, or `acl::UNKNOWN`.
+    pub async fn caller(&self, header: &Header<'_>) -> String {
+        self.identities.caller_executable(self.conn(), header).await
     }
 
     #[expect(clippy::expect_used, reason = "set_connection runs before the first request is served")]
@@ -410,6 +492,7 @@ impl Daemon {
     /// Frees everything a client held, once it left the bus. Prompts that
     /// have not started drop their pending secret with their object.
     pub async fn drop_owner(&self, owner: &str) {
+        self.identities.forget(owner);
         let sessions: Vec<String> = {
             let mut sessions = lock(&self.sessions);
             let paths: Vec<String> =
@@ -489,6 +572,7 @@ impl Daemon {
             before = k.item_refs();
             k.lock();
         }
+        *self.confirmed.lock().await = None;
         self.backend.lock().await;
         let after: BTreeSet<(String, String)> = self.keyring.lock().await.item_refs().into_iter().collect();
         let diff = Diff { deleted: before.into_iter().filter(|r| !after.contains(r)).collect(), ..Default::default() };
@@ -514,39 +598,112 @@ impl Daemon {
 
     /// Checks that `caller` may use the item, asking the user when needed.
     pub async fn authorize(self: &Arc<Self>, caller: &str, item_id: &str, action: &str) -> SResult<()> {
-        let (label, acl, collection) = {
+        let (mut decision, mut label) = self.decision(caller, item_id).await?;
+        let _gate = match decision {
+            Decision::Allow | Decision::Deny => None,
+            Decision::Ask { .. } | Decision::ConfirmLine => {
+                let gate = self.confirm_gate.lock().await;
+                // An earlier prompt may have settled it meanwhile.
+                (decision, label) = self.decision(caller, item_id).await?;
+                Some(gate)
+            }
+        };
+        let denied = || SecretError::AccessDenied(format!("{caller} was denied access to \"{label}\""));
+        match decision {
+            Decision::Allow => Ok(()),
+            Decision::Deny => Err(denied()),
+            Decision::ConfirmLine => {
+                let answer = self.ask(&confirm_line_text(caller, action, &label), false).await;
+                let allowed = answer != Confirm::Deny;
+                self.remember(item_id, caller, if allowed { Mark::Confirmed } else { Mark::Denied }).await;
+                if allowed { Ok(()) } else { Err(denied()) }
+            }
+            Decision::Ask { always } => {
+                let text = ask_text(caller, action, &label, crate::acl::kind(caller));
+                match self.ask(&text, always).await {
+                    Confirm::Deny => Err(denied()),
+                    Confirm::Always if always => {
+                        self.grant(caller, item_id).await;
+                        Ok(())
+                    }
+                    Confirm::Once | Confirm::Always => Ok(()),
+                }
+            }
+        }
+    }
+
+    async fn ask(&self, text: &str, offer_always: bool) -> Confirm {
+        self.prompter.confirm(text, offer_always).await.unwrap_or_else(|e| {
+            tracing::warn!("prompt failed: {e}");
+            Confirm::Deny
+        })
+    }
+
+    /// The decision for `caller` on the item, and the item's label.
+    async fn decision(&self, caller: &str, item_id: &str) -> SResult<(Decision, String)> {
+        let (label, listed, collection) = {
             let k = self.keyring.lock().await;
             let item = k.item(item_id).ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
-            (item.label.clone(), item.acl.clone(), item.collection.clone())
+            (item.label.clone(), item.acl.iter().any(|a| a == caller), item.collection.clone())
         };
-        if self.config.acl == AclMode::Off || collection == SESSION_COLLECTION || acl.iter().any(|a| a == caller) {
-            return Ok(());
+        if self.config.acl == AclMode::Off || collection == SESSION_COLLECTION {
+            return Ok((Decision::Allow, label));
         }
-        let _gate = self.confirm_gate.lock().await;
-        let answer = self
-            .prompter
-            .confirm(&format!("{caller}\n\nwants to {action} the keyring item\n\n\"{label}\""))
-            .await
-            .unwrap_or(Confirm::Deny);
-        match answer {
-            Confirm::Once => Ok(()),
-            Confirm::Always => {
-                let updated = {
-                    let mut k = self.keyring.lock().await;
-                    let Some(item) = k.item(item_id).cloned() else { return Ok(()) };
-                    let mut item = item;
-                    if !item.acl.iter().any(|a| a == caller) {
-                        item.acl.push(caller.to_owned());
-                    }
-                    k.upsert(item.clone());
-                    item
-                };
-                if let Err(e) = self.backend.put_item(&updated).await {
-                    tracing::warn!("could not save the access rule: {e}");
-                }
-                Ok(())
+        let kind = crate::acl::kind(caller);
+        let line = if kind == CallerKind::App { self.line(caller, item_id, listed).await? } else { Line::Absent };
+        Ok((decide(kind, line), label))
+    }
+
+    /// The state of `caller`'s line in the item on this device. When the line
+    /// is gone from the item, so is whatever this device decided about it.
+    async fn line(&self, caller: &str, item_id: &str, listed: bool) -> SResult<Line> {
+        let key = match self.backend.acl_trust().await? {
+            AclTrust::Local => return Ok(if listed { Line::Confirmed } else { Line::Absent }),
+            AclTrust::PerDevice(key) => key,
+        };
+        let mut guard = self.confirmed.lock().await;
+        let set = guard.get_or_insert_with(|| ConfirmSet::open(self.acl_state_path.get().cloned(), key));
+        Ok(match (listed, set.mark(item_id, caller)) {
+            (true, Mark::Confirmed) => Line::Confirmed,
+            (true, Mark::Denied) => Line::Denied,
+            (true, Mark::None) => Line::Unconfirmed,
+            (false, Mark::None) => Line::Absent,
+            (false, Mark::Confirmed | Mark::Denied) => {
+                set.set(item_id, caller, Mark::None);
+                Line::Absent
             }
-            Confirm::Deny => Err(SecretError::AccessDenied(format!("{caller} was denied access to \"{label}\""))),
+        })
+    }
+
+    /// Records this device's decision about `caller`'s line in the item.
+    async fn remember(&self, item_id: &str, caller: &str, mark: Mark) {
+        match self.backend.acl_trust().await {
+            Ok(AclTrust::PerDevice(key)) => {
+                let mut guard = self.confirmed.lock().await;
+                guard
+                    .get_or_insert_with(|| ConfirmSet::open(self.acl_state_path.get().cloned(), key))
+                    .set(item_id, caller, mark);
+            }
+            Ok(AclTrust::Local) => {}
+            Err(e) => tracing::info!("access decision not recorded: {e}"),
+        }
+    }
+
+    /// "Always allow": adds `caller` to the item's ACL, which syncs, and
+    /// records that this device granted it.
+    async fn grant(&self, caller: &str, item_id: &str) {
+        let updated = {
+            let mut k = self.keyring.lock().await;
+            let Some(mut item) = k.item(item_id).cloned() else { return };
+            if !item.acl.iter().any(|a| a == caller) {
+                item.acl.push(caller.to_owned());
+            }
+            k.upsert(item.clone());
+            item
+        };
+        self.remember(item_id, caller, Mark::Confirmed).await;
+        if let Err(e) = self.backend.put_item(&updated).await {
+            tracing::warn!("could not save the access rule: {e}");
         }
     }
 
@@ -619,12 +776,17 @@ impl Daemon {
                 content_type,
                 created: t,
                 modified: t,
-                acl: if caller == crate::acl::UNKNOWN { vec![] } else { vec![caller.to_owned()] },
+                // Only an identified executable gets a line: an interpreter's
+                // would cover every script it runs.
+                acl: if crate::acl::kind(caller) == CallerKind::App { vec![caller.to_owned()] } else { vec![] },
             },
         };
         let is_new = self.keyring.lock().await.item(&item.id).is_none();
         if collection != SESSION_COLLECTION {
             self.backend.put_item(&item).await?;
+            if is_new && item.acl.iter().any(|a| a == caller) {
+                self.remember(&item.id, caller, Mark::Confirmed).await;
+            }
         }
         let path = op(&item_path(collection, &item.id));
         let r = (collection.to_owned(), item.id.clone());
@@ -864,6 +1026,9 @@ mod tests {
         async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
             self.inner.delete_item(item).await
         }
+        async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+            self.inner.acl_trust().await
+        }
         async fn describe(&self) -> String {
             self.inner.describe().await
         }
@@ -977,6 +1142,235 @@ mod tests {
         let item = k.item("x").unwrap();
         assert_eq!(&*item.secret, b"new");
         assert_eq!(own_attributes(&item.attributes), Attributes::from([("service".to_owned(), "git".to_owned())]));
+    }
+
+    #[test]
+    fn decision_table() {
+        use CallerKind::{App, Interpreter, Unknown};
+        for line in [Line::Absent, Line::Confirmed, Line::Denied, Line::Unconfirmed] {
+            assert_eq!(decide(Unknown, line), Decision::Ask { always: false }, "{line:?}");
+            assert_eq!(decide(Interpreter, line), Decision::Ask { always: false }, "{line:?}");
+        }
+        assert_eq!(decide(App, Line::Absent), Decision::Ask { always: true });
+        assert_eq!(decide(App, Line::Confirmed), Decision::Allow);
+        assert_eq!(decide(App, Line::Denied), Decision::Deny);
+        assert_eq!(decide(App, Line::Unconfirmed), Decision::ConfirmLine);
+    }
+
+    #[test]
+    fn prompts_say_why_always_is_missing() {
+        assert!(ask_text("/usr/bin/git", "read", "l", CallerKind::App).ends_with("\"l\""));
+        assert!(ask_text("/usr/bin/python3", "read", "l", CallerKind::Interpreter).contains("runs scripts"));
+        assert!(ask_text(crate::acl::UNKNOWN, "read", "l", CallerKind::Unknown).contains("cannot tell which"));
+        assert!(
+            confirm_line_text("/usr/bin/git", "read", "l")
+                .starts_with("Allow /usr/bin/git, granted on another device?")
+        );
+    }
+
+    /// A memory backend whose ACL lines may come from elsewhere, like Bitwarden's.
+    struct SyncedBackend {
+        inner: MemoryBackend,
+        key: crate::bw::crypto::SymmetricKey,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for SyncedBackend {
+        async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+            self.inner.unlock(password).await
+        }
+        async fn lock(&self) {
+            self.inner.lock().await;
+        }
+        async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
+            self.inner.refresh().await
+        }
+        async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+            self.inner.create_collection(label).await
+        }
+        async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
+            self.inner.delete_collection(id, items).await
+        }
+        async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+            self.inner.put_item(item).await
+        }
+        async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+            self.inner.delete_item(item).await
+        }
+        async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+            self.inner.acl_trust().await?;
+            Ok(AclTrust::PerDevice(self.key.clone()))
+        }
+        async fn describe(&self) -> String {
+            self.inner.describe().await
+        }
+    }
+
+    /// A pinentry that answers every CONFIRM with `confirm` ("OK" or a
+    /// cancel) and logs the commands it gets.
+    struct ScriptedPinentry {
+        dir: tempfile::TempDir,
+    }
+
+    impl ScriptedPinentry {
+        fn new(allow: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("log");
+            let answer = if allow { "OK" } else { "ERR 83886179 Operation cancelled" };
+            let script = format!(
+                "#!/bin/sh\necho OK\nwhile IFS= read -r l; do\n  printf '%s\\n' \"$l\" >> '{}'\n  case \"$l\" in\n    CONFIRM*) echo '{answer}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n",
+                log.display()
+            );
+            let path = dir.path().join("pinentry");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ScriptedPinentry { dir }
+        }
+
+        fn prompter(&self) -> Prompter {
+            Prompter::new(self.dir.path().join("pinentry").to_string_lossy(), Duration::from_secs(10))
+        }
+
+        fn log(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("log"))
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        }
+
+        fn confirms(&self) -> usize {
+            self.log().iter().filter(|l| l.starts_with("CONFIRM")).count()
+        }
+    }
+
+    const GIT: &str = "/usr/bin/git";
+
+    /// A daemon over a synced backend holding `stored_item("x")` with `acl`,
+    /// keeping its confirmations in `state`.
+    async fn synced_daemon(acl: &[&str], pinentry: &ScriptedPinentry, state: &std::path::Path) -> Arc<Daemon> {
+        let backend =
+            SyncedBackend { inner: MemoryBackend::new("pw"), key: crate::bw::crypto::SymmetricKey::generate() };
+        backend.inner.unlock("pw").await.unwrap();
+        let mut item = stored_item("x");
+        item.acl = acl.iter().map(|s| (*s).to_owned()).collect();
+        backend.inner.put_item(&item).await.unwrap();
+        let d = Daemon::new(Keyring::new(None), Arc::new(backend), pinentry.prompter(), Config::default());
+        d.set_acl_state_path(state.join("acl-confirmed"));
+        d.unlock_with_password("pw").await.unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_synced_line_is_confirmed_once_per_device() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let d = synced_daemon(&[GIT], &pin, state.path()).await;
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 1, "exactly one question, with no 'Always allow' step");
+        assert!(pin.log().iter().any(|l| l.contains("granted on another device")), "{:?}", pin.log());
+        assert!(!pin.log().iter().any(|l| l.contains("Always allow")));
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 1, "confirmed lines are not asked about again");
+        assert!(state.path().join("acl-confirmed").exists());
+        // Locking drops the set with its key; it comes back from the file.
+        d.lock().await;
+        d.unlock_with_password("pw").await.unwrap();
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_synced_line_stays_denied_without_asking_until_it_changes() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(false);
+        let d = synced_daemon(&[GIT], &pin, state.path()).await;
+        assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
+        assert_eq!(pin.confirms(), 1);
+        assert!(matches!(d.authorize(GIT, "x", "read").await, Err(SecretError::AccessDenied(_))));
+        assert_eq!(pin.confirms(), 1, "a remembered denial asks nothing");
+
+        // The line goes away: git is an ordinary unlisted caller again.
+        let mut item = d.keyring.lock().await.item("x").cloned().unwrap();
+        item.acl.clear();
+        d.keyring.lock().await.upsert(item.clone());
+        assert!(d.authorize(GIT, "x", "read").await.is_err());
+        assert_eq!(pin.confirms(), 2);
+        // When it comes back, it is a new line to confirm.
+        item.acl.push(GIT.into());
+        d.keyring.lock().await.upsert(item);
+        assert!(d.authorize(GIT, "x", "read").await.is_err());
+        assert_eq!(pin.confirms(), 3);
+        assert!(pin.log().last().is_some_and(|l| l.starts_with("BYE")));
+        assert!(pin.log().iter().filter(|l| l.contains("granted on another device")).count() == 2);
+    }
+
+    #[tokio::test]
+    async fn interpreters_and_unknown_callers_are_asked_every_time() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let python = "/usr/bin/python3.13";
+        let d = synced_daemon(&[python, crate::acl::UNKNOWN], &pin, state.path()).await;
+        for caller in [python, crate::acl::UNKNOWN] {
+            let before = pin.confirms();
+            d.authorize(caller, "x", "read").await.unwrap();
+            d.authorize(caller, "x", "read").await.unwrap();
+            assert_eq!(pin.confirms(), before + 2, "{caller}: a line in the item never counts");
+        }
+        assert!(!pin.log().iter().any(|l| l.contains("Always allow")), "{:?}", pin.log());
+        assert!(pin.log().iter().any(|l| l.contains("runs scripts")));
+        assert!(pin.log().iter().any(|l| l.contains("cannot tell which application")));
+        let acl = d.keyring.lock().await.item("x").unwrap().acl.clone();
+        assert_eq!(acl, [python, crate::acl::UNKNOWN], "nothing was added");
+    }
+
+    #[tokio::test]
+    async fn always_allow_lists_and_confirms_the_app_here() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let d = synced_daemon(&[], &pin, state.path()).await;
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2, "allow, then remember");
+        assert!(pin.log().iter().any(|l| l == "SETOK Always allow"));
+        assert_eq!(d.keyring.lock().await.item("x").unwrap().acl, [GIT]);
+        d.authorize(GIT, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 2, "granted on this device: no question");
+    }
+
+    #[tokio::test]
+    async fn the_creator_is_confirmed_unless_it_is_an_interpreter() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(false);
+        let d = synced_daemon(&[], &pin, state.path()).await;
+        let new = |label: &str| NewItem {
+            label: label.into(),
+            attributes: Attributes::from([("app".to_owned(), label.to_owned())]),
+            secret: Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            replace: false,
+        };
+        let git_path = d.create_item(LOGIN_COLLECTION, new("git"), GIT).await.unwrap();
+        let (_, git_id) = parse_path(git_path.as_str()).unwrap();
+        d.authorize(GIT, &git_id.unwrap(), "read").await.unwrap();
+        assert_eq!(pin.confirms(), 0, "the creator needs no question");
+
+        let py_path = d.create_item(LOGIN_COLLECTION, new("py"), "/usr/bin/python3").await.unwrap();
+        let py_id = parse_path(py_path.as_str()).unwrap().1.unwrap();
+        assert!(d.keyring.lock().await.item(&py_id).unwrap().acl.is_empty());
+        assert!(d.authorize("/usr/bin/python3", &py_id, "read").await.is_err());
+        assert_eq!(pin.confirms(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_acl_checks_nothing_is_asked() {
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        let pin = ScriptedPinentry::new(false);
+        let config = Config { acl: AclMode::Off, ..Config::default() };
+        let d = Daemon::new(Keyring::new(None), backend.clone(), pin.prompter(), config);
+        d.unlock_with_password("pw").await.unwrap();
+        backend.put_item(&stored_item("x")).await.unwrap();
+        d.keyring.lock().await.upsert(stored_item("x"));
+        d.authorize(crate::acl::UNKNOWN, "x", "read").await.unwrap();
+        assert_eq!(pin.confirms(), 0);
     }
 
     #[test]

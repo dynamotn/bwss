@@ -168,8 +168,9 @@ impl Prompter {
         .map_err(|_| PromptError::Timeout)?
     }
 
-    /// Asks whether an application may use an item.
-    pub async fn confirm(&self, description: &str) -> Result<Confirm, PromptError> {
+    /// Asks whether an application may use an item. Without `offer_always`
+    /// there is no second question: the answer is `Once` or `Deny`.
+    pub async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError> {
         tokio::time::timeout(self.timeout, async {
             let mut c = Conversation::start(&self.program).await?;
             c.set("SETTITLE", "Keyring access").await?;
@@ -179,9 +180,9 @@ impl Prompter {
             // Only an explicit OK grants anything: pinentries differ in how
             // they report other buttons, so every other answer is a denial.
             let allowed = matches!(c.command("CONFIRM").await?, Reply::Ok(_));
-            if !allowed {
+            if !allowed || !offer_always {
                 c.finish().await;
-                return Ok(Confirm::Deny);
+                return Ok(if allowed { Confirm::Once } else { Confirm::Deny });
             }
             c.set("SETDESC", "Remember this decision for this application?").await?;
             c.set("SETOK", "Always allow").await?;

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use zbus::{OwnedObjectPath, OwnedVariant, Variant, interface, message::Header, object_server::SignalEmitter};
 use zeroize::Zeroizing;
 
-use crate::acl::caller_executable;
 use crate::daemon::{
     Daemon, NewItem, OpenSession, PROMPTS_PER_OWNER, PromptEntry, PromptSlot, SERVICE_PATH, SResult, SecretError,
     WireSecret, collection_path, item_path, no_prompt, op, parse_path, prompt_slot,
@@ -180,7 +179,7 @@ impl ServiceObj {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, WireSecret>, SecretError> {
         self.daemon.session(session.as_str(), sender(&header).as_deref())?;
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         let mut out = HashMap::new();
         for path in items {
             let Some((_, Some(id))) = parse_path(path.as_str()) else { continue };
@@ -245,7 +244,7 @@ impl CollectionObj {
     async fn delete(&self, #[zbus(header)] header: Header<'_>) -> Result<OwnedObjectPath, SecretError> {
         // Deleting a collection deletes its items: the caller needs the same
         // permission it would need to delete each one of them.
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         let ids = self.daemon.keyring.lock().await.items_in(&self.id);
         for id in &ids {
             self.daemon.authorize(&caller, id, "delete").await?;
@@ -269,7 +268,7 @@ impl CollectionObj {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
         let (plain, content_type) = self.daemon.decode_secret(&secret, sender(&header).as_deref())?;
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         let label = prop_string(&properties, PROP_ITEM_LABEL);
         let attributes = prop_attributes(&properties);
         if self.daemon.keyring.lock().await.collection_locked(&self.id) {
@@ -334,7 +333,7 @@ pub struct ItemObj {
 #[interface(name = "org.freedesktop.Secret.Item")]
 impl ItemObj {
     async fn delete(&self, #[zbus(header)] header: Header<'_>) -> Result<OwnedObjectPath, SecretError> {
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         self.daemon.authorize(&caller, &self.id, "delete").await?;
         self.daemon.delete_item(&self.id).await?;
         Ok(no_prompt())
@@ -349,7 +348,7 @@ impl ItemObj {
         if self.daemon.keyring.lock().await.item_locked(&self.id) {
             return Err(SecretError::IsLocked("the item is locked".into()));
         }
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         self.daemon.authorize(&caller, &self.id, "read").await?;
         let (secret, ct) = self
             .daemon
@@ -365,7 +364,7 @@ impl ItemObj {
 
     async fn set_secret(&self, secret: WireSecret, #[zbus(header)] header: Header<'_>) -> Result<(), SecretError> {
         let (plain, content_type) = self.daemon.decode_secret(&secret, sender(&header).as_deref())?;
-        let caller = caller_executable(self.daemon.conn(), &header).await;
+        let caller = self.daemon.caller(&header).await;
         self.daemon.authorize(&caller, &self.id, "change").await?;
         self.daemon
             .update_item(&self.id, move |i| {
@@ -429,7 +428,7 @@ impl ItemObj {
         f: impl FnOnce(&mut crate::model::ItemData),
     ) -> zbus::fdo::Result<()> {
         let caller = match &header {
-            Some(h) => caller_executable(self.daemon.conn(), h).await,
+            Some(h) => self.daemon.caller(h).await,
             None => crate::acl::UNKNOWN.to_owned(),
         };
         let to_fdo = |e: SecretError| zbus::fdo::Error::Failed(format!("{e:?}"));
@@ -632,10 +631,22 @@ pub struct ControlObj {
 
 #[interface(name = "io.github.dynamotn.bwss.Control1")]
 impl ControlObj {
-    /// For login hooks and scripts. Failures are slowed down so that the
-    /// method cannot be used to guess the password quickly.
-    async fn unlock_with_password(&self, password: String) -> Result<(), SecretError> {
+    /// For `bwss unlock --password-stdin` only: any other executable is
+    /// refused before the password is tried. Failures are slowed down so that
+    /// the method cannot be used to guess the password quickly.
+    async fn unlock_with_password(
+        &self,
+        password: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), SecretError> {
         let password = Zeroizing::new(password);
+        let caller = self.daemon.caller(&header).await;
+        if !crate::acl::is_own_executable(&caller) {
+            tracing::warn!(caller = %caller, "refused a password sent by another executable");
+            return Err(SecretError::AccessDenied(format!(
+                "only the bwss CLI may send the master password; {caller} may not (use `bwss unlock`)"
+            )));
+        }
         self.daemon.unlock_with_password_throttled(&password).await.map_err(|e| SecretError::Failed(e.to_string()))
     }
 

@@ -112,6 +112,13 @@ pub fn value_mark(mark_key: &SymmetricKey, id: &str, stored: &str) -> [u8; 32] {
     hmac(&mark_key.mac, &[id.as_bytes(), &[0], stored.as_bytes()])
 }
 
+/// The tag that records an ACL decision on this device for the item `id`
+/// and the executable `exe`: HMAC-SHA256 of `id ‖ 0x00 ‖ exe` under the MAC
+/// half of `confirm_key` (the user key derived for "acl-confirm").
+pub fn acl_confirm_tag(confirm_key: &SymmetricKey, id: &str, exe: &str) -> [u8; 32] {
+    hmac(&confirm_key.mac, &[id.as_bytes(), &[0], exe.as_bytes()])
+}
+
 /// HKDF-Expand (RFC 5869) for one 32-byte block.
 fn hkdf_expand32(prk: &[u8], info: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(hmac(prk, &[info, &[1u8]]))

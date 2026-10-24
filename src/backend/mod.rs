@@ -10,7 +10,17 @@ mod tests;
 
 use async_trait::async_trait;
 
+use crate::bw::crypto::SymmetricKey;
 use crate::model::{CollectionData, ItemData, Snapshot};
+
+/// Where the ACL lines of a backend's items can have come from.
+pub enum AclTrust {
+    /// Only from this process: every line was granted here (memory backend).
+    Local,
+    /// From any device that syncs the vault: a line counts here only once
+    /// this device confirmed it (design §6). Decisions are keyed by this key.
+    PerDevice(SymmetricKey),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -42,6 +52,9 @@ pub trait Backend: Send + Sync {
     /// Stores a new or changed item.
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError>;
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError>;
+    /// How far the ACL lines of the items can be trusted on this device;
+    /// [`BackendError::Locked`] while locked.
+    async fn acl_trust(&self) -> Result<AclTrust, BackendError>;
     /// Human-readable status for `bwss status`.
     async fn describe(&self) -> String;
 }

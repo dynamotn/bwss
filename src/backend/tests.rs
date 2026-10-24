@@ -295,6 +295,7 @@ async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
         credentials: dir.path().join("credentials.toml"),
         cache: dir.path().join("cache"),
         state: dir.path().join("state"),
+        tool_state: dir.path().join("tool-state"),
     };
     let creds = Credentials { client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
     let backend = Arc::new(BitwardenBackend::new(&config, creds, &paths).unwrap());
@@ -884,4 +885,19 @@ async fn a_delete_keeps_an_item_that_gained_foreign_content_meanwhile() {
     assert!(v.fake.cipher(&cid)["deletedDate"].is_null(), "an item with foreign content is never trashed");
     assert_eq!(v.names(&cid), ["note"]);
     assert_eq!(v.fake.count("PUT", &format!("/api/ciphers/{cid}/delete")), 0);
+}
+
+#[tokio::test]
+async fn acl_decisions_are_keyed_by_a_key_of_their_own() {
+    let user = SymmetricKey::generate();
+    let v = vault(vec![], user.clone()).await;
+    match v.backend.acl_trust().await.unwrap() {
+        super::AclTrust::PerDevice(key) => {
+            assert_eq!(key.to_bytes(), user.derive("acl-confirm").to_bytes());
+            assert_ne!(key.to_bytes(), user.to_bytes());
+        }
+        super::AclTrust::Local => panic!("synced lines must be confirmed per device"),
+    }
+    v.backend.lock().await;
+    assert!(matches!(v.backend.acl_trust().await, Err(BackendError::Locked)));
 }

@@ -82,6 +82,8 @@ pub struct Paths {
     pub credentials: PathBuf,
     pub cache: PathBuf,
     pub state: PathBuf,
+    /// Device state under the dybw layout (`$XDG_STATE_HOME/dybw/tools/bwss`).
+    pub tool_state: PathBuf,
 }
 
 impl Paths {
@@ -92,6 +94,7 @@ impl Paths {
             credentials: config_dir.join("credentials.toml"),
             cache: xdg("XDG_CACHE_HOME", ".cache").join("bwss"),
             state: xdg("XDG_STATE_HOME", ".local/state").join("bwss"),
+            tool_state: xdg("XDG_STATE_HOME", ".local/state").join("dybw/tools/bwss"),
         }
     }
 }
@@ -150,6 +153,7 @@ mod tests {
             credentials: path,
             cache: dir.path().join("cache"),
             state: dir.path().join("state"),
+            tool_state: dir.path().join("tool-state"),
         };
         let c = load_credentials(&paths).unwrap();
         assert_eq!(c.client_id, "cid");

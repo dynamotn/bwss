@@ -17,7 +17,7 @@ use crate::model::ItemData;
 
 use super::registry::Entry;
 
-const FORMAT: u64 = 2;
+pub(crate) const FORMAT: u64 = 2;
 
 /// A queued write. A delete's `cipher_id` is the cipher it was read from,
 /// when known.

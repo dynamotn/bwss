@@ -7,6 +7,7 @@ the Vaultwarden container's network namespace).
 import base64
 import json
 import os
+import shutil
 import time
 
 import pytest
@@ -25,8 +26,8 @@ def account():
     return Account(URL)
 
 
-def bitwarden_daemon(account, server=None):
-    d = Daemon({"backend": "bitwarden", "folder": FOLDER, "acl": "off"})
+def bitwarden_daemon(account, server=None, acl="off"):
+    d = Daemon({"backend": "bitwarden", "folder": FOLDER, "acl": acl})
     # `bwss login` keeps the other settings and stores the API key with mode 0600.
     d.cli("login", "--email", account.email, "--server", server or URL, "--client-id", account.client_id,
           "--client-secret-stdin", input=account.client_secret + "\n")
@@ -325,5 +326,84 @@ def test_wrong_password_is_reported(account):
     try:
         r = d.cli("unlock", "--password-stdin", input="not it\n", check=False)
         assert r.returncode != 0 and "wrong master password" in (r.stderr + r.stdout).lower()
+    finally:
+        d.stop()
+
+
+def confirms(d):
+    return sum(1 for p in d.prompts() if p.startswith("CONFIRM"))
+
+
+def test_a_synced_acl_line_is_confirmed_once_on_this_device(account):
+    d = bitwarden_daemon(account, acl="prompt").start()
+    try:
+        unlock(d, account)
+        # Another client granted secret-tool: the line syncs in, unconfirmed here.
+        tool = os.path.realpath(shutil.which("secret-tool"))
+        account.add_login(FOLDER, "Synced grant", "syn-pw", {"bwss:id": "syn", "bwss:attr:syn": "1", "bwss:acl": tool})
+        d.cli("sync")
+        d.pinentry(confirm="always")
+        assert d.tool("lookup", "syn", "1").stdout == "syn-pw"
+        assert confirms(d) == 1, d.prompts()
+        assert any(p.startswith("SETDESC") and "granted on another device" in p for p in d.prompts()), d.prompts()
+        assert not any("Always allow" in p for p in d.prompts()), d.prompts()
+
+        d.pinentry(confirm="deny")
+        assert d.tool("lookup", "syn", "1").stdout == "syn-pw"
+        assert confirms(d) == 1, "confirmed once on this device"
+
+        state = d.home / "state" / "dybw" / "tools" / "bwss" / "acl-confirmed"
+        sealed = json.loads(state.read_text())
+        assert sealed["format"] == 2 and sealed["set"].startswith("2.")
+        assert "secret-tool" not in state.read_text() and "syn" not in state.read_text()
+        assert (state.stat().st_mode & 0o777) == 0o600
+    finally:
+        d.stop()
+
+
+def test_a_denied_synced_acl_line_is_denied_without_asking_again(account):
+    d = bitwarden_daemon(account, acl="prompt").start()
+    try:
+        unlock(d, account)
+        tool = os.path.realpath(shutil.which("secret-tool"))
+        account.add_login(FOLDER, "Denied grant", "den-pw", {"bwss:id": "den", "bwss:attr:den": "1", "bwss:acl": tool})
+        d.cli("sync")
+        d.pinentry(confirm="deny")
+        assert d.tool("lookup", "den", "1", check=False).stdout == ""
+        assert confirms(d) == 1
+
+        # Even a pinentry that would allow is not asked: the denial is remembered.
+        d.pinentry(confirm="always")
+        assert d.tool("lookup", "den", "1", check=False).stdout == ""
+        assert confirms(d) == 1, d.prompts()
+        # And it survives a restart of the daemon.
+        d.stop()
+        d.start()
+        unlock(d, account)
+        assert d.tool("lookup", "den", "1", check=False).stdout == ""
+        assert confirms(d) == 1, d.prompts()
+    finally:
+        d.stop()
+
+
+def test_always_allow_here_needs_no_confirmation_after_a_restart(account):
+    d = bitwarden_daemon(account, acl="prompt").start()
+    try:
+        unlock(d, account)
+        account.add_login(FOLDER, "Local grant", "loc-pw", {"bwss:id": "loc", "bwss:attr:loc": "1"})
+        d.cli("sync")
+        d.pinentry(confirm="always")
+        assert d.tool("lookup", "loc", "1").stdout == "loc-pw"
+        assert "SETOK Always allow" in d.prompts()
+        tool = os.path.realpath(shutil.which("secret-tool"))
+        cid = next(i for i in account.items(FOLDER).values() if i["fields"].get("bwss:id") == "loc")["id"]
+        assert account.item(cid)["fields"]["bwss:acl"] == tool
+        d.stop()
+        d.start()
+        unlock(d, account)
+        d.pinentry(confirm="deny")
+        before = confirms(d)
+        assert d.tool("lookup", "loc", "1").stdout == "loc-pw"
+        assert confirms(d) == before, "granted on this device, so no confirmation"
     finally:
         d.stop()
