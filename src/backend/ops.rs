@@ -29,7 +29,13 @@ pub enum Op {
     Registry { collection: String, entry: Entry },
 }
 
+/// Result of reading a state file.
+///
+/// On `Unreadable` the file is still in place and may hold data (for example
+/// queued writes): callers must not overwrite or delete it.
 pub enum Loaded<T> {
+    /// The file could not be read or set aside.
+    Unreadable(std::io::Error),
     Ok(T),
     Missing,
     SetAside(PathBuf),
@@ -143,7 +149,7 @@ pub fn read_versioned(path: &Path, legacy_suffix: &str) -> Loaded<Value> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Missing,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "cannot read state file");
-            return Loaded::Missing;
+            return Loaded::Unreadable(e);
         }
     };
     match serde_json::from_slice::<Value>(&bytes) {
@@ -168,7 +174,7 @@ fn set_aside(path: &Path, suffix: &str) -> Loaded<Value> {
         }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "cannot set aside state file");
-            Loaded::Missing
+            Loaded::Unreadable(e)
         }
     }
 }
@@ -260,5 +266,78 @@ mod tests {
         assert!(matches!(read_versioned(&p, "legacy"), Loaded::Missing));
         std::fs::write(&p, r#"{"format":2,"ops":"x"}"#).unwrap();
         assert!(matches!(read_versioned(&p, "legacy"), Loaded::Ok(v) if v["format"] == 2));
+    }
+
+    #[test]
+    fn unreadable_file_is_reported_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("queue.json");
+        std::fs::create_dir(&p).unwrap();
+        assert!(matches!(read_versioned(&p, "legacy"), Loaded::Unreadable(_)));
+        assert!(p.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_set_aside_is_reported_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("queue.json");
+        std::fs::write(&p, "nope").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let got = read_versioned(&p, "legacy");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if std::fs::File::create(dir.path().join("probe")).is_ok() {
+            return; // permissions not enforced (running as root)
+        }
+        assert!(matches!(got, Loaded::Unreadable(_)));
+        assert!(p.exists());
+    }
+
+    #[test]
+    fn patch_round_trips() {
+        use crate::bw::scan::ValueSource;
+        use crate::bw::write::ValueChange;
+        let key = SymmetricKey::generate();
+        let patch = Patch {
+            id: "pid".into(),
+            base_revision: "r1".into(),
+            set: vec![("bwss:label".into(), "l".into(), false)],
+            remove: vec!["bwss:attr:".into()],
+            acl_add: vec!["/bin/a".into()],
+            value: ValueChange::Set { source: ValueSource::Field, secret: b"pw".to_vec(), base_mark: [7; 32] },
+        };
+        let back = unseal(&seal(&[Op::Patch(patch)], &key), &key).unwrap();
+        match &back[0] {
+            Op::Patch(p) => {
+                assert_eq!((p.id.as_str(), p.base_revision.as_str()), ("pid", "r1"));
+                assert_eq!(p.set, vec![("bwss:label".to_string(), "l".to_string(), false)]);
+                assert_eq!(p.acl_add, vec!["/bin/a".to_string()]);
+                assert!(
+                    matches!(&p.value, ValueChange::Set { secret, base_mark, .. } if secret == b"pw" && *base_mark == [7; 32])
+                );
+            }
+            _ => panic!("wrong op"),
+        }
+    }
+
+    #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let key = SymmetricKey::generate();
+        let mut sealed = seal(&[Op::Delete { id: "a".into(), base_revision: "r".into() }], &key);
+        let mut enc = sealed["ops"].as_str().unwrap().to_string();
+        let last = enc.pop().unwrap();
+        enc.push(if last == 'A' { 'B' } else { 'A' });
+        sealed["ops"] = Value::String(enc);
+        assert!(unseal(&sealed, &key).is_err());
+    }
+
+    #[test]
+    fn old_format_number_is_renamed_as_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("queue.json");
+        std::fs::write(&p, r#"{"format":1}"#).unwrap();
+        assert!(matches!(read_versioned(&p, "legacy"), Loaded::SetAside(_)));
+        assert!(dir.path().join("queue.json.legacy").exists());
     }
 }
