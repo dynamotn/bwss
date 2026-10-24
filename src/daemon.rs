@@ -358,6 +358,18 @@ impl Daemon {
         result
     }
 
+    /// `unlock_interactive` for remote callers (`bwss unlock`): requests take
+    /// the same turns as password attempts, and one that ends locked makes the
+    /// next wait, so a client cannot keep a pinentry dialog in the user's face.
+    pub async fn unlock_interactive_throttled(self: &Arc<Self>) -> bool {
+        let _turn = self.failure_gate.lock().await;
+        let unlocked = self.unlock_interactive().await;
+        if !unlocked {
+            tokio::time::sleep(FAILED_UNLOCK_DELAY).await;
+        }
+        unlocked
+    }
+
     /// Adds a session, first making room under the per-client cap. At the
     /// global cap it does not add it unless `force`, which then closes the
     /// oldest session of the client holding the most. Returns the paths of the
@@ -784,6 +796,34 @@ mod tests {
             assert!(a.await.unwrap());
         }
         assert!(start.elapsed() >= 2 * FAILED_UNLOCK_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_interactive_unlocks_take_turns_and_never_hold_the_unlock_gate() {
+        // A prompter that cannot start: every interactive unlock fails at once.
+        let prompter = Prompter::new("/nonexistent/bwss-test-pinentry", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None), Arc::new(MemoryBackend::new("pw")), prompter, Config::default());
+        let start = tokio::time::Instant::now();
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let d = d.clone();
+                tokio::spawn(async move { d.unlock_interactive_throttled().await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(d.unlock_gate.try_lock().is_ok(), "the penalty must not hold the interactive gate");
+        for a in attempts {
+            assert!(!a.await.unwrap());
+        }
+        assert!(start.elapsed() >= 2 * FAILED_UNLOCK_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_unlock_of_an_unlocked_keyring_succeeds_without_delay() {
+        let (d, _backend) = gated_daemon(None).await;
+        let start = tokio::time::Instant::now();
+        assert!(d.unlock_interactive_throttled().await);
+        assert!(start.elapsed() < FAILED_UNLOCK_DELAY);
     }
 
     use crate::backend::memory::MemoryBackend;

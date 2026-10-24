@@ -5,6 +5,8 @@
 //! the client. It does stop one ordinary app from quietly reading another
 //! app's secrets, which plain Secret Service implementations allow.
 
+use std::path::{Path, PathBuf};
+
 use zbus::{Connection, fdo::DBusProxy, message::Header, names::BusName};
 
 pub const UNKNOWN: &str = "(unknown application)";
@@ -18,8 +20,50 @@ pub async fn caller_executable(conn: &Connection, header: &Header<'_>) -> String
     executable_of(pid).unwrap_or_else(|| UNKNOWN.into())
 }
 
-fn executable_of(pid: u32) -> Option<String> {
+/// The executable of a process, from `/proc` (Linux only; `None` elsewhere).
+pub fn executable_of(pid: u32) -> Option<String> {
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let s = path.to_string_lossy();
-    Some(s.strip_suffix(" (deleted)").unwrap_or(&s).to_owned())
+    Some(strip_deleted(&path.to_string_lossy()).to_owned())
+}
+
+/// `/proc/<pid>/exe` names a binary replaced on disk (an upgrade) "<path> (deleted)".
+fn strip_deleted(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
+/// Whether `owner` (a path from `executable_of`) is the same binary as `me`
+/// (`current_exe()`), comparing canonical paths where they still resolve.
+pub fn same_executable(owner: &str, me: &Path) -> bool {
+    let canonical = |p: &str| {
+        let p = Path::new(strip_deleted(p));
+        std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+    };
+    canonical(owner) == canonical(&me.to_string_lossy())
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_executable_sees_through_links_and_replaced_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwss");
+        std::fs::write(&bin, b"").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let bin_str = bin.to_str().unwrap();
+
+        assert!(same_executable(bin_str, &bin));
+        assert!(same_executable(link.to_str().unwrap(), &bin), "a symlink names the same file");
+        // An upgraded binary shows as "(deleted)" in /proc, on either side.
+        assert!(same_executable(&format!("{bin_str} (deleted)"), &bin));
+        assert!(same_executable(bin_str, Path::new(&format!("{bin_str} (deleted)"))));
+
+        let other = dir.path().join("python3");
+        std::fs::write(&other, b"").unwrap();
+        assert!(!same_executable(other.to_str().unwrap(), &bin));
+        assert!(!same_executable("/nonexistent/bwss", &bin));
+    }
 }

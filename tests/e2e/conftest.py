@@ -7,6 +7,7 @@ bus that exists only for this test session.
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ import secretstorage
 HERE = Path(__file__).parent
 BWSS = os.environ.get("BWSS_BIN", str(HERE.parents[1] / "target" / "release" / "bwss"))
 PINENTRY = str(HERE / "fake_pinentry.py")
+SQUATTER = str(HERE / "squatter.py")
 
 
 class Daemon:
@@ -66,6 +68,40 @@ class Daemon:
     def tool(self, *args, input=None, check=True):
         """secret-tool, run as a separate process (its own executable for the ACL)."""
         return subprocess.run(["secret-tool", *args], env=self.env, input=input, capture_output=True, text=True, check=check)
+
+
+class Squatter:
+    """Another client on the bus asking for `name` (see squatter.py)."""
+
+    # RequestName flags.
+    REPLACE_EXISTING = 2
+    DO_NOT_QUEUE = 4
+
+    def __init__(self, name: str, flags: int = DO_NOT_QUEUE):
+        self.log = Path(tempfile.mkdtemp(prefix="bwss-squatter-")) / "calls.log"
+        self.proc = subprocess.Popen([sys.executable, SQUATTER, name, str(flags), str(self.log)],
+                                     stdout=subprocess.PIPE, text=True)
+        self.reply = int(self.proc.stdout.readline())
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def stop(self):
+        self.proc.terminate()
+        self.proc.wait(10)
+
+
+@pytest.fixture
+def squatters():
+    started = []
+
+    def start(name, flags=Squatter.DO_NOT_QUEUE):
+        started.append(Squatter(name, flags))
+        return started[-1]
+
+    yield start
+    for s in started:
+        s.stop()
 
 
 @pytest.fixture

@@ -639,6 +639,12 @@ impl ControlObj {
         self.daemon.unlock_with_password_throttled(&password).await.map_err(|e| SecretError::Failed(e.to_string()))
     }
 
+    /// Asks for the master password through the daemon's own prompter, so no
+    /// password crosses the bus. Returns whether the keyring is unlocked.
+    async fn unlock_interactive(&self) -> bool {
+        self.daemon.unlock_interactive_throttled().await
+    }
+
     async fn lock(&self) {
         self.daemon.lock().await;
     }

@@ -94,7 +94,9 @@ offline writes before upgrading. See
   notes: visible and editable in every Bitwarden client, and shared by every
   bwss instance on the same account.
 - **Unlock once.** The first app that needs a secret pops up a pinentry
-  dialog. Scripts and login hooks can use `bwss unlock --password-stdin`.
+  dialog, and so does `bwss unlock`. Scripts and login hooks can use
+  `bwss unlock --password-stdin`, which sends the password only to the bwss
+  binary that owns the control bus name.
 - **Per-app access control, like the macOS Keychain.** The app that created
   an item can use it freely. Any other executable triggers
   *Allow / Deny*, then *Always allow / Only this time*. The check fails
@@ -186,7 +188,7 @@ systemctl --user enable --now bwss.service
 
 ```sh
 bwss status      # locked/unlocked · item count · queued offline changes
-bwss unlock      # pinentry, or: bwss unlock --password-stdin
+bwss unlock      # the daemon's pinentry, or: bwss unlock --password-stdin
 bwss lock
 bwss sync        # pull changes now (otherwise every 5 minutes)
 ```
@@ -203,6 +205,9 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
   resource exhaustion.
 - Secrets cross D-Bus encrypted whenever the client asks for it
   (`dh-ietf1024-sha256-aes128-cbc-pkcs7`, the libsecret default).
+- bwss will not start unless it owns both of its bus names, and no other
+  process can take them over afterwards, so a look-alike service cannot
+  collect the master password from `bwss unlock`.
 - On disk there is only Bitwarden ciphertext, plus the locked index. The
   index holds salted attribute hashes, never secrets; this is the same
   trade-off gnome-keyring makes.

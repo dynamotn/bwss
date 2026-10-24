@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use zbus::fdo::{RequestNameFlags, RequestNameReply};
+use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
+use zbus::names::BusName;
 use zeroize::Zeroizing;
 
 use crate::backend::{Backend, bitwarden::BitwardenBackend, memory::MemoryBackend};
@@ -49,9 +50,11 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
-    /// Unlock the keyring (master password from stdin, or the configured prompter).
+    /// Unlock the keyring: the daemon asks through its prompter, or the
+    /// master password comes from stdin.
     Unlock {
-        /// Read the password from the first line of stdin.
+        /// Read the password from the first line of stdin and send it to the
+        /// daemon, after checking that the daemon is this same bwss binary.
         #[arg(long)]
         password_stdin: bool,
     },
@@ -88,9 +91,99 @@ fn read_line_secret(prompt: &str, from_stdin: bool) -> anyhow::Result<Zeroizing<
     Ok(trimmed)
 }
 
+async fn session_bus() -> anyhow::Result<zbus::Connection> {
+    zbus::Connection::session().await.context("cannot reach the session bus")
+}
+
 async fn control() -> anyhow::Result<zbus::Proxy<'static>> {
-    let conn = zbus::Connection::session().await.context("cannot reach the session bus")?;
-    Ok(zbus::Proxy::new(&conn, CONTROL_NAME, CONTROL_PATH, CONTROL_IFACE).await?)
+    Ok(zbus::Proxy::new(&session_bus().await?, CONTROL_NAME, CONTROL_PATH, CONTROL_IFACE).await?)
+}
+
+/// The control interface of the connection that owns `CONTROL_NAME`, after
+/// checking that it runs this same binary. The proxy talks to that unique
+/// name, so the owner cannot change between the check and the call.
+async fn verified_control() -> anyhow::Result<zbus::Proxy<'static>> {
+    require_proc()?;
+    let conn = session_bus().await?;
+    let bus = DBusProxy::new(&conn).await?;
+    let owner = bus
+        .get_name_owner(BusName::try_from(CONTROL_NAME)?)
+        .await
+        .with_context(|| format!("{CONTROL_NAME} is not on the bus; is the bwss daemon running?"))?;
+    let pid = bus.get_connection_unix_process_id(BusName::Unique(owner.as_ref())).await?;
+    let me = std::env::current_exe().context("cannot find this executable")?;
+    match acl::executable_of(pid) {
+        Some(exe) if acl::same_executable(&exe, &me) => {}
+        found => bail!(
+            "refusing to send the password: {CONTROL_NAME} is owned by {} (pid {pid}), not {}",
+            found.as_deref().unwrap_or(acl::UNKNOWN),
+            me.display()
+        ),
+    }
+    Ok(zbus::Proxy::new(&conn, owner.into_inner(), CONTROL_PATH, CONTROL_IFACE).await?)
+}
+
+/// The owner check reads `/proc/<pid>/exe`, which only Linux has.
+#[cfg(target_os = "linux")]
+fn require_proc() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_proc() -> anyhow::Result<()> {
+    bail!("--password-stdin needs Linux (/proc) to check who owns {CONTROL_NAME}; run `bwss unlock` without it")
+}
+
+/// "<executable> (pid N)" of whoever owns `name`, for error messages.
+async fn owner_of(bus: &DBusProxy<'_>, name: &str) -> String {
+    let Ok(name) = BusName::try_from(name) else { return acl::UNKNOWN.into() };
+    let Ok(owner) = bus.get_name_owner(name).await else { return acl::UNKNOWN.into() };
+    let pid = bus.get_connection_unix_process_id(BusName::Unique(owner.as_ref())).await.ok();
+    let exe = pid.and_then(acl::executable_of);
+    let who = pid.map_or_else(|| owner.to_string(), |pid| format!("pid {pid}"));
+    format!("{} ({who})", exe.as_deref().unwrap_or(acl::UNKNOWN))
+}
+
+fn name_refusal(name: &str, owner: &str, replace: bool) -> String {
+    if name == SECRETS_NAME {
+        if replace {
+            format!("{name} is owned by {owner}, which does not allow replacement")
+        } else {
+            format!("{name} is owned by {owner} (gnome-keyring, KWallet, KeePassXC?); use --replace")
+        }
+    } else {
+        format!("{name} is owned by {owner}: another bwss, or a process squatting the name; stop it first")
+    }
+}
+
+/// Takes `name` as its only owner, or says who holds it.
+async fn claim(conn: &zbus::Connection, name: &'static str, replace: bool) -> anyhow::Result<()> {
+    // No ALLOW_REPLACEMENT: nobody can take a name from bwss with REPLACE_EXISTING.
+    let mut flags = RequestNameFlags::DO_NOT_QUEUE;
+    if replace {
+        flags |= RequestNameFlags::REPLACE_EXISTING;
+    }
+    let reply = match conn.request_name_with_flags(name, flags).await {
+        // zbus turns the `Exists` reply into this error.
+        Err(zbus::Error::NameTaken) => RequestNameReply::Exists,
+        other => other?,
+    };
+    if matches!(reply, RequestNameReply::PrimaryOwner) {
+        return Ok(());
+    }
+    let owner = owner_of(&DBusProxy::new(conn).await?, name).await;
+    bail!("{}", name_refusal(name, &owner, replace))
+}
+
+/// Takes both bus names or neither. The control name goes first and is never
+/// replaced: whoever holds it receives `bwss unlock --password-stdin`.
+async fn claim_names(conn: &zbus::Connection, replace: bool) -> anyhow::Result<()> {
+    claim(conn, CONTROL_NAME, false).await?;
+    if let Err(e) = claim(conn, SECRETS_NAME, replace).await {
+        let _ = conn.release_name(CONTROL_NAME).await;
+        return Err(e);
+    }
+    Ok(())
 }
 
 async fn run_daemon(replace: bool) -> anyhow::Result<()> {
@@ -113,15 +206,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     let conn = zbus::connection::Builder::session().build().await?;
     daemon.set_connection(conn.clone());
     dbus::serve(&daemon).await?;
-    let mut flags = RequestNameFlags::DO_NOT_QUEUE | RequestNameFlags::ALLOW_REPLACEMENT;
-    if replace {
-        flags |= RequestNameFlags::REPLACE_EXISTING;
-    }
-    match conn.request_name_with_flags(SECRETS_NAME, flags).await? {
-        RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => {}
-        _ => bail!("{SECRETS_NAME} is owned by another provider (gnome-keyring, KWallet, KeePassXC?); use --replace"),
-    }
-    conn.request_name_with_flags(CONTROL_NAME, RequestNameFlags::DO_NOT_QUEUE).await?;
+    claim_names(&conn, replace).await?;
     tracing::info!("serving {SECRETS_NAME}");
 
     // Periodic pull from Bitwarden.
@@ -162,18 +247,18 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon { replace } => run_daemon(replace).await,
-        Command::Unlock { password_stdin } => {
-            let proxy = control().await?;
-            let password = if password_stdin || !std::io::stdin().is_terminal() {
-                read_line_secret("", true)?
-            } else {
-                let config = load_config(&Paths::from_env())?;
-                Prompter::new(config.prompter, Duration::from_secs(120))
-                    .password("Unlock the bwss keyring.", None)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("cancelled"))?
-            };
+        Command::Unlock { password_stdin: true } => {
+            let proxy = verified_control().await?;
+            let password = read_line_secret("", true)?;
             proxy.call::<_, _, ()>("UnlockWithPassword", &(password.as_str(),)).await.context("unlock failed")?;
+            println!("unlocked");
+            Ok(())
+        }
+        Command::Unlock { password_stdin: false } => {
+            let unlocked: bool = control().await?.call("UnlockInteractive", &()).await?;
+            if !unlocked {
+                bail!("unlock cancelled or failed");
+            }
             println!("unlocked");
             Ok(())
         }
@@ -226,5 +311,23 @@ async fn main() -> std::process::ExitCode {
             eprintln!("bwss: {e:#}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_taken_name_says_who_holds_it_and_what_to_do() {
+        let owner = "/usr/bin/python3 (pid 42)";
+        let control = name_refusal(CONTROL_NAME, owner, true);
+        assert!(control.contains(CONTROL_NAME) && control.contains(owner), "{control}");
+        assert!(!control.contains("--replace"), "--replace never takes the control name: {control}");
+
+        let secrets = name_refusal(SECRETS_NAME, owner, false);
+        assert!(secrets.contains(owner) && secrets.contains("use --replace"), "{secrets}");
+        let replaced = name_refusal(SECRETS_NAME, owner, true);
+        assert!(replaced.contains(owner) && replaced.contains("does not allow replacement"), "{replaced}");
     }
 }

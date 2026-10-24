@@ -340,7 +340,8 @@ changing are never clobbered. Then:
 Unchanged from `legacy`:
 
 - One Bitwarden master password unlocks everything, through pinentry (3
-  attempts) on the first request or `bwss unlock`. Failed CLI unlocks are
+  attempts) on the first request or `bwss unlock`. Failed CLI unlocks (a
+  wrong `--password-stdin`, or a `bwss unlock` prompt that ends locked) are
   delayed 2 s: attempts take turns and the delay never holds the interactive
   unlock. This is a speed bump against other processes of the
   same user, not a defence against one that can also read the bus.
@@ -559,9 +560,23 @@ No sync happens while locked: the user key and the API token are gone.
 Unchanged from `legacy`: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`
 sessions owned by the opening bus name (at most 4,096); pinentry over
 Assuan with 120 s timeouts; `Prompt.Completed` carries a result of the
-success type even when dismissed; `org.freedesktop.secrets` requested with
-`DO_NOT_QUEUE | ALLOW_REPLACEMENT` (plus `REPLACE_EXISTING` with
-`--replace`); the control interface `io.github.dynamotn.bwss.Control1`.
+success type even when dismissed; the control interface
+`io.github.dynamotn.bwss.Control1`.
+
+Bus names. The daemon must be the primary owner of both
+`io.github.dynamotn.bwss` and `org.freedesktop.secrets`, or it exits with an
+error naming the current owner's executable and pid, after releasing a name
+it already took. Both are requested with `DO_NOT_QUEUE` and without
+`ALLOW_REPLACEMENT`, so no other client can take them over with
+`REPLACE_EXISTING`. `--replace` adds `REPLACE_EXISTING` for
+`org.freedesktop.secrets` only, to take over from another provider that
+allows it; the control name is claimed first and never replaced, since
+whoever holds it would receive `bwss unlock --password-stdin`.
+
+Control methods: `UnlockInteractive() -> b` (the daemon prompts through its
+own pinentry, so no password crosses the bus; throttled like a failed
+password), `UnlockWithPassword(s)`, `Lock()`, `Sync()` and
+`Status() -> (b, u, s)`.
 
 ## 10. Configuration and CLI
 
@@ -585,6 +600,16 @@ bwss unlock [--password-stdin]
 bwss lock | sync | status
 bwss login --email E [--server URL] --client-id ID [--client-secret-stdin]
 ```
+
+`bwss unlock` calls `UnlockInteractive`: the daemon shows the pinentry and
+the password never leaves it. `--password-stdin` is for scripts and login
+hooks. Before sending the password it resolves the owner of
+`io.github.dynamotn.bwss` (`GetNameOwner`, `GetConnectionUnixProcessID`,
+`/proc/<pid>/exe`) and refuses, naming that executable, unless it is the
+CLI's own `current_exe()` (canonical paths; a ` (deleted)` suffix from an
+upgrade is ignored). The call then goes to that unique name, so the owner
+cannot change in between. Without `/proc` (non-Linux), `--password-stdin` is
+refused.
 
 `bwss status` additionally reports duplicate ids and likely duplicate items
 (§3.3, §8), by id and label only, never secrets.
