@@ -199,6 +199,11 @@ impl Paths {
         self.cache.join("locked-index.json")
     }
 
+    /// Present once the write queue moved to its own key (design §8.1).
+    pub fn queue_key_migrated(&self) -> PathBuf {
+        self.tool_state.join("queue-key-migrated")
+    }
+
     /// Present when derived attributes go in the locked index on this device.
     pub fn index_derived(&self) -> PathBuf {
         self.tool_state.join("index-derived")
@@ -619,7 +624,7 @@ pub fn flag_set(path: &Path) -> bool {
 }
 
 /// Sets the device flag `path` (a private file holding `text`) or clears it.
-fn set_flag(path: &Path, on: bool, text: &[u8]) -> std::io::Result<()> {
+pub(crate) fn set_flag(path: &Path, on: bool, text: &[u8]) -> std::io::Result<()> {
     if on {
         return crate::fsutil::write_private(path, text);
     }
@@ -1005,6 +1010,7 @@ mod tests {
         assert_eq!(p.acl_off(), Path::new("/st/dybw/tools/bwss/acl-off"));
         assert_eq!(p.index_derived(), Path::new("/st/dybw/tools/bwss/index-derived"));
         assert_eq!(p.locked_index(), Path::new("/home/u/.cache/bwss/locked-index.json"));
+        assert_eq!(p.queue_key_migrated(), Path::new("/st/dybw/tools/bwss/queue-key-migrated"));
         assert_eq!(p.cache, Path::new("/home/u/.cache/bwss"));
         assert_eq!(p.state, Path::new("/st/bwss"));
     }

@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use super::Backend;
 use super::BackendError;
 use super::bitwarden::BitwardenBackend;
-use super::ops::{Loaded, read_versioned, unseal};
+use super::ops::{Loaded, QUEUE_FORMAT, read_formats, unseal};
 use super::registry::Registry;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::field_names;
@@ -291,20 +291,51 @@ async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
     let dir = tempfile::tempdir().unwrap();
     let identity_origin = crate::bw::api::origin_of(&url).unwrap();
     let config = Config { server_url: url, email: EMAIL.into(), profile: Some("p".into()), ..Config::default() };
-    let paths = Paths {
-        config: dir.path().join("config.toml"),
-        legacy_config: dir.path().join("legacy.toml"),
-        legacy_credentials: dir.path().join("legacy-credentials.toml"),
-        cache: dir.path().join("cache"),
-        state: dir.path().join("state"),
-        profiles: dir.path().join("profiles"),
-        tool_state: dir.path().join("tool-state"),
-    };
+    let paths = paths_in(dir.path());
     let creds = Credentials { identity_origin, client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
     let backend = Arc::new(BitwardenBackend::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
     let keys = Keys { mark: user.derive("value-mark"), user };
     Vault { keys, fake, backend, dir: dir.path().to_owned(), _dir: dir }
+}
+
+fn paths_in(dir: &std::path::Path) -> Paths {
+    Paths {
+        config: dir.join("config.toml"),
+        legacy_config: dir.join("legacy.toml"),
+        legacy_credentials: dir.join("legacy-credentials.toml"),
+        cache: dir.join("cache"),
+        state: dir.join("state"),
+        profiles: dir.join("profiles"),
+        tool_state: dir.join("tool-state"),
+    }
+}
+
+#[test]
+fn starting_without_a_queue_ends_the_migration_window() {
+    let config = Config {
+        server_url: "http://127.0.0.1:1".into(),
+        email: EMAIL.into(),
+        profile: Some("p".into()),
+        ..Config::default()
+    };
+    let creds = || Credentials {
+        identity_origin: "http://127.0.0.1:1".into(),
+        client_id: "id".into(),
+        client_secret: Zeroizing::new("secret".into()),
+    };
+    let fresh = tempfile::tempdir().unwrap();
+    let paths = paths_in(fresh.path());
+    BitwardenBackend::new(&config, creds(), &paths).unwrap();
+    assert!(crate::config::flag_set(&paths.queue_key_migrated()), "set before any unlock");
+
+    // A queue left by an older bwss keeps the window open for its unlock.
+    let upgraded = tempfile::tempdir().unwrap();
+    let paths = paths_in(upgraded.path());
+    std::fs::create_dir_all(&paths.state).unwrap();
+    std::fs::write(paths.state.join("queue.json"), r#"{"format":2,"ops":"x"}"#).unwrap();
+    BitwardenBackend::new(&config, creds(), &paths).unwrap();
+    assert!(!crate::config::flag_set(&paths.queue_key_migrated()));
 }
 
 impl Vault {
@@ -339,7 +370,7 @@ impl Vault {
 
     /// The ops in queue.json, opened with the queue key.
     fn queue_file(&self) -> usize {
-        match read_versioned(&self.dir.join("state/queue.json"), "legacy") {
+        match read_formats(&self.dir.join("state/queue.json"), "legacy", &[QUEUE_FORMAT]) {
             Loaded::Ok(v) => unseal(&v, &super::bitwarden::queue_key(&self.keys.user)).unwrap().len(),
             Loaded::Missing => 0,
             _ => panic!("queue.json cannot be read"),

@@ -586,14 +586,32 @@ the older behaviour.
 
 **Write queue** (`~/.local/state/bwss/queue.json`, mode 0600). The ordered
 list of ops not yet accepted by the server, sealed as a whole: the file is
-`{ "format": 2, "ops": "<EncString>" }`, one EncString under the queue key
-(the user key derived for `"queue"`, so nothing else the user key encrypts
-can pass for the queue) holding every op with its ids, fields, values, marks, cipher ids and
-revision dates. Only `format` is plain. A queue sealed with the user key
-itself (bwss before the queue key) is opened with it once at unlock and
-resealed with the queue key at once; one that opens with neither key is
-renamed `queue.json.unsealable`, never deleted, and its ops are not
-replayed. The queue, the cache and the locked
+`{ "format": 3, "ops": "<EncString>" }`, one EncString under the queue key
+(the user key derived for `"queue"`) holding every op with its ids, fields,
+values, marks, cipher ids and revision dates. Only `format` is plain.
+
+The user key itself must not open the queue: a process of the same user
+that can create an item gets text of its choice encrypted under the user
+key (new ciphers have no item key, so their field values are), and could
+copy that into `queue.json` as forged ops that bypass the ACL when they are
+replayed. Older bwss sealed the queue that way, as format 2, so there is a
+one-time migration window, closed by the device flag
+`$XDG_STATE_HOME/dybw/tools/bwss/queue-key-migrated`:
+
+- While the flag is absent, a format-2 queue is opened with the user key at
+  unlock, resealed as format 3 at once, and the flag is set. If the reseal
+  fails, the file stays as it was and the window stays open for the next
+  unlock.
+- The flag is also set when the daemon starts, or a queue is loaded, with
+  no queue file, and when a format-3 queue opens with the queue key.
+- Once it is set, a format-2 queue, or a format-3 one that does not open
+  with the queue key, is renamed `queue.json.unsealable` with a warning,
+  never deleted, and its ops are not replayed.
+
+A same-user process that deletes the flag reopens the window. Like the
+other same-user checks (R13), this is a speed bump, not a boundary.
+
+The queue, the cache and the locked
 index are device state (spec §10): they are never synced or copied to
 another device. A queued op is applied to the cache right away, so reads on
 this device see it before the server does.
@@ -896,7 +914,7 @@ boundary for `--password-stdin`.
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
 | Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a program the user cannot replace or one under bwss's own prefix (§10); bwss refuses to run as root |
-| Disk | Bitwarden ciphertext only (cache, queue under its own derived key, ACL confirmations); hashed locked index without derived attributes unless this device opted in (§7) |
+| Disk | Bitwarden ciphertext only (cache, queue under its own derived key after a one-time migration, ACL confirmations); hashed locked index without derived attributes unless this device opted in (§7) |
 | Server input | KDF bounds, MAC checked before decrypt, response bodies capped at 256 MiB while they are read, error text stripped of control characters (ANSI escapes included) and clipped |
 | Prompt text | The caller's path is shown on one line: line breaks and other control characters become U+FFFD |
 

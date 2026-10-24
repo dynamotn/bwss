@@ -1,8 +1,9 @@
 //! Queued writes and versioned state files.
 //!
 //! Queued ops hold secrets, ids and labels, so the whole list is sealed with
-//! the user key (design §8.1, stricter: op kinds are hidden too). State files
-//! carry `"format": 2`; anything older is set aside, never overwritten.
+//! the queue key (design §8.1, stricter: op kinds are hidden too). State
+//! files carry `"format": 2` (the queue: 3); anything older is set aside,
+//! never overwritten.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,9 @@ use crate::model::ItemData;
 use super::registry::Entry;
 
 pub(crate) const FORMAT: u64 = 2;
+/// `queue.json` sealed with the queue key. Format 2 was sealed with the user
+/// key itself and is opened only during the one-time migration.
+pub(crate) const QUEUE_FORMAT: u64 = 3;
 
 /// A queued write. A delete's `cipher_id` is the cipher it was read from,
 /// when known.
@@ -146,13 +150,14 @@ impl From<SealedOp> for Op {
 pub fn seal(ops: &[Op], key: &SymmetricKey) -> Value {
     let mirror: Vec<SealedOp> = ops.iter().map(SealedOp::from).collect();
     let json = Zeroizing::new(serde_json::to_vec(&mirror).expect("ops serialize to JSON"));
-    serde_json::json!({ "format": FORMAT, "ops": key.encrypt(&json) })
+    serde_json::json!({ "format": QUEUE_FORMAT, "ops": key.encrypt(&json) })
 }
 
 /// Opens a sealed op list. A wrong key or tampered data is an error; the
 /// caller decides what to do with the file.
+/// Which key may open which format is the caller's decision.
 pub fn unseal(file: &Value, key: &SymmetricKey) -> Result<Vec<Op>, CryptoError> {
-    if file.get("format").and_then(Value::as_u64) != Some(FORMAT) {
+    if !matches!(file.get("format").and_then(Value::as_u64), Some(FORMAT | QUEUE_FORMAT)) {
         return Err(CryptoError::Malformed);
     }
     let enc = file.get("ops").and_then(Value::as_str).ok_or(CryptoError::Malformed)?;
@@ -164,6 +169,11 @@ pub fn unseal(file: &Value, key: &SymmetricKey) -> Result<Vec<Op>, CryptoError> 
 /// Reads a state file. A file that is not JSON, or lacks `"format": 2`, is
 /// renamed aside (never overwriting an earlier set-aside) and reported.
 pub fn read_versioned(path: &Path, legacy_suffix: &str) -> Loaded<Value> {
+    read_formats(path, legacy_suffix, &[FORMAT])
+}
+
+/// `read_versioned` for a file that may carry any of `formats`.
+pub fn read_formats(path: &Path, legacy_suffix: &str, formats: &[u64]) -> Loaded<Value> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Missing,
@@ -173,7 +183,7 @@ pub fn read_versioned(path: &Path, legacy_suffix: &str) -> Loaded<Value> {
         }
     };
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(v) if v.get("format").and_then(Value::as_u64) == Some(FORMAT) => Loaded::Ok(v),
+        Ok(v) if v.get("format").and_then(Value::as_u64).is_some_and(|f| formats.contains(&f)) => Loaded::Ok(v),
         Ok(_) => set_aside(path, legacy_suffix),
         Err(_) => set_aside(path, "corrupt"),
     }
@@ -245,7 +255,7 @@ mod tests {
             },
         ];
         let sealed = seal(&ops, &key);
-        assert_eq!(sealed["format"], 2);
+        assert_eq!(sealed["format"], 3);
         let text = sealed.to_string();
         for needle in ["s3cr3t-plumb-unique", "id-7f3a-unique", "label-xyzzy-unique"] {
             assert!(!text.contains(needle), "{needle} leaked");

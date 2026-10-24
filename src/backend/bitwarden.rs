@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::ops::{Loaded, Op, read_versioned, seal, set_aside, unseal};
+use super::ops::{
+    FORMAT as LEGACY_QUEUE_FORMAT, Loaded, Op, QUEUE_FORMAT, read_formats, read_versioned, seal, set_aside, unseal,
+};
 use super::registry::{REGISTRY_ID, Registry};
 use super::runner::{Effect, status_lines};
 use super::{AclTrust, Backend, BackendError};
@@ -436,41 +438,67 @@ fn load_cache(path: &Path, email: &str) -> Result<Option<Cache>, BackendError> {
     }
 }
 
-/// The key `queue.json` is sealed with: the user key derived for "queue",
-/// so nothing else the user key encrypts can pass for the queue.
+/// The key `queue.json` is sealed with: the user key derived for "queue".
+/// A same-user process can get text of its choice encrypted under the user
+/// key itself (any field of an item it creates), so that key must never open
+/// the queue once this device moved to the queue key (design §8.1).
 pub(super) fn queue_key(user: &SymmetricKey) -> SymmetricKey {
     user.derive("queue")
 }
 
-/// Reads `queue.json`, sealed with `queue_key(user)`. A queue sealed with
-/// the user key itself (bwss before the queue key) is opened with it once and
-/// resealed at once; one that opens with neither key is set aside.
-fn load_queue(path: &Path, user: &SymmetricKey) -> Result<Vec<Op>, BackendError> {
+/// Sets the flag that closes the one-time migration window.
+fn end_migration(flag: &Path) {
+    if !crate::config::flag_set(flag)
+        && let Err(e) = crate::config::set_flag(flag, true, b"done\n")
+    {
+        tracing::warn!(path = %flag.display(), "could not record that the queue moved to its key: {e}");
+    }
+}
+
+/// Reads `queue.json`: format 3 under `queue_key(user)`. A format-2 queue
+/// (sealed with the user key itself by an older bwss) is opened with the
+/// user key only while `migrated` is absent, and is then resealed and the
+/// flag set. Anything that does not open is set aside, never replayed.
+fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<Op>, BackendError> {
     let refuse = |e: std::io::Error| {
         unavailable(format!("cannot read the write queue {}: {e}; it is left untouched", path.display()))
     };
     let key = queue_key(user);
-    match read_versioned(path, "legacy") {
-        Loaded::Ok(v) => match unseal(&v, &key).map_err(|e| (e, unseal(&v, user))) {
-            Ok(ops) => Ok(ops),
-            Err((_, Ok(ops))) => {
-                // Sealed by an older bwss. The ops are in memory now; when the
-                // reseal fails, the file stays as it was and the next queue
-                // write replaces it.
-                if let Err(e) = write_json_private(path, &seal(&ops, &key)) {
-                    tracing::warn!(path = %path.display(), "could not reseal the write queue: {e}");
+    match read_formats(path, "legacy", &[LEGACY_QUEUE_FORMAT, QUEUE_FORMAT]) {
+        Loaded::Ok(v) => {
+            let legacy = v.get("format").and_then(Value::as_u64) == Some(LEGACY_QUEUE_FORMAT);
+            let opened = match (legacy, crate::config::flag_set(migrated)) {
+                (false, _) => unseal(&v, &key).map_err(|e| e.to_string()),
+                (true, false) => unseal(&v, user).map_err(|e| e.to_string()),
+                (true, true) => Err("it is sealed the old way, and this device already moved to the queue key".into()),
+            };
+            match opened {
+                Ok(ops) if legacy => {
+                    // When the reseal fails, the file stays as it was and the
+                    // window stays open for the next unlock.
+                    match write_json_private(path, &seal(&ops, &key)) {
+                        Ok(()) => end_migration(migrated),
+                        Err(e) => tracing::warn!(path = %path.display(), "could not reseal the write queue: {e}"),
+                    }
+                    Ok(ops)
                 }
-                Ok(ops)
-            }
-            Err((e, Err(_))) => {
-                tracing::warn!(path = %path.display(), "the write queue cannot be opened ({e}); setting it aside");
-                match set_aside(path, "unsealable") {
-                    Loaded::Unreadable(e) => Err(refuse(e)),
-                    _ => Ok(Vec::new()),
+                Ok(ops) => {
+                    end_migration(migrated);
+                    Ok(ops)
+                }
+                Err(why) => {
+                    tracing::warn!(path = %path.display(), "the write queue cannot be opened ({why}); setting it aside");
+                    match set_aside(path, "unsealable") {
+                        Loaded::Unreadable(e) => Err(refuse(e)),
+                        _ => Ok(Vec::new()),
+                    }
                 }
             }
-        },
-        Loaded::Missing => Ok(Vec::new()),
+        }
+        Loaded::Missing => {
+            end_migration(migrated);
+            Ok(Vec::new())
+        }
         Loaded::SetAside(to) => {
             tracing::warn!(moved_to = %to.display(), "changes queued by an older version are not replayed");
             Ok(Vec::new())
@@ -500,6 +528,9 @@ pub struct BitwardenBackend {
     pub(super) state: Mutex<Option<Unlocked>>,
     cache_path: PathBuf,
     queue_path: PathBuf,
+    /// Device flag: the queue moved to the queue key, so a queue under the
+    /// user key is never opened again.
+    queue_migrated: PathBuf,
     /// Queued ops; loaded at unlock (it is sealed with the queue key) and
     /// dropped at lock. Lock order: `queue`, then `state`.
     pub(super) queue: Mutex<Vec<Op>>,
@@ -526,6 +557,11 @@ impl BitwardenBackend {
                 id
             }
         };
+        let queue_path = paths.state.join("queue.json");
+        // Nothing to migrate: close the window before any unlock.
+        if std::fs::symlink_metadata(&queue_path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            end_migration(&paths.queue_key_migrated());
+        }
         Ok(BitwardenBackend {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
@@ -537,7 +573,8 @@ impl BitwardenBackend {
             },
             state: Mutex::new(None),
             cache_path: paths.cache.join("sync.json"),
-            queue_path: paths.state.join("queue.json"),
+            queue_path,
+            queue_migrated: paths.queue_key_migrated(),
             queue: Mutex::new(Vec::new()),
         })
     }
@@ -657,7 +694,7 @@ impl Backend for BitwardenBackend {
         let keys = Keys { mark: user.derive("value-mark"), user };
 
         let mut queue = self.queue.lock().await;
-        *queue = load_queue(&self.queue_path, &keys.user)?;
+        *queue = load_queue(&self.queue_path, &keys.user, &self.queue_migrated)?;
         let folder = keyring_folder(&sync, &keys.user, &self.root);
         let built = build_fresh(&sync, &queue, &keys, folder.as_deref());
         let state = Unlocked { keys, kdf, sync, revision, built, keyring_folder: folder };
@@ -1026,55 +1063,108 @@ mod tests {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
-    #[test]
-    fn the_queue_is_sealed_with_a_key_of_its_own() {
+    /// A queue as bwss wrote it before the queue key: format 2, sealed with
+    /// the user key itself. A same-user process can forge exactly this.
+    fn legacy_queue(user: &SymmetricKey) -> Vec<u8> {
+        let mut file = seal(&one_op(), user);
+        file["format"] = json!(2);
+        serde_json::to_vec(&file).unwrap()
+    }
+
+    struct QueueDir {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        flag: PathBuf,
+        aside: PathBuf,
+    }
+
+    fn queue_dir() -> QueueDir {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.json");
-        let user = SymmetricKey::generate();
-        std::fs::write(&path, serde_json::to_vec(&seal(&one_op(), &queue_key(&user))).unwrap()).unwrap();
-        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
-        assert!(path.exists());
-        assert!(unseal(&read_file(&path), &user).is_err(), "the user key itself does not open it");
+        let path = dir.path().join("state/queue.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let flag = dir.path().join("tool-state/queue-key-migrated");
+        let aside = dir.path().join("state/queue.json.unsealable");
+        QueueDir { _dir: dir, path, flag, aside }
     }
 
     #[test]
-    fn a_queue_sealed_with_the_user_key_is_opened_once_and_resealed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.json");
+    fn the_queue_is_sealed_with_a_key_of_its_own_as_format_3() {
+        let q = queue_dir();
         let user = SymmetricKey::generate();
-        // As an older bwss wrote it.
-        std::fs::write(&path, serde_json::to_vec(&seal(&one_op(), &user)).unwrap()).unwrap();
-        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
-        let resealed = read_file(&path);
-        assert!(unseal(&resealed, &user).is_err(), "no longer under the user key");
+        let file = seal(&one_op(), &queue_key(&user));
+        assert_eq!(file["format"], 3);
+        std::fs::write(&q.path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
+        assert!(q.path.exists());
+        assert!(crate::config::flag_set(&q.flag), "a queue under the queue key means the move is done");
+    }
+
+    #[test]
+    fn a_pre_migration_queue_is_resealed_once_and_the_flag_set() {
+        let q = queue_dir();
+        let user = SymmetricKey::generate();
+        std::fs::write(&q.path, legacy_queue(&user)).unwrap();
+        assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
+        let resealed = read_file(&q.path);
+        assert_eq!(resealed["format"], 3);
         assert_eq!(unseal(&resealed, &queue_key(&user)).unwrap().len(), 1);
-        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
-        assert!(!dir.path().join("queue.json.unsealable").exists());
+        assert!(crate::config::flag_set(&q.flag));
+        assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
+        assert!(!q.aside.exists());
+    }
+
+    #[test]
+    fn a_forged_user_key_queue_after_the_migration_is_never_replayed() {
+        let user = SymmetricKey::generate();
+        // Format 2 under the user key, and the same ciphertext labelled format 3.
+        let forged_v3 = {
+            let mut file = seal(&one_op(), &user);
+            file["format"] = json!(3);
+            serde_json::to_vec(&file).unwrap()
+        };
+        for forged in [legacy_queue(&user), forged_v3] {
+            let q = queue_dir();
+            crate::config::set_flag(&q.flag, true, b"done\n").unwrap();
+            std::fs::write(&q.path, &forged).unwrap();
+            assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty(), "nothing is replayed");
+            assert!(!q.path.exists());
+            assert_eq!(std::fs::read(&q.aside).unwrap(), forged, "set aside as it was");
+        }
+    }
+
+    #[test]
+    fn no_queue_at_all_ends_the_migration_window() {
+        let q = queue_dir();
+        let user = SymmetricKey::generate();
+        assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
+        assert!(crate::config::flag_set(&q.flag));
+        // A user-key queue planted afterwards is not opened with the user key.
+        std::fs::write(&q.path, legacy_queue(&user)).unwrap();
+        assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
+        assert!(q.aside.exists());
     }
 
     #[test]
     fn a_queue_that_cannot_be_resealed_is_still_read_and_left_as_it_was() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.json");
+        let q = queue_dir();
         let user = SymmetricKey::generate();
-        let old = serde_json::to_vec(&seal(&one_op(), &user)).unwrap();
-        std::fs::write(&path, &old).unwrap();
+        let old = legacy_queue(&user);
+        std::fs::write(&q.path, &old).unwrap();
         // The private write goes through this temporary name: a directory
         // there makes it fail, even for root.
-        std::fs::create_dir(path.with_extension(format!("tmp{}", std::process::id()))).unwrap();
-        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
-        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::create_dir(q.path.with_extension(format!("tmp{}", std::process::id()))).unwrap();
+        assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&q.path).unwrap(), old);
+        assert!(!crate::config::flag_set(&q.flag), "not moved yet: the window stays for the next try");
     }
 
     #[test]
     fn a_queue_that_opens_with_neither_key_is_kept_aside() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.json");
+        let q = queue_dir();
         let foreign = serde_json::to_vec(&seal(&one_op(), &SymmetricKey::generate())).unwrap();
-        std::fs::write(&path, &foreign).unwrap();
-        assert!(load_queue(&path, &SymmetricKey::generate()).unwrap().is_empty());
-        assert!(!path.exists());
-        let kept = dir.path().join("queue.json.unsealable");
-        assert_eq!(std::fs::read(kept).unwrap(), foreign, "set aside as it was, never lost");
+        std::fs::write(&q.path, &foreign).unwrap();
+        assert!(load_queue(&q.path, &SymmetricKey::generate(), &q.flag).unwrap().is_empty());
+        assert!(!q.path.exists());
+        assert_eq!(std::fs::read(&q.aside).unwrap(), foreign, "set aside as it was, never lost");
     }
 }
