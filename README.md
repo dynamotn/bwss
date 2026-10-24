@@ -206,10 +206,14 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 - Secrets cross D-Bus encrypted whenever the client asks for it
   (`dh-ietf1024-sha256-aes128-cbc-pkcs7`, the libsecret default).
 - bwss will not start unless it owns both of its bus names, and no other
-  process can take them over afterwards. `bwss unlock` keeps the password
-  inside the daemon. `bwss unlock --password-stdin` sends it only to a
-  `bwss daemon` process running the same installed file as the CLI, as a
-  speed bump against look-alike services run by your user, not a guarantee.
+  process can take them over afterwards.
+- `bwss unlock` is the safe way to unlock: the daemon asks through its own
+  pinentry, so no password crosses the bus. `bwss unlock --password-stdin`
+  (for login hooks) sends the password only to a `bwss daemon` process
+  running the same installed file as the CLI. That stops a look-alike
+  service that is not bwss. It does not stop another process of your user
+  that forks and starts a real `bwss daemon` to pass the check, or one that
+  can ptrace; use `--password-stdin` only if you accept that risk.
 - On disk there is only Bitwarden ciphertext, plus the locked index. The
   index holds salted attribute hashes, never secrets; this is the same
   trade-off gnome-keyring makes.
