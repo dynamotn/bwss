@@ -116,8 +116,8 @@ fn family(base: &str) -> Option<Family> {
 /// Every argument before it must be a value-less flag of that interpreter's
 /// [`Family`], or a `--` the family honours. Anything else before it (`-c`,
 /// `-m`, `-e`, `-s`, `-`, `+e`, an option with a value, an unknown flag), or
-/// a candidate that starts with `+` (or with `-`, unless after `--`), means
-/// there is no script file.
+/// a candidate that is `-` (stdin, even after `--`) or starts with `+` (or
+/// with `-`, unless after `--`), means there is no script file.
 pub fn script_argument(interpreter: &str, cmdline: &[u8]) -> Option<String> {
     let family = family(interpreter.rsplit('/').next().unwrap_or_default())?;
     let raw = cmdline.strip_suffix(b"\0").unwrap_or(cmdline);
@@ -129,8 +129,9 @@ pub fn script_argument(interpreter: &str, cmdline: &[u8]) -> Option<String> {
         }
         if arg == "--" && family.dash_dash {
             let next = std::str::from_utf8(args.next()?).ok()?;
-            // Even after `--`, a `+` name is an option to some shells.
-            break if next.starts_with('+') { return None } else { next };
+            // Even after `--`, `-` is stdin to most interpreters and a `+`
+            // name is an option to some shells.
+            break if next == "-" || next.starts_with('+') { return None } else { next };
         }
         if arg.starts_with(['-', '+']) {
             return None;
@@ -460,6 +461,23 @@ mod tests {
         assert_eq!(arg("/usr/bin/bash", b"bash\0--\0job.sh\0"), Some("job.sh".into()));
         assert_eq!(arg("/usr/bin/fish", b"fish\0--\0job.fish\0"), None);
         assert_eq!(arg("/usr/bin/lua5.4", b"lua\0--\0s.lua\0"), None);
+    }
+
+    #[test]
+    fn a_bare_dash_is_stdin_never_a_script() {
+        // `ln -s trusted.py ./-; echo evil | python3 -- -` runs stdin.
+        for (exe, argv0) in [
+            ("/usr/bin/python3", "python3"),
+            ("/usr/bin/perl", "perl"),
+            ("/usr/bin/ruby3.3", "ruby"),
+            ("/usr/bin/node", "node"),
+            ("/usr/bin/bash", "bash"),
+        ] {
+            let after = format!("{argv0}\0--\0-\0");
+            assert_eq!(script_argument(exe, after.as_bytes()), None, "{argv0} -- -");
+            let bare = format!("{argv0}\0-\0");
+            assert_eq!(script_argument(exe, bare.as_bytes()), None, "{argv0} -");
+        }
     }
 
     #[test]

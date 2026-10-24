@@ -352,8 +352,9 @@ changing are never clobbered. Then:
   `--` where it means "the script follows" (python, perl, ruby, the
   shells, node; not php, where `php --` reads stdin, nor fish or lua).
   Any other argument before it, any argument starting with `+` (`bash +e`,
-  `+O name`), or a script name starting with `+` (or with `-`, unless
-  after `--`), means no script. `deno`, `bun`, `busybox` and
+  `+O name`), or a script name that is exactly `-` (stdin to python,
+  perl, ruby and node, even after `--`), starts with `+`, or starts with
+  `-` other than after `--`, means no script. `deno`, `bun`, `busybox` and
   `java` (subcommands, applets, `-jar`) never get a script identity. The
   script is resolved against `/proc/<pid>/cwd`, canonicalized, and must be
   an existing regular file. The identity, and

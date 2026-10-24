@@ -245,7 +245,7 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control) | 164 pass, 1 ignored (perf) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control) | 165 pass, 1 ignored (perf) |
 | End-to-end against Vaultwarden 1.37.4 | 44 pass (17 Bitwarden, 19 Secret Service, 8 bus names) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
