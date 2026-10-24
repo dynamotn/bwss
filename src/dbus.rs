@@ -8,8 +8,8 @@ use zeroize::Zeroizing;
 
 use crate::acl::caller_executable;
 use crate::daemon::{
-    DEFAULT_ALIAS_PATH, Daemon, NewItem, OpenSession, SERVICE_PATH, SResult, SecretError, WireSecret, collection_path,
-    item_path, no_prompt, op, parse_path,
+    Daemon, NewItem, OpenSession, PROMPTS_PER_OWNER, SERVICE_PATH, SESSIONS_PER_OWNER, SESSIONS_TOTAL, SResult,
+    SecretError, WireSecret, collection_path, item_path, no_prompt, oldest_to_evict, op, parse_path,
 };
 use crate::model::{Attributes, LOGIN_COLLECTION, SESSION_COLLECTION};
 use crate::session::Session;
@@ -71,17 +71,26 @@ impl ServiceObj {
         let bytes: Vec<u8> = Vec::<u8>::try_from(input.try_clone().map_err(SecretError::ZBus)?).unwrap_or_default();
         let (session, output) =
             Session::open(algorithm, &bytes).map_err(|e| SecretError::NotSupported(e.to_string()))?;
-        let path = format!("{SERVICE_PATH}/session/s{}", self.daemon.next_id());
+        let seq = self.daemon.next_id();
+        let path = format!("{SERVICE_PATH}/session/s{seq}");
         let owner = sender(&header).unwrap_or_default();
-        {
+        let evicted = {
             let mut sessions = self.daemon.sessions.lock().unwrap();
-            // Bound memory use by clients that never close their sessions.
-            if sessions.len() >= 4096
-                && let Some(k) = sessions.keys().next().cloned()
-            {
-                sessions.remove(&k);
+            let mine = sessions.iter().filter(|(_, s)| s.owner == owner).map(|(p, s)| (s.seq, p));
+            // A client that never closes its sessions only loses its own oldest.
+            let evicted = oldest_to_evict(mine.clone().map(|(seq, _)| seq), SESSIONS_PER_OWNER)
+                .and_then(|oldest| mine.clone().find(|(seq, _)| *seq == oldest).map(|(_, p)| p.clone()));
+            if let Some(p) = &evicted {
+                sessions.remove(p);
             }
-            sessions.insert(path.clone(), Arc::new(OpenSession { owner, session }));
+            if sessions.len() >= SESSIONS_TOTAL {
+                return Err(SecretError::Failed("too many open sessions".into()));
+            }
+            sessions.insert(path.clone(), Arc::new(OpenSession { seq, owner, session }));
+            evicted
+        };
+        if let Some(p) = evicted {
+            let _ = self.daemon.conn().object_server().remove::<SessionObj, _>(p.as_str()).await;
         }
         self.daemon
             .conn()
@@ -101,13 +110,15 @@ impl ServiceObj {
         &self,
         properties: HashMap<String, OwnedVariant>,
         alias: &str,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
         if alias == "default" {
             return Ok((op(&collection_path(LOGIN_COLLECTION)), no_prompt()));
         }
         let label = prop_string(&properties, PROP_COLLECTION_LABEL);
         if !self.daemon.keyring.lock().await.is_unlocked() {
-            let prompt = PromptObj::register(&self.daemon, PromptAction::CreateCollection { label }).await?;
+            let prompt =
+                PromptObj::register(&self.daemon, sender(&header), PromptAction::CreateCollection { label }).await?;
             return Ok((no_prompt(), prompt));
         }
         Ok((self.daemon.create_collection(&label).await?, no_prompt()))
@@ -123,6 +134,7 @@ impl ServiceObj {
     async fn unlock(
         &self,
         objects: Vec<OwnedObjectPath>,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), SecretError> {
         let k = self.daemon.keyring.lock().await;
         if k.is_unlocked() {
@@ -135,7 +147,8 @@ impl ServiceObj {
         if pending.is_empty() {
             return Ok((already, no_prompt()));
         }
-        let prompt = PromptObj::register(&self.daemon, PromptAction::Unlock { objects: pending }).await?;
+        let prompt =
+            PromptObj::register(&self.daemon, sender(&header), PromptAction::Unlock { objects: pending }).await?;
         Ok((already, prompt))
     }
 
@@ -262,7 +275,7 @@ impl CollectionObj {
         if self.daemon.keyring.lock().await.collection_locked(&self.id) {
             let new = NewItem { label, attributes, secret: plain, content_type, replace };
             let action = PromptAction::CreateItem { collection: self.id.clone(), new, caller };
-            let prompt = PromptObj::register(&self.daemon, action).await?;
+            let prompt = PromptObj::register(&self.daemon, sender(&header), action).await?;
             return Ok((no_prompt(), prompt));
         }
         let new = NewItem { label, attributes, secret: plain, content_type, replace };
@@ -434,8 +447,19 @@ pub struct SessionObj {
 
 #[interface(name = "org.freedesktop.Secret.Session")]
 impl SessionObj {
-    async fn close(&self, #[zbus(object_server)] server: &zbus::ObjectServer) -> zbus::fdo::Result<()> {
-        self.daemon.sessions.lock().unwrap().remove(&self.path);
+    async fn close(
+        &self,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let mut sessions = self.daemon.sessions.lock().unwrap();
+            // Only the bus name that opened the session may close it.
+            if sessions.get(&self.path).is_some_and(|s| Some(s.owner.as_str()) != sender(&header).as_deref()) {
+                return Err(zbus::fdo::Error::AccessDenied("the session belongs to another client".into()));
+            }
+            sessions.remove(&self.path);
+        }
         server.remove::<SessionObj, _>(self.path.as_str()).await?;
         Ok(())
     }
@@ -469,14 +493,58 @@ impl PromptAction {
 }
 
 impl PromptObj {
-    pub async fn register(daemon: &Arc<Daemon>, action: PromptAction) -> Result<OwnedObjectPath, SecretError> {
-        let path = format!("{SERVICE_PATH}/prompt/p{}", daemon.next_id());
+    pub async fn register(
+        daemon: &Arc<Daemon>,
+        owner: Option<String>,
+        action: PromptAction,
+    ) -> Result<OwnedObjectPath, SecretError> {
+        let owner = owner.unwrap_or_default();
+        let seq = daemon.next_id();
+        let path = format!("{SERVICE_PATH}/prompt/p{seq}");
+        // A client holds a bounded number of prompts; it loses its own oldest.
+        let victim = {
+            let mut prompts = daemon.prompts.lock().unwrap();
+            let mine = prompts.iter().filter(|(_, _, o)| *o == owner).map(|(s, _, _)| *s);
+            oldest_to_evict(mine, PROMPTS_PER_OWNER).and_then(|oldest| {
+                let at = prompts.iter().position(|(s, _, _)| *s == oldest)?;
+                Some(prompts.remove(at))
+            })
+        };
+        if let Some(entry) = victim
+            && !PromptObj::dismiss_pending(daemon, &entry.1).await
+        {
+            // The oldest one is already running: it still counts.
+            daemon.prompts.lock().unwrap().push(entry);
+            return Err(SecretError::Failed("too many outstanding prompts".into()));
+        }
         let obj = PromptObj { daemon: daemon.clone(), path: path.clone(), action: std::sync::Mutex::new(Some(action)) };
         daemon.conn().object_server().at(path.as_str(), obj).await.map_err(SecretError::ZBus)?;
+        daemon.prompts.lock().unwrap().push((seq, path.clone(), owner));
         Ok(op(&path))
     }
 
+    /// Dismisses a prompt that has not started yet, dropping (and so zeroizing)
+    /// what it holds. False when it is already running.
+    async fn dismiss_pending(daemon: &Arc<Daemon>, path: &str) -> bool {
+        let action = match daemon.conn().object_server().interface::<_, PromptObj>(path).await {
+            Ok(iface) => {
+                let obj = iface.get().await;
+                let taken = obj.action.lock().unwrap().take();
+                match taken {
+                    Some(a) => Some(a.dismissed_result()),
+                    None => return false,
+                }
+            }
+            Err(_) => None,
+        };
+        let result =
+            action.unwrap_or_else(|| PromptAction::CreateCollection { label: String::new() }.dismissed_result());
+        PromptObj::finish(daemon.clone(), path.to_owned(), true, result).await;
+        true
+    }
+
     async fn finish(daemon: Arc<Daemon>, path: String, dismissed: bool, result: OwnedVariant) {
+        daemon.prompts.lock().unwrap().retain(|(_, p, _)| *p != path);
         if let Ok(e) = SignalEmitter::new(daemon.conn(), path.clone()) {
             let _ = PromptObj::completed(&e, dismissed, result).await;
         }
@@ -552,13 +620,7 @@ impl ControlObj {
     /// method cannot be used to guess the password quickly.
     async fn unlock_with_password(&self, password: String) -> Result<(), SecretError> {
         let password = Zeroizing::new(password);
-        match self.daemon.unlock_with_password(&password).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                Err(SecretError::Failed(e.to_string()))
-            }
-        }
+        self.daemon.unlock_with_password_throttled(&password).await.map_err(|e| SecretError::Failed(e.to_string()))
     }
 
     async fn lock(&self) {
@@ -585,6 +647,5 @@ pub async fn serve(daemon: &Arc<Daemon>) -> zbus::Result<()> {
     let server = daemon.conn().object_server();
     server.at(SERVICE_PATH, ServiceObj { daemon: daemon.clone() }).await?;
     server.at(CONTROL_PATH, ControlObj { daemon: daemon.clone() }).await?;
-    let _ = DEFAULT_ALIAS_PATH;
     daemon.sync_objects().await
 }

@@ -105,7 +105,27 @@ pub struct NewItem {
     pub replace: bool,
 }
 
+/// Most sessions one bus client may hold; its oldest one goes first.
+pub const SESSIONS_PER_OWNER: usize = 64;
+/// Most sessions held by all clients together. A new one is refused beyond it.
+pub const SESSIONS_TOTAL: usize = 4096;
+/// Most outstanding prompt objects one bus client may hold.
+pub const PROMPTS_PER_OWNER: usize = 16;
+
+/// The oldest of one client's objects (by their creation sequence number) when
+/// it already holds `cap` of them and so has to give one up for a new one.
+pub fn oldest_to_evict(seqs: impl IntoIterator<Item = u64>, cap: usize) -> Option<u64> {
+    let mut count = 0usize;
+    let mut oldest: Option<u64> = None;
+    for seq in seqs {
+        count += 1;
+        oldest = Some(oldest.map_or(seq, |o| o.min(seq)));
+    }
+    if count >= cap { oldest } else { None }
+}
+
 pub struct OpenSession {
+    pub seq: u64,
     pub owner: String,
     pub session: Session,
 }
@@ -117,6 +137,8 @@ pub struct Daemon {
     pub config: Config,
     conn: OnceLock<Connection>,
     pub sessions: std::sync::Mutex<HashMap<String, Arc<OpenSession>>>,
+    /// Outstanding prompt objects as (sequence, path, owner).
+    pub prompts: std::sync::Mutex<Vec<(u64, String, String)>>,
     registered: Mutex<BTreeSet<String>>,
     counter: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
@@ -134,6 +156,7 @@ impl Daemon {
             config,
             conn: OnceLock::new(),
             sessions: std::sync::Mutex::new(HashMap::new()),
+            prompts: std::sync::Mutex::new(Vec::new()),
             registered: Mutex::new(BTreeSet::new()),
             counter: AtomicU64::new(1),
             last_activity: std::sync::Mutex::new(Instant::now()),
@@ -255,6 +278,17 @@ impl Daemon {
         self.publish(diff).await;
         tracing::info!("keyring unlocked");
         Ok(())
+    }
+
+    /// Like `unlock_with_password` for remote callers: a failure holds the
+    /// unlock gate for a while, so that parallel guesses queue up behind it.
+    pub async fn unlock_with_password_throttled(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
+        let _gate = self.unlock_gate.lock().await;
+        let result = self.unlock_with_password(password).await;
+        if result.is_err() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        result
     }
 
     /// Asks for the master password; returns false when the user gave up.
@@ -534,6 +568,15 @@ mod path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn eviction_policy_takes_the_oldest_only_at_the_cap() {
+        use super::oldest_to_evict;
+        assert_eq!(oldest_to_evict([5, 3, 9], 4), None);
+        assert_eq!(oldest_to_evict([5, 3, 9], 3), Some(3));
+        assert_eq!(oldest_to_evict([], 1), None);
+        assert_eq!(oldest_to_evict([7], 1), Some(7));
+    }
+
     use super::*;
 
     use crate::backend::memory::MemoryBackend;

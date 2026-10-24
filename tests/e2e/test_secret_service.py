@@ -6,6 +6,7 @@ DH-encrypted session), and the bwss CLI.
 
 import pytest
 import secretstorage
+from conftest import BWSS
 from secretstorage.exceptions import LockedException
 
 PASSWORD = "open sesame"
@@ -171,3 +172,93 @@ def test_survives_garbage_input(memory_daemon, bus):
     reply = bus.send_and_get_reply(new_method_call(svc, "GetSecrets", "aoo", (["/org/freedesktop/secrets/collection/login/nope"], "/bogus")))
     assert reply.header.message_type.name == "error"
     assert d.cli("status").returncode == 0
+
+
+# --- abuse limits between bus clients (TM-019) ---------------------------------------
+
+SVC = "/org/freedesktop/secrets"
+LOGIN = "/org/freedesktop/secrets/collection/login"
+SESSION_CAP = 64
+PROMPT_CAP = 16
+
+
+@pytest.fixture
+def other_bus():
+    conn = secretstorage.dbus_init()
+    yield conn
+    conn.close()
+
+
+def _call(conn, path, interface, member, sig="", body=()):
+    from jeepney import DBusAddress, new_method_call
+
+    addr = DBusAddress(path, bus_name="org.freedesktop.secrets", interface=interface)
+    return conn.send_and_get_reply(new_method_call(addr, member, sig, body))
+
+
+def _open_plain(conn):
+    reply = _call(conn, SVC, "org.freedesktop.Secret.Service", "OpenSession", "sv", ("plain", ("s", "")))
+    assert reply.header.message_type.name == "method_return", reply.body
+    return reply.body[1]
+
+
+def _session_alive(conn, path):
+    """A session is alive while Close on it is not answered with an unknown-object error."""
+    reply = _call(conn, path, "org.freedesktop.DBus.Introspectable", "Introspect")
+    return reply.header.message_type.name == "method_return"
+
+
+def test_one_client_cannot_evict_anothers_sessions(memory_daemon, bus, other_bus):
+    a_session = _open_plain(bus)
+    first_b = _open_plain(other_bus)
+    for _ in range(SESSION_CAP + 8):
+        _open_plain(other_bus)
+    # A's session is untouched by B's flood.
+    assert _session_alive(bus, a_session)
+    # B pushed out only its own oldest sessions, and their objects are gone.
+    assert not _session_alive(other_bus, first_b)
+
+
+def test_session_close_is_limited_to_its_owner(memory_daemon, bus, other_bus):
+    a_session = _open_plain(bus)
+    denied = _call(other_bus, a_session, "org.freedesktop.Secret.Session", "Close")
+    assert denied.header.message_type.name == "error"
+    assert _session_alive(bus, a_session)
+    ok = _call(bus, a_session, "org.freedesktop.Secret.Session", "Close")
+    assert ok.header.message_type.name == "method_return"
+    assert not _session_alive(bus, a_session)
+
+
+def test_prompts_are_capped_per_client(memory_daemon, bus, other_bus):
+    a_prompt = _call(bus, SVC, "org.freedesktop.Secret.Service", "Unlock", "ao", ([LOGIN],)).body[1]
+    b_prompts = [
+        _call(other_bus, SVC, "org.freedesktop.Secret.Service", "Unlock", "ao", ([LOGIN],)).body[1]
+        for _ in range(PROMPT_CAP + 4)
+    ]
+    # B's oldest prompts were dismissed and removed; its newest survive; A's is untouched.
+    assert not _session_alive(other_bus, b_prompts[0])
+    assert _session_alive(other_bus, b_prompts[-1])
+    assert _session_alive(bus, a_prompt)
+
+
+def test_failed_unlocks_are_serialized(memory_daemon):
+    import subprocess
+    import time
+
+    d = memory_daemon
+    start = time.monotonic()
+    procs = [
+        subprocess.Popen(
+            [BWSS, "unlock", "--password-stdin"],
+            env=d.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for p in procs:
+        p.communicate("wrong\n")
+        assert p.returncode != 0
+    assert time.monotonic() - start >= 4.0

@@ -341,7 +341,11 @@ Unchanged from `legacy`:
 
 - One Bitwarden master password unlocks everything, through pinentry (3
   attempts) on the first request or `bwss unlock`. Failed CLI unlocks are
-  delayed 2 s.
+  delayed 2 s, and the delay holds the unlock gate so parallel guesses queue.
+- Per bus client: at most 64 sessions (its oldest is closed first; 4096 in
+  all, then new sessions are refused) and 16 outstanding prompts (its oldest
+  unstarted one is dismissed). Only the bus name that opened a session may
+  close it.
 - Lock on request, after `idle_lock_minutes`, and on SIGTERM: keys and
   decrypted items are zeroized, the API session is dropped.
 - The locked index (`~/.cache/bwss/locked-index.json`) keeps, per marked
