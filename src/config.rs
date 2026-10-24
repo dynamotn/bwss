@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -57,11 +58,17 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
+    }
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
@@ -107,6 +114,44 @@ pub fn load_credentials(paths: &Paths) -> anyhow::Result<Credentials> {
             anyhow::bail!("{} must not be readable by others (chmod 600)", paths.credentials.display());
         }
     }
-    let text = std::fs::read_to_string(&paths.credentials)?;
+    let text = Zeroizing::new(std::fs::read_to_string(&paths.credentials)?);
     Ok(toml::from_str(&text)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compiles only while the secret is wiped on drop.
+    fn _assert_zeroizing(c: &Credentials) -> &Zeroizing<String> {
+        &c.client_secret
+    }
+
+    #[test]
+    fn credentials_debug_is_redacted() {
+        let c = Credentials { client_id: "the-id".into(), client_secret: Zeroizing::new("hunter2-secret".into()) };
+        let out = format!("{c:?}");
+        assert!(!out.contains("hunter2-secret"));
+        assert!(out.contains("<redacted>"));
+        assert!(out.contains("the-id"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_load_into_zeroizing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        std::fs::write(&path, "client_id = \"cid\"\nclient_secret = \"csecret\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let paths = Paths {
+            config: dir.path().join("config.toml"),
+            credentials: path,
+            cache: dir.path().join("cache"),
+            state: dir.path().join("state"),
+        };
+        let c = load_credentials(&paths).unwrap();
+        assert_eq!(c.client_id, "cid");
+        assert_eq!(c.client_secret.as_str(), "csecret");
+    }
 }

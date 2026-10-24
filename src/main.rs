@@ -205,7 +205,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             config.server_url = server;
             config.backend = BackendKind::Bitwarden;
             fsutil::write_private(&paths.config, toml::to_string_pretty(&config)?.as_bytes())?;
-            let creds = Credentials { client_id, client_secret: secret.to_string() };
+            let creds = Credentials { client_id, client_secret: secret };
             fsutil::write_private(&paths.credentials, Zeroizing::new(toml::to_string(&creds)?).as_bytes())?;
             println!("saved {} and {}", paths.config.display(), paths.credentials.display());
             Ok(())

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use url::Url;
+use zeroize::Zeroizing;
 
 use super::crypto::KdfParams;
 
@@ -92,10 +93,16 @@ pub fn normalize_keys(value: Value) -> Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiKey {
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey").field("client_id", &self.client_id).field("client_secret", &"<redacted>").finish()
+    }
 }
 
 // DeviceType.LinuxDesktop in the Bitwarden server enum.
@@ -106,7 +113,7 @@ pub struct Api {
     urls: ServerUrls,
     http: reqwest::Client,
     device_id: String,
-    token: Option<(String, Instant)>,
+    token: Option<(Zeroizing<String>, Instant)>,
     user_id: Option<String>,
 }
 
@@ -182,7 +189,7 @@ impl Api {
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::Protocol("no access token".into()))?;
         let ttl = body.get("expires_in").and_then(Value::as_u64).unwrap_or(3600).saturating_sub(60).max(60);
-        self.token = Some((token.to_owned(), Instant::now() + Duration::from_secs(ttl)));
+        self.token = Some((Zeroizing::new(token.to_owned()), Instant::now() + Duration::from_secs(ttl)));
         Ok(())
     }
 
@@ -203,7 +210,7 @@ impl Api {
 
     fn authed(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, ApiError> {
         match &self.token {
-            Some((t, exp)) if *exp > Instant::now() => Ok(req.bearer_auth(t)),
+            Some((t, exp)) if *exp > Instant::now() => Ok(req.bearer_auth(t.as_str())),
             _ => Err(ApiError::Http { status: 401, message: "not logged in".into() }),
         }
     }
@@ -287,6 +294,15 @@ fn describe_error(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_debug_is_redacted() {
+        let k = ApiKey { client_id: "the-id".into(), client_secret: Zeroizing::new("hunter2-secret".into()) };
+        let out = format!("{k:?}");
+        assert!(!out.contains("hunter2-secret"));
+        assert!(out.contains("<redacted>"));
+        assert!(out.contains("the-id"));
+    }
 
     #[test]
     fn server_urls() {

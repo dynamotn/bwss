@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v4"] }
 zbus = { version = "6.0.0", default-features = false, features = ["proxy", "service", "tokio"] }
-zeroize = { version = "1.9.1", features = ["derive"] }
+zeroize = { version = "1.9.1", features = ["derive", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

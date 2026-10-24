@@ -294,7 +294,7 @@ async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
         cache: dir.path().join("cache"),
         state: dir.path().join("state"),
     };
-    let creds = Credentials { client_id: "id".into(), client_secret: "secret".into() };
+    let creds = Credentials { client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
     let backend = Arc::new(BitwardenBackend::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
     let keys = Keys { mark: user.derive("value-mark"), user };
