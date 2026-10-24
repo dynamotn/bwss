@@ -6,6 +6,7 @@ bus that exists only for this test session.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import secretstorage
+from jeepney.bus_messages import message_bus
 
 HERE = Path(__file__).parent
 BWSS = os.environ.get("BWSS_BIN", str(HERE.parents[1] / "target" / "release" / "bwss"))
@@ -62,8 +64,9 @@ class Daemon:
             self.proc.wait(10)
             self.proc = None
 
-    def cli(self, *args, input=None, check=True):
-        return subprocess.run([BWSS, *args], env=self.env, input=input, capture_output=True, text=True, check=check)
+    def cli(self, *args, input=None, check=True, timeout=None):
+        return subprocess.run([BWSS, *args], env=self.env, input=input, capture_output=True, text=True, check=check,
+                              timeout=timeout)
 
     def tool(self, *args, input=None, check=True):
         """secret-tool, run as a separate process (its own executable for the ACL)."""
@@ -77,26 +80,43 @@ class Squatter:
     REPLACE_EXISTING = 2
     DO_NOT_QUEUE = 4
 
-    def __init__(self, name: str, flags: int = DO_NOT_QUEUE):
+    def __init__(self, name: str, flags: int = DO_NOT_QUEUE, exec_argv=(), env=None):
+        self.name = name
         self.log = Path(tempfile.mkdtemp(prefix="bwss-squatter-")) / "calls.log"
-        self.proc = subprocess.Popen([sys.executable, SQUATTER, name, str(flags), str(self.log)],
-                                     stdout=subprocess.PIPE, text=True)
+        # Its own process group, so stop() also reaches a forked child.
+        self.proc = subprocess.Popen([sys.executable, SQUATTER, name, str(flags), str(self.log), *exec_argv],
+                                     stdout=subprocess.PIPE, text=True, env=env, start_new_session=True)
         self.reply = int(self.proc.stdout.readline())
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
 
     def stop(self):
-        self.proc.terminate()
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         self.proc.wait(10)
+        if self.reply != 1:
+            return
+        # Wait until the name is free again for the next test.
+        conn = secretstorage.dbus_init()
+        try:
+            for _ in range(100):
+                if not conn.send_and_get_reply(message_bus.NameHasOwner(self.name)).body[0]:
+                    return
+                time.sleep(0.1)
+            raise RuntimeError(f"{self.name} is still owned after the squatter stopped")
+        finally:
+            conn.close()
 
 
 @pytest.fixture
 def squatters():
     started = []
 
-    def start(name, flags=Squatter.DO_NOT_QUEUE):
-        started.append(Squatter(name, flags))
+    def start(name, flags=Squatter.DO_NOT_QUEUE, **kw):
+        started.append(Squatter(name, flags, **kw))
         return started[-1]
 
     yield start

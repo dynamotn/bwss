@@ -112,6 +112,8 @@ async fn verified_control() -> anyhow::Result<zbus::Proxy<'static>> {
         .with_context(|| format!("{CONTROL_NAME} is not on the bus; is the bwss daemon running?"))?;
     let pid = bus.get_connection_unix_process_id(BusName::Unique(owner.as_ref())).await?;
     let me = std::env::current_exe().context("cannot find this executable")?;
+    // A speed bump against processes of the same user, like the item ACL:
+    // it holds as long as the CLI and the daemon are the same installed file.
     match acl::executable_of(pid) {
         Some(exe) if acl::same_executable(&exe, &me) => {}
         found => bail!(
@@ -119,6 +121,9 @@ async fn verified_control() -> anyhow::Result<zbus::Proxy<'static>> {
             found.as_deref().unwrap_or(acl::UNKNOWN),
             me.display()
         ),
+    }
+    if !acl::runs_daemon(pid) {
+        bail!("refusing to send the password: {CONTROL_NAME} is owned by pid {pid}, which is not a `bwss daemon`");
     }
     Ok(zbus::Proxy::new(&conn, owner.into_inner(), CONTROL_PATH, CONTROL_IFACE).await?)
 }

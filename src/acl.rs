@@ -31,6 +31,19 @@ fn strip_deleted(path: &str) -> &str {
     path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
+/// Whether process `pid` was started as `<bwss> daemon [--replace]`, from
+/// `/proc/<pid>/cmdline`. The executable alone is not enough: a squatter can
+/// fork (the child keeps the bus connection) and exec bwss in the parent,
+/// whose pid is the one the bus reports.
+pub fn runs_daemon(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| is_daemon_cmdline(&raw))
+}
+
+fn is_daemon_cmdline(raw: &[u8]) -> bool {
+    let mut args = raw.strip_suffix(b"\0").unwrap_or(raw).split(|&b| b == 0).skip(1);
+    args.next() == Some(b"daemon".as_slice()) && args.all(|a| a == b"--replace")
+}
+
 /// Whether `owner` (a path from `executable_of`) is the same binary as `me`
 /// (`current_exe()`), comparing canonical paths where they still resolve.
 pub fn same_executable(owner: &str, me: &Path) -> bool {
@@ -65,5 +78,17 @@ mod tests {
         std::fs::write(&other, b"").unwrap();
         assert!(!same_executable(other.to_str().unwrap(), &bin));
         assert!(!same_executable("/nonexistent/bwss", &bin));
+    }
+
+    #[test]
+    fn only_a_daemon_command_line_counts_as_the_daemon() {
+        assert!(is_daemon_cmdline(b"/usr/bin/bwss\0daemon\0"));
+        assert!(is_daemon_cmdline(b"bwss\0daemon\0--replace\0"));
+        assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0unlock\0"), "a blocking client is not the daemon");
+        assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0daemon\0--other\0"));
+        assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0--replace\0daemon\0"));
+        assert!(!is_daemon_cmdline(b"/usr/bin/bwss\0"));
+        assert!(!is_daemon_cmdline(b""));
+        assert!(!runs_daemon(u32::MAX), "no such process");
     }
 }

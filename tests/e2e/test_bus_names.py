@@ -1,6 +1,9 @@
 """Bus-name ownership: who may hold bwss's names, and who gets the password."""
 
+import os
 import subprocess
+import sys
+import time
 
 from jeepney.bus_messages import message_bus
 
@@ -9,6 +12,7 @@ from conftest import BWSS, Daemon, Squatter
 PASSWORD = "open sesame"
 CONTROL = "io.github.dynamotn.bwss"
 SECRETS = "org.freedesktop.secrets"
+PYTHON = os.path.realpath(sys.executable)
 
 
 def has_owner(bus, name):
@@ -28,7 +32,7 @@ def test_daemon_refuses_a_squatted_control_name(squatters, bus):
     assert squatter.reply == 1
     r = run_daemon(memory_home())
     assert r.returncode != 0
-    assert f"{CONTROL} is owned by /usr/bin/python3" in r.stderr, r.stderr
+    assert f"{CONTROL} is owned by {PYTHON}" in r.stderr, r.stderr
     assert not has_owner(bus, SECRETS)
 
 
@@ -37,7 +41,7 @@ def test_daemon_refuses_a_secrets_provider_it_cannot_replace(squatters, bus):
     assert squatter.reply == 1
     r = run_daemon(memory_home())
     assert r.returncode != 0
-    assert f"{SECRETS} is owned by /usr/bin/python3" in r.stderr, r.stderr
+    assert f"{SECRETS} is owned by {PYTHON}" in r.stderr, r.stderr
     assert "does not allow replacement" in r.stderr
     assert not has_owner(bus, CONTROL)
 
@@ -54,13 +58,33 @@ def test_password_stdin_goes_only_to_bwss(squatters):
     home = memory_home()
     r = home.cli("unlock", "--password-stdin", input=PASSWORD + "\n", check=False)
     assert r.returncode != 0
-    assert "refusing to send the password" in r.stderr and "/usr/bin/python3" in r.stderr, r.stderr
+    assert "refusing to send the password" in r.stderr and PYTHON in r.stderr, r.stderr
     # Plain `unlock` sends no password, so it does reach the squatter; that
     # shows the squatter would have logged a password had one been sent.
     assert home.cli("unlock", check=False).returncode != 0
     calls = squatter.calls()
     assert any(c.startswith("UnlockInteractive ") for c in calls), calls
     assert not any("UnlockWithPassword" in c or PASSWORD in c for c in calls), calls
+
+
+def test_password_stdin_refuses_a_squatter_that_execs_bwss(squatters):
+    # The squatter forks: the child keeps the name, and the parent (the pid
+    # the bus reports) becomes a genuine, blocked `bwss unlock`.
+    home = memory_home()
+    squatter = squatters(CONTROL, exec_argv=[BWSS, "unlock"], env=home.env)
+    assert squatter.reply == 1
+    exe = f"/proc/{squatter.proc.pid}/exe"
+    for _ in range(100):
+        if os.path.realpath(exe) == os.path.realpath(BWSS):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the squatter did not exec bwss")
+    # The child never answers, so a password sent to it would hang the CLI.
+    r = home.cli("unlock", "--password-stdin", input=PASSWORD + "\n", check=False, timeout=10)
+    assert r.returncode != 0
+    assert "which is not a `bwss daemon`" in r.stderr, r.stderr
+    assert not any("UnlockWithPassword" in c or PASSWORD in c for c in squatter.calls()), squatter.calls()
 
 
 def test_password_stdin_without_a_daemon_says_so():

@@ -607,9 +607,17 @@ hooks. Before sending the password it resolves the owner of
 `io.github.dynamotn.bwss` (`GetNameOwner`, `GetConnectionUnixProcessID`,
 `/proc/<pid>/exe`) and refuses, naming that executable, unless it is the
 CLI's own `current_exe()` (canonical paths; a ` (deleted)` suffix from an
-upgrade is ignored). The call then goes to that unique name, so the owner
-cannot change in between. Without `/proc` (non-Linux), `--password-stdin` is
-refused.
+upgrade is ignored) and `/proc/<pid>/cmdline` is `<bwss> daemon
+[--replace]`. The command line matters: a squatter can fork, keep the bus
+connection in the child and exec a blocking `bwss unlock` in the parent,
+whose pid is the one the bus reports. The call then goes to that unique
+name, so the owner cannot change in between. Without `/proc` (non-Linux),
+`--password-stdin` is refused. The CLI and the daemon must be the same
+installed file.
+
+This check is a speed bump against other processes of the same user, like
+the item ACL (§11), not a guarantee: such a process can ptrace the daemon
+or the CLI. Plain `bwss unlock` sends no password at all.
 
 `bwss status` additionally reports duplicate ids and likely duplicate items
 (§3.3, §8), by id and label only, never secrets.
@@ -633,6 +641,10 @@ Notes:
   a personal item on its own. (For organization items it could, through
   any member with write access; see §12.)
 - bwss holds the security invariants of spec §11 as written there.
+- The bus names are never replaceable, and `bwss unlock --password-stdin`
+  sends the password only to a `bwss daemon` running the CLI's own file
+  (§10). Against a process of the same user that is a speed bump, not a
+  wall; plain `bwss unlock` keeps the password inside the daemon.
 - `bwss:acl` comes from the item. Anyone who can edit the item in
   Bitwarden can grant an executable access; for personal items that is the
   user.
