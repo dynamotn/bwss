@@ -126,9 +126,15 @@ Notes:
   - they are read-only: creating, changing or deleting them, and deleting
     the collection, fail with `NotSupported`, before any access prompt.
   - their "Always allow" rules are not written into the item (it is not
-    ours) but into `~/.local/state/bwss/vault-acl`, encrypted with the user
-    key, so another process cannot grant itself access by editing the
-    file. Those rules stay on the machine that made them.
+    ours) but into `~/.local/state/bwss/vault-acl`, encrypted with a key
+    derived from the user key (HKDF, purpose `vault-acl`). Another process
+    can neither edit the file nor replace it with some other ciphertext of
+    the user key, such as an item label it chose. Those rules stay on the
+    machine that made them.
+  - as for every item, labels and attributes are readable by any process
+    on the session bus while the keyring is unlocked; only secrets go
+    through the access check. With `whole_vault` that means the names,
+    usernames, URIs and folders of the whole vault.
   - a sub-folder `<root>/Vault` would clash with the collection id; it is
     skipped with a warning and its items show up in `vault`.
   - the locked index covers them too, so it reveals how many items the

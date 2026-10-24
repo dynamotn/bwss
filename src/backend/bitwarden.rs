@@ -78,6 +78,8 @@ fn map_api(e: ApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
 }
 
+const VAULT_ACL_PURPOSE: &str = "vault-acl";
+
 fn read_only() -> BackendError {
     BackendError::Rejected("items of the vault collection are read-only".into())
 }
@@ -140,11 +142,17 @@ impl BitwardenBackend {
         }
     }
 
-    /// The `vault` access rules, encrypted with the user key so that another
-    /// process cannot grant itself access by editing the file.
+    /// The access rules of vault items, encrypted with a key derived from the
+    /// user key, so that another process can neither edit the file nor swap
+    /// in some other ciphertext of the user key (an item name it chose, say).
     fn load_vault_acl(&self, key: &SymmetricKey) -> BTreeMap<String, Vec<String>> {
         let Ok(text) = std::fs::read_to_string(&self.vault_acl_path) else { return BTreeMap::new() };
-        match key.decrypt_str(text.trim()).ok().and_then(|plain| serde_json::from_str(&plain).ok()) {
+        match key
+            .derive(VAULT_ACL_PURPOSE)
+            .decrypt_str(text.trim())
+            .ok()
+            .and_then(|plain| serde_json::from_str(&plain).ok())
+        {
             Some(acl) => acl,
             None => {
                 tracing::warn!("ignoring {}: it does not belong to this vault", self.vault_acl_path.display());
@@ -155,7 +163,8 @@ impl BitwardenBackend {
 
     fn save_vault_acl(&self, state: &Unlocked) {
         let plain = Zeroizing::new(serde_json::to_string(&state.vault_acl).unwrap_or_default());
-        if let Err(e) = write_private(&self.vault_acl_path, state.user_key.encrypt_str(&plain).as_bytes()) {
+        let enc = state.user_key.derive(VAULT_ACL_PURPOSE).encrypt_str(&plain);
+        if let Err(e) = write_private(&self.vault_acl_path, enc.as_bytes()) {
             tracing::warn!("could not save the access rules of vault items: {e}");
         }
     }

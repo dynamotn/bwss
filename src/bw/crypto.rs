@@ -154,6 +154,20 @@ impl SymmetricKey {
         key
     }
 
+    /// A key of its own for `purpose` (HKDF-Expand over this key), so that
+    /// nothing encrypted with this key can pass for data of that purpose.
+    pub fn derive(&self, purpose: &str) -> Self {
+        let mut prk = Zeroizing::new([0u8; 64]);
+        prk[..32].copy_from_slice(&self.enc);
+        prk[32..].copy_from_slice(&self.mac);
+        let enc = hkdf_expand32(prk.as_ref(), format!("bwss {purpose} enc").as_bytes());
+        let mac = hkdf_expand32(prk.as_ref(), format!("bwss {purpose} mac").as_bytes());
+        let mut key = SymmetricKey { enc: [0; 32], mac: [0; 32] };
+        key.enc.copy_from_slice(enc.as_ref());
+        key.mac.copy_from_slice(mac.as_ref());
+        key
+    }
+
     pub fn encrypt(&self, plain: &[u8]) -> String {
         let mut iv = [0u8; 16];
         rand::fill(&mut iv);
@@ -294,5 +308,17 @@ mod tests {
         assert!(KdfParams::Pbkdf2 { iterations: 1 }.validate().is_err());
         assert!(KdfParams::Argon2id { iterations: 3, memory_mib: 4096, parallelism: 4 }.validate().is_err());
         assert!(KdfParams::Pbkdf2 { iterations: 600_000 }.validate().is_ok());
+    }
+
+    #[test]
+    fn derived_keys_are_separate() {
+        let user = SymmetricKey::generate();
+        let acl = user.derive("vault-acl");
+        assert_eq!(acl.to_bytes(), user.derive("vault-acl").to_bytes());
+        assert_ne!(acl.to_bytes(), user.to_bytes());
+        assert_ne!(acl.to_bytes(), user.derive("other").to_bytes());
+        // Text the user key encrypted (an item name, say) does not open with the derived key.
+        assert!(acl.decrypt_str(&user.encrypt_str("{}")).is_err());
+        assert_eq!(&*acl.decrypt_str(&acl.encrypt_str("{}")).unwrap(), "{}");
     }
 }
