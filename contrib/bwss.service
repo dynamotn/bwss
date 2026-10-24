@@ -1,0 +1,21 @@
+# systemd user unit: ~/.config/systemd/user/bwss.service
+[Unit]
+Description=bwss Secret Service (Bitwarden-backed keyring)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=%h/.cargo/bin/bwss daemon
+Restart=on-failure
+# The daemon holds decrypted secrets while unlocked.
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical-session.target
