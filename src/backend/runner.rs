@@ -23,7 +23,7 @@ use super::bitwarden::{
     registry_with_queue, with_queue,
 };
 use super::ops::Op;
-use super::registry::{Entry, REGISTRY_ID};
+use super::registry::{Entry, REGISTRY_ID, Registry};
 use crate::bw::api::ApiError;
 use crate::bw::fields::{F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_LABEL, PREFIX};
 use crate::bw::scan::{MarkedItem, Scan, ValueSource, normalize_collection, scan};
@@ -543,7 +543,8 @@ impl BitwardenBackend {
                         return Err(Failure::Wait("the collection registry note has a bwss:password field".into()));
                     }
                     merged.merge(&state.built.registry);
-                    merged.put(collection, entry.clone());
+                    // Merged, never put: a newer entry from another device wins.
+                    merged.merge(&Registry(BTreeMap::from([(collection.to_owned(), entry.clone())])));
                     let patch = Patch {
                         id: REGISTRY_ID.into(),
                         base_revision: revision,

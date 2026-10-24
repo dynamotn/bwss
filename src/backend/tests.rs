@@ -697,6 +697,33 @@ async fn collections_live_in_the_registry_note() {
 }
 
 #[tokio::test]
+async fn a_queued_tombstone_never_buries_a_newer_collection() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![registry_note(&k, "r1", r#"{"work":{"label":"Work","created":5}}"#)], k.clone()).await;
+    v.fake.with(|s| s.down = true);
+    v.backend.delete_collection("work", &[]).await.unwrap();
+    assert_eq!(v.queued().await, 1);
+
+    // Another device deleted and created it again meanwhile.
+    let notes = k.encrypt_str(r#"{"work":{"label":"Work again","created":100}}"#);
+    v.fake.with(|s| {
+        s.down = false;
+        s.rev += 1;
+        let rev = s.revision();
+        let c = s.find("r1").unwrap();
+        c["notes"] = json!(notes);
+        c["revisionDate"] = json!(rev);
+    });
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    let registry = Registry::try_parse(&v.dec(&v.fake.cipher("r1")["notes"])).unwrap();
+    assert!(!registry.0["work"].deleted, "{registry:?}");
+    assert_eq!(registry.0["work"].created, 100);
+    assert!(v.snapshot().await.collections.iter().any(|c| c.id == "work"));
+}
+
+#[tokio::test]
 async fn an_unreadable_registry_is_never_written() {
     let k = SymmetricKey::generate();
     let v = vault(vec![registry_note(&k, "r1", "not json")], k).await;
