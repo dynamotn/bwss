@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{Backend, BackendError};
-use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now, path_segment};
+use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now};
 
 pub struct MemoryBackend {
     password: String,
@@ -51,7 +51,7 @@ impl Backend for MemoryBackend {
     async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
         self.check()?;
         let mut data = self.data.lock().unwrap();
-        let mut id = path_segment(&label.to_lowercase());
+        let mut id = label.trim().to_lowercase();
         while data.collections.iter().any(|c| c.id == id) {
             id.push('_');
         }

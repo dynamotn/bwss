@@ -19,7 +19,7 @@ use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key}
 use crate::bw::items::{self, MapError};
 use crate::config::{Config, Credentials, Paths};
 use crate::fsutil::write_private;
-use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now, path_segment};
+use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now};
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
@@ -146,7 +146,7 @@ impl BitwardenBackend {
             } else if let Some(sub) =
                 name.strip_prefix(&format!("{}/", self.root)).filter(|s| !s.is_empty() && !s.contains('/'))
             {
-                let cid = path_segment(&sub.to_lowercase());
+                let cid = sub.to_lowercase();
                 collections.push(CollectionData { id: cid.clone(), label: sub.to_owned(), created: 0, modified: 0 });
                 cid
             } else {
@@ -411,7 +411,7 @@ impl Backend for BitwardenBackend {
         if label.is_empty() {
             return Err(BackendError::Rejected("a collection needs a label".into()));
         }
-        let id = path_segment(&label.to_lowercase());
+        let id = label.to_lowercase();
         self.ensure_folder(&id, &label).await?;
         Ok(CollectionData { id, label, created: now(), modified: now() })
     }

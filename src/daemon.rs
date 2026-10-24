@@ -13,7 +13,7 @@ use crate::backend::{Backend, BackendError};
 use crate::config::{AclMode, Config};
 use crate::dbus::{CollectionObj, ItemObj, ServiceObj};
 use crate::keyring::{Diff, Keyring};
-use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, now, path_segment};
+use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, escape_segment, now, unescape_segment};
 use crate::prompter::{Confirm, Prompter};
 use crate::session::Session;
 
@@ -21,11 +21,11 @@ pub const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 pub const DEFAULT_ALIAS_PATH: &str = "/org/freedesktop/secrets/aliases/default";
 
 pub fn collection_path(id: &str) -> String {
-    format!("{SERVICE_PATH}/collection/{id}")
+    format!("{SERVICE_PATH}/collection/{}", escape_segment(id))
 }
 
 pub fn item_path(collection: &str, id: &str) -> String {
-    format!("{SERVICE_PATH}/collection/{collection}/{id}")
+    format!("{SERVICE_PATH}/collection/{}/{}", escape_segment(collection), escape_segment(id))
 }
 
 pub fn op(path: &str) -> OwnedObjectPath {
@@ -43,8 +43,11 @@ pub fn parse_path(path: &str) -> Option<(String, Option<String>)> {
     }
     let rest = path.strip_prefix(&format!("{SERVICE_PATH}/collection/"))?;
     let mut parts = rest.split('/');
-    let c = parts.next().filter(|s| !s.is_empty())?.to_owned();
-    let i = parts.next().map(str::to_owned);
+    let c = unescape_segment(parts.next().filter(|s| !s.is_empty())?)?;
+    let i = match parts.next() {
+        Some(seg) => Some(unescape_segment(seg)?),
+        None => None,
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -469,7 +472,7 @@ impl Daemon {
             return Err(SecretError::IsLocked("the keyring is locked".into()));
         }
         let c = self.backend.create_collection(label).await?;
-        let id = path_segment(&c.id);
+        let id = c.id.clone();
         self.keyring.lock().await.add_collection(c);
         self.publish(Diff { collections_created: vec![id.clone()], ..Default::default() }).await;
         Ok(op(&collection_path(&id)))
@@ -491,5 +494,16 @@ impl Daemon {
         })
         .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn parse_path_unescapes_ids() {
+        assert_eq!(parse_path(&item_path("work/keys", "a b")), Some(("work/keys".into(), Some("a b".into()))));
+        assert_eq!(parse_path(&format!("{SERVICE_PATH}/collection/_zz")), None);
     }
 }

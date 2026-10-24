@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey};
-use crate::model::{Attributes, ItemData, path_segment};
+use crate::model::{Attributes, ItemData};
 
 pub const PREFIX: &str = "bwss:";
 pub const F_ID: &str = "bwss:id";
@@ -105,10 +105,7 @@ pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Resu
     let cipher_id = cipher.get("id").and_then(Value::as_str).unwrap_or_default();
     let modified = parse_date(cipher.get("revisionDate").and_then(Value::as_str).unwrap_or_default());
     Ok(ItemData {
-        id: get(F_ID)
-            .filter(|s| !s.is_empty())
-            .map(|s| path_segment(&s))
-            .unwrap_or_else(|| format!("c{}", path_segment(cipher_id))),
+        id: get(F_ID).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| format!("c{cipher_id}")),
         collection: collection.to_owned(),
         label: dec(cipher.get("name"), &key)?.map(|s| s.to_string()).unwrap_or_default(),
         attributes,
@@ -337,7 +334,7 @@ mod tests {
             "login": { "username": key.encrypt_str("me"), "password": key.encrypt_str("hunter2") }, "fields": null
         });
         let it = decode(&login, &key, "login").unwrap();
-        assert_eq!(it.id, "c1234_abcd");
+        assert_eq!(it.id, "c1234-abcd");
         assert_eq!(&*it.secret, b"hunter2");
         assert_eq!(it.modified, 1_767_323_045);
         let note = json!({ "id": "n", "type": 2, "name": key.encrypt_str("Note"), "notes": key.encrypt_str("text"), "revisionDate": "" });
