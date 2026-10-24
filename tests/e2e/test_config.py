@@ -109,6 +109,19 @@ def test_a_broken_credentials_file_never_shows_the_secret():
     assert "s3cr3t" not in r.stderr
 
 
+def test_an_unreadable_credentials_file_stops_the_daemon_naming_it():
+    d = bitwarden_home()
+    login(d)
+    creds = d.state / "profiles" / PROFILE / "credentials"
+    creds.chmod(0o000)
+    try:
+        r = run_daemon(d)
+    finally:
+        creds.chmod(0o600)
+    assert r.returncode != 0 and str(creds) in r.stderr and "Permission denied" in r.stderr, r.stderr
+    assert "csecret" not in r.stderr
+
+
 def test_login_needs_a_profile():
     d = Daemon({"backend": "memory"})
     r = d.cli("login", "--client-id", "x", "--client-secret-stdin", input="s\n", check=False)

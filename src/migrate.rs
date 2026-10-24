@@ -679,20 +679,53 @@ mod tests {
 
     #[test]
     fn files_left_behind_by_a_failed_rename_are_named() {
+        let mut h = home();
+        h.legacy("email = \"me@example.org\"\n");
+        // A name so long that `<name>.migrated` exceeds NAME_MAX: the rename
+        // fails whatever the permissions (the tests may run as root).
+        let long = h.paths.legacy_config.with_file_name("c".repeat(250));
+        h.paths.legacy_credentials = long.clone();
+        write(&long, "client_id = \"user.cid\"\nclient_secret = \"csecret\"\n");
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(e.contains("not renamed") && e.contains("renaming") && e.contains(&"c".repeat(250)), "{e}");
+        assert!(!e.contains("csecret"), "the secret is never shown: {e}");
+        assert!(e.contains("wrote [bwss]"), "what was done is reported too: {e}");
+        assert!(e.contains("renamed") && e.contains("config.toml.migrated"), "the other file was renamed: {e}");
+        assert!(long.exists(), "the file that could not be renamed stays");
+        assert!(!h.paths.legacy_config.exists());
+    }
+
+    #[test]
+    fn legacy_credentials_missing_a_key_are_named_without_their_secret() {
         let h = home();
         h.legacy("email = \"me@example.org\"\n");
-        h.legacy_credentials();
-        let dir = h.paths.legacy_config.parent().unwrap().to_owned();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let probe = std::fs::File::create(dir.join("probe"));
-        if probe.is_ok() {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            return; // permissions not enforced (running as root)
-        }
+        write(&h.paths.legacy_credentials, "client_id = \"user.cid\"\n");
+        std::fs::set_permissions(&h.paths.legacy_credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
         let e = format!("{:#}", h.run(false).unwrap_err());
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(e.contains("not renamed") && e.contains("config.toml") && e.contains("credentials.toml"), "{e}");
-        assert!(e.contains("wrote [bwss]"), "what was done is reported too: {e}");
+        assert!(e.contains("missing key `client_secret`") && e.contains("credentials.toml"), "{e}");
+        assert!(!e.contains("user.cid"), "{e}");
+        assert!(h.paths.legacy_config.exists(), "nothing was renamed");
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_written_or_parsed_names_the_file() {
+        let h = home();
+        h.legacy("email = \"me@example.org\"\n");
+        h.dybw("this is = = not toml\n");
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(e.contains(&h.paths.config.display().to_string()), "{e}");
+        assert!(h.paths.legacy_config.exists());
+
+        // The temporary file of the replace cannot be created: the error
+        // names the file, and no old file is renamed.
+        let h = home();
+        h.legacy("email = \"me@example.org\"\n");
+        std::fs::create_dir_all(h.paths.config.with_extension(format!("tmp{}", std::process::id()))).unwrap();
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(e.contains(&h.paths.config.display().to_string()), "{e}");
+        assert!(h.paths.legacy_config.exists());
+        assert!(!h.paths.config.exists());
     }
 
     #[test]

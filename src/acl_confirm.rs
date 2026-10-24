@@ -235,6 +235,43 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_path_reads_as_empty_and_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading it fails, not "missing".
+        let p = path(&dir);
+        std::fs::create_dir_all(&p).unwrap();
+        let mut set = ConfirmSet::open(Some(p.clone()), SymmetricKey::generate());
+        assert_eq!(set.mark("i", "/x"), Mark::None);
+        set.set("i", "/x", Mark::Confirmed);
+        assert_eq!(set.mark("i", "/x"), Mark::Confirmed, "kept in memory");
+        assert!(p.is_dir(), "the unreadable path is left alone");
+    }
+
+    #[test]
+    fn setting_the_mark_it_already_has_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        set.set("i", "/x", Mark::None);
+        assert!(!path(&dir).exists(), "nothing recorded, nothing written");
+        set.set("i", "/x", Mark::Denied);
+        let before = std::fs::read(path(&dir)).unwrap();
+        set.set("i", "/x", Mark::Denied);
+        assert_eq!(std::fs::read(path(&dir)).unwrap(), before, "not even re-sealed");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_decision_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        // The file does not exist yet, so the set is writable; then a
+        // directory takes the file's place and the replace fails.
+        std::fs::create_dir_all(path(&dir)).unwrap();
+        set.set("i", "/x", Mark::Confirmed);
+        assert_eq!(set.mark("i", "/x"), Mark::Confirmed);
+        assert!(path(&dir).is_dir(), "what is there is left alone");
+    }
+
+    #[test]
     fn a_memory_only_set_still_remembers() {
         let mut set = ConfirmSet::open(None, SymmetricKey::generate());
         set.set("i", "/x", Mark::Confirmed);

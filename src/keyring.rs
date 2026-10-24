@@ -436,6 +436,42 @@ mod tests {
         }
     }
 
+    fn collection(id: &str, label: &str) -> CollectionData {
+        CollectionData { id: id.into(), label: label.into(), created: 1, modified: 1 }
+    }
+
+    #[test]
+    fn renaming_a_collection_updates_it_and_the_locked_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let mut k = Keyring::new(Some(path.clone()), None);
+        k.load(Snapshot { collections: vec![collection("work", "Work")], items: vec![] });
+        assert_eq!(read_json(&path)["collections"][0]["label"], "Work");
+
+        k.set_collection_label("work", "Office");
+        let c = k.collection("work").unwrap();
+        assert_eq!(c.label, "Office");
+        assert!(c.modified > 1, "the modification time moves");
+        assert_eq!(read_json(&path)["collections"][0]["label"], "Office");
+
+        let before = k.collections().count();
+        k.set_collection_label("nope", "Ghost");
+        assert!(k.collection("nope").is_none(), "an unknown collection is not created");
+        assert_eq!(k.collections().count(), before);
+        assert_eq!(read_json(&path)["collections"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_saved_leaves_the_keyring_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut k = Keyring::new(Some(blocker.join("index.json")), None);
+        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
+        assert_eq!(k.search(&q(&[("service", "gh")]), None).0, vec![("login".into(), "a".into())]);
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"x");
+    }
+
     const DERIVED: [(&str, &str); 4] =
         [("bwss:id", "a"), ("bwss:name", "GitHub"), ("bwss:username", "me"), ("bwss:uri", "https://github.com")];
 

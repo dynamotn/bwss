@@ -475,8 +475,7 @@ impl Trust {
         let shown = resolved.display();
         let now = std::fs::canonicalize(resolved).with_context(|| format!("pinentry {shown}"))?;
         ensure!(now == resolved, "pinentry {shown} now resolves to {}", now.display());
-        let meta = std::fs::metadata(resolved).with_context(|| format!("pinentry {shown}"))?;
-        ensure!(meta.is_file(), "pinentry {shown} is not a program");
+        ensure!(resolved.is_file(), "pinentry {shown} is not a program");
         let Some(writable) = self.writable_part(resolved) else {
             return Ok(PinentryRule::NotWritable);
         };
@@ -528,10 +527,10 @@ impl Trust {
         for dir in file.ancestors().skip(1) {
             let meta = std::fs::metadata(dir);
             let open = meta.as_ref().map_or(true, |m| self.user.may_write_file(m));
-            let shielded = match (&meta, std::fs::symlink_metadata(below)) {
-                (Ok(dir), Ok(entry)) => sticky_shields(dir.mode(), dir.uid(), entry.uid(), &self.user),
-                _ => false,
-            };
+            let shielded = meta.as_ref().is_ok_and(|dir| {
+                std::fs::symlink_metadata(below)
+                    .is_ok_and(|entry| sticky_shields(dir.mode(), dir.uid(), entry.uid(), &self.user))
+            });
             if open && !shielded {
                 return Some(dir.to_owned());
             }
@@ -733,7 +732,7 @@ mod tests {
         "[profiles.personal]\nserver_url = \"https://vault.example.org\"\nemail = \"me@example.org\"\n";
 
     /// Compiles only while the secret is wiped on drop.
-    fn _assert_zeroizing(c: &Credentials) -> &Zeroizing<String> {
+    fn assert_zeroizing(c: &Credentials) -> &Zeroizing<String> {
         &c.client_secret
     }
 
@@ -744,6 +743,7 @@ mod tests {
             client_id: "the-id".into(),
             client_secret: Zeroizing::new("hunter2-secret".into()),
         };
+        assert_eq!(assert_zeroizing(&c).as_str(), "hunter2-secret");
         let out = format!("{c:?}");
         assert!(!out.contains("hunter2-secret"));
         assert!(out.contains("<redacted>"));
@@ -1013,6 +1013,14 @@ mod tests {
         assert_eq!(p.queue_key_migrated(), Path::new("/st/dybw/tools/bwss/queue-key-migrated"));
         assert_eq!(p.cache, Path::new("/home/u/.cache/bwss"));
         assert_eq!(p.state, Path::new("/st/bwss"));
+    }
+
+    #[test]
+    fn without_a_home_the_locations_hang_off_the_root() {
+        let p = Paths::with(|_| None);
+        assert_eq!(p.config, Path::new("/.config/dybw/config.toml"));
+        assert_eq!(p.state, Path::new("/.local/state/bwss"));
+        assert_eq!(p.cache, Path::new("/.cache/bwss"));
     }
 
     #[test]
@@ -1287,6 +1295,27 @@ mod tests {
         }
 
         #[test]
+        fn a_pinentry_that_vanished_or_is_not_a_program_fails_the_check_before_each_spawn() {
+            let f = fixture();
+            let t = trust(&f, f.me.clone());
+            let gone = f.bin.join("vanished");
+            let e = format!("{:#}", t.verify(&gone).unwrap_err());
+            assert!(e.contains("pinentry") && e.contains(&gone.display().to_string()), "{e}");
+            let e = format!("{:#}", t.verify(&f.bin).unwrap_err());
+            assert!(e.contains("is not a program"), "{e}");
+        }
+
+        #[test]
+        fn an_executable_without_a_prefix_never_uses_the_prefix_rule() {
+            let f = fixture();
+            // As root everything is writable; `/` has neither a Cellar nor a grandparent.
+            let t =
+                Trust { exe: Some(PathBuf::from("/")), user: User { uid: 0, groups: None }, ..trust(&f, f.me.clone()) };
+            let e = format!("{:#}", t.verify(&f.bin.join("pinentry")).unwrap_err());
+            assert!(e.contains("has no installation prefix") && e.contains("writable by this user"), "{e}");
+        }
+
+        #[test]
         fn the_prefix_is_the_keg_root_or_the_grandparent() {
             let p = |s: &str| install_prefix(Path::new(s));
             assert_eq!(p("/opt/homebrew/Cellar/bwss/1.0/bin/bwss"), Some(PathBuf::from("/opt/homebrew")));
@@ -1441,6 +1470,24 @@ mod tests {
 
             std::fs::write(&path, "client_id = \"no origin\"\n").unwrap();
             assert!(load_credentials(&path, &user, ORIGIN).is_err());
+        }
+
+        #[test]
+        fn credentials_that_are_not_text_or_cannot_be_saved_say_where() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials");
+            save_credentials(&path, &creds()).unwrap();
+            let user = me(&path);
+            std::fs::write(&path, b"client_secret = \"\xff\xfe\"\n").unwrap();
+            let e = format!("{:#}", load_credentials(&path, &user, ORIGIN).unwrap_err());
+            assert!(e.contains(&path.display().to_string()) && e.contains("UTF-8"), "{e}");
+
+            let blocker = dir.path().join("blocker");
+            std::fs::write(&blocker, "x").unwrap();
+            let target = blocker.join("profiles/p/credentials");
+            let e = format!("{:#}", save_credentials(&target, &creds()).unwrap_err());
+            assert!(e.contains(&target.display().to_string()), "{e}");
+            assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "x");
         }
 
         #[test]

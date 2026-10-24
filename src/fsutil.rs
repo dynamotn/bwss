@@ -71,7 +71,7 @@ impl User {
     #[cfg(target_os = "linux")]
     pub fn current() -> std::io::Result<User> {
         let status = std::fs::read_to_string("/proc/self/status")?;
-        parse_status(&status).ok_or_else(|| std::io::Error::other("cannot read the user from /proc/self/status"))
+        user_from_status(&status)
     }
 
     /// Without `/proc`: a new file is owned by the effective user id.
@@ -105,6 +105,11 @@ impl User {
 fn tempfile_path() -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     std::env::temp_dir().join(format!("bwss-uid-{}-{nanos}", std::process::id()))
+}
+
+#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code, reason = "Linux only; tested everywhere"))]
+fn user_from_status(status: &str) -> std::io::Result<User> {
+    parse_status(status).ok_or_else(|| std::io::Error::other("cannot read the user from /proc/self/status"))
 }
 
 /// The effective uid and the groups from `/proc/<pid>/status`.
@@ -150,6 +155,30 @@ mod tests {
         assert!(err.to_string().contains("cannot serialize"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"kept":true}"#);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_in_a_directory_that_cannot_be_created_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(write_private(&blocker.join("child/state.json"), b"{}").is_err());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"x", "the blocking file is untouched");
+        assert!(ensure_private_dir(&blocker.join("sub")).is_err());
+    }
+
+    #[test]
+    fn a_status_without_the_ids_is_an_error_naming_the_file() {
+        let e = user_from_status("Name:\tbwss\n").unwrap_err();
+        assert!(e.to_string().contains("/proc/self/status"), "{e}");
+        let ok = user_from_status("Uid:\t1\t2\t2\t2\nGid:\t3\t4\t4\t4\nGroups:\n").unwrap();
+        assert_eq!(ok, User { uid: 2, groups: Some(vec![4]) });
+    }
+
+    #[test]
+    fn a_path_without_a_parent_cannot_be_written() {
+        assert!(write_atomic(Path::new(""), b"x", 0o600).is_err());
+        assert!(write_atomic(Path::new("/"), b"x", 0o600).is_err());
     }
 
     #[test]

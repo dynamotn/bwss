@@ -131,5 +131,26 @@ mod tests {
         assert_eq!(escape_segment("0123abcdef"), "0123abcdef");
         assert_eq!(escape_segment("a-b"), "a_2db");
         assert_eq!(unescape_segment("_zz"), None);
+        assert_eq!(unescape_segment("a-b"), None, "a byte that escape_segment would have escaped");
+        assert_eq!(unescape_segment("a b"), None);
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_secret() {
+        let item = ItemData {
+            id: "id-1".into(),
+            collection: "login".into(),
+            label: "GitHub".into(),
+            attributes: Attributes::from([("service".to_owned(), "gh".to_owned())]),
+            secret: Zeroizing::new(b"hunter2-secret".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 2,
+            acl: vec!["/usr/bin/git".into()],
+        };
+        let out = format!("{item:?}");
+        assert!(!out.contains("hunter2-secret") && !out.contains("104, 117"), "{out}");
+        assert!(out.contains("<redacted>") && out.contains("id-1") && out.contains("GitHub"), "{out}");
+        assert!(out.contains("service") && out.contains("text/plain"), "{out}");
     }
 }
