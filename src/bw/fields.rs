@@ -28,12 +28,13 @@ pub const A_URI: &str = "bwss:uri";
 /// opted in (`bwss index derived on`).
 pub const DERIVED: [&str; 4] = [A_ID, A_NAME, A_USERNAME, A_URI];
 
-/// What the first `bwss:location` field says (spec §6.4, ADR 0010).
+/// What the first `bwss:location` field says, compared after trimming (spec
+/// §3.2, §6.4, ADR 0010, ADR 0014).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Location {
     /// No field, or a value empty or blank after trimming.
     Absent,
-    /// Exactly `notes`: the notes hold bwss's secret.
+    /// `notes` after trimming: the notes hold bwss's secret.
     Notes,
     /// Any other value, which this version does not know.
     Unknown,
@@ -41,10 +42,30 @@ pub enum Location {
 
 impl Location {
     pub fn classify(value: Option<&str>) -> Self {
-        match value {
+        match value.map(str::trim) {
+            None | Some("") => Self::Absent,
             Some("notes") => Self::Notes,
-            None => Self::Absent,
-            Some(v) if v.trim().is_empty() => Self::Absent,
+            Some(_) => Self::Unknown,
+        }
+    }
+}
+
+/// What the first `bwss:encoding` field says (spec §3.2, ADR 0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    /// No field, or a value blank after trimming.
+    Absent,
+    /// `base64` after trimming.
+    Base64,
+    /// Any other value, which this version does not know.
+    Unknown,
+}
+
+impl Encoding {
+    pub fn classify(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("") => Self::Absent,
+            Some("base64") => Self::Base64,
             Some(_) => Self::Unknown,
         }
     }
@@ -93,9 +114,25 @@ mod tests {
         for blank in ["", " ", "  ", "\t\n"] {
             assert_eq!(Location::classify(Some(blank)), Location::Absent, "{blank:?}");
         }
-        assert_eq!(Location::classify(Some("notes")), Location::Notes);
-        for other in [" notes ", "notes\n", "Notes", "NOTES", "attachment", "field"] {
+        for mark in ["notes", " notes ", "notes\n", "\tnotes"] {
+            assert_eq!(Location::classify(Some(mark)), Location::Notes, "{mark:?}");
+        }
+        for other in ["Notes", "NOTES", "attachment", "field", "no tes"] {
             assert_eq!(Location::classify(Some(other)), Location::Unknown, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn encoding_classes() {
+        assert_eq!(Encoding::classify(None), Encoding::Absent);
+        for blank in ["", " ", "\t\n"] {
+            assert_eq!(Encoding::classify(Some(blank)), Encoding::Absent, "{blank:?}");
+        }
+        for mark in ["base64", " base64\n", "\tbase64 "] {
+            assert_eq!(Encoding::classify(Some(mark)), Encoding::Base64, "{mark:?}");
+        }
+        for other in ["Base64", "hex", "base 64"] {
+            assert_eq!(Encoding::classify(Some(other)), Encoding::Unknown, "{other:?}");
         }
     }
 

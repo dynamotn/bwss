@@ -11,8 +11,8 @@ use zeroize::Zeroizing;
 
 use super::crypto::{CryptoError, SymmetricKey, value_mark};
 use super::fields::{
-    A_ID, A_NAME, A_URI, A_USERNAME, F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_LABEL,
-    F_LOCATION, F_PASSWORD, Location, field_names, field_value, first_index,
+    A_ID, A_NAME, A_URI, A_USERNAME, Encoding, F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING,
+    F_ID, F_LABEL, F_LOCATION, F_PASSWORD, Location, field_names, field_value, first_index,
 };
 use super::items::{item_key, parse_date};
 use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION};
@@ -142,10 +142,10 @@ fn read_marked(
         Location::Unknown => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_LOCATION}"))),
     };
     let encoding = field(F_ENCODING)?;
-    let base64 = match encoding.as_deref().map(String::as_str) {
-        None => false,
-        Some("base64") => true,
-        Some(_) => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_ENCODING}"))),
+    let base64 = match Encoding::classify(encoding.as_deref().map(String::as_str)) {
+        Encoding::Absent => false,
+        Encoding::Base64 => true,
+        Encoding::Unknown => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_ENCODING}"))),
     };
 
     // The value source: the first present one.
@@ -462,11 +462,23 @@ mod tests {
             let m = marked(scan(&c, &k));
             assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::LoginPassword, b"pw".as_slice()));
         }
-        // the mark is the exact value "notes": anything else is unknown
-        for odd in [" notes ", "notes\n", "Notes"] {
+        // only "notes" (after trimming) is the mark: anything else is unknown
+        for odd in ["Notes", "hex"] {
             let c = login(&k, &[id.clone(), f("bwss:location", odd)], Some("pw"), Some("mine"));
             assert!(matches!(scan(&c, &k), Scan::Skipped(_)), "{odd:?}");
+            let c = login(&k, &[id.clone(), f("bwss:encoding", odd)], Some("pw"), Some("mine"));
+            assert!(matches!(scan(&c, &k), Scan::Skipped(_)), "{odd:?}");
         }
+        // a padded mark is the mark (ADR 0014)
+        let c = login(&k, &[id.clone(), f("bwss:location", " notes\n")], None, Some("big"));
+        let m = marked(scan(&c, &k));
+        assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::BwssNotes, b"big".as_slice()));
+        let c = login(&k, &[id.clone(), f("bwss:encoding", " base64\n"), f("bwss:password", "AAE=")], None, None);
+        let m = marked(scan(&c, &k));
+        assert_eq!(m.item.secret.as_slice(), [0u8, 1].as_slice());
+        // a blank encoding is absent: the value is read as text
+        let c = login(&k, &[id.clone(), f("bwss:encoding", "  "), f("bwss:password", "AAE=")], None, None);
+        assert_eq!(marked(scan(&c, &k)).item.secret.as_slice(), b"AAE=".as_slice());
         // undecryptable field names -> Uninspectable
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
         c["fields"][0]["name"] = json!("2.bad|bad|bad");

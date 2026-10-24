@@ -1,6 +1,6 @@
 # bwss — redesign
 
-This design follows the **dybw data model, version 1.3**
+This design follows the **dybw data model, version 1.4**
 (`docs/data-model.md` in the dybw umbrella repository). That spec is
 normative and wins over this document; this document adds the `bwss`
 namespace's own rules (its fields are registered in dybw's
@@ -89,17 +89,18 @@ These would make it a failure even if every test passed:
 | `bwss:id` | text | The marker and the item's stable id. bwss generates a UUID (32 hex digits) for items it creates; the user may type any value on items they mark. |
 | `bwss:password` | hidden | Holds the secret when the field is present, even empty. New items keep their secret here. |
 | `bwss:label` | text | The Secret Service label, when present. Label edits go here. |
-| `bwss:attr:<name>` | text | One lookup attribute each: a common field of the data model (spec §3.4), matched exactly in the `bwss` namespace only. |
+| `bwss:attr:<name>` | text | One lookup attribute each: a common field of the data model (spec §3.4), matched exactly in the `bwss` namespace only, values compared without trimming. |
 | `bwss:collection` | text | Collection id; absent means `login` (alias `default`). |
 | `bwss:content-type` | text | Content type of the secret; absent means `text/plain`. |
-| `bwss:encoding` | text | `base64` when the stored secret is base64 of non-UTF-8 bytes. Valid only with a source bwss owns: `bwss:password`, or the notes with `bwss:location=notes`. |
-| `bwss:location` | text | `notes` when bwss itself moved an oversize secret into the notes (§5.2). Only that value is a mark: an empty or blank value counts as absent (spec §6.4, ADR 0010). |
+| `bwss:encoding` | text | Compared after trimming like `bwss:location`. `base64` when the stored secret is base64 of non-UTF-8 bytes. Valid only with a source bwss owns: `bwss:password`, or the notes with `bwss:location=notes`. |
+| `bwss:location` | text | `notes` when bwss itself moved an oversize secret into the notes (§5.2). Compared after trimming: only `notes` is a mark, a blank value counts as absent, anything else skips the item (spec §3.2, ADR 0010, ADR 0014). |
 | `bwss:acl` | hidden | Executables allowed without asking, one path per line. |
 | `bwss:created` | text | Unix seconds when the item joined the keyring. |
 
 Field names are matched exactly (case-sensitive). If an item carries the
-same field twice, the first in field order counts, and a write changes only
-that one (spec §3.1). Every field bwss does not own is kept on write: other
+same field twice, the first in field order counts, a write that changes a
+value changes only that one, and a write that removes a field removes every
+field of that name (spec §3.1, ADR 0014). Every field bwss does not own is kept on write: other
 namespaces (`obsidian:*`, the reserved `dybw:*`), fields with no namespace,
 and `bwss:` fields this version does not know, so newer versions can add
 some.

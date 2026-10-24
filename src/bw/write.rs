@@ -120,7 +120,7 @@ impl<'k> Fields<'k> {
         }
     }
 
-    /// Whether the first `bwss:location` is exactly `notes` (the one
+    /// Whether the first `bwss:location` is `notes` after trimming (the one
     /// classification scan, write and delete share).
     fn is_notes_marked(&self) -> Result<bool, CryptoError> {
         let value = self.value(F_LOCATION)?;
@@ -153,27 +153,18 @@ impl<'k> Fields<'k> {
         json!({ "type": kind, "name": self.key.encrypt_str(name), "value": enc, "linkedId": null })
     }
 
-    fn remove_where(&mut self, keep: impl Fn(&str) -> bool, first_only: bool) {
-        let mut removed = false;
-        self.entries.retain(|(_, name)| {
-            let hit = !(first_only && removed) && name.as_deref().is_some_and(|n| !keep(n));
-            removed |= hit;
-            !hit
-        });
-    }
-
-    fn remove_first(&mut self, name: &str) {
-        self.remove_where(|n| n != name, true);
+    fn remove_where(&mut self, keep: impl Fn(&str) -> bool) {
+        self.entries.retain(|(_, name)| name.as_deref().is_none_or(&keep));
     }
 
     /// Removes every field called `name`, so no later duplicate takes its
-    /// place when bwss removes a field that decides how the value is read.
+    /// place (spec §3.1, ADR 0014).
     fn remove_all(&mut self, name: &str) {
-        self.remove_where(|n| n != name, false);
+        self.remove_where(|n| n != name);
     }
 
     fn remove_prefix(&mut self, prefix: &str) {
-        self.remove_where(|n| !n.starts_with(prefix), false);
+        self.remove_where(|n| !n.starts_with(prefix));
     }
 
     /// Fails when a field value is over Bitwarden's limit, so an oversize
@@ -331,7 +322,7 @@ pub fn apply(cipher: &Value, patch: &Patch, keys: &Keys) -> Result<Map<String, V
         if name == F_ATTR {
             fields.remove_prefix(F_ATTR);
         } else {
-            fields.remove_first(name);
+            fields.remove_all(name);
         }
     }
     for (name, value, hidden) in &patch.set {
@@ -727,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_changes_only_the_first_duplicate() {
+    fn patch_changes_the_first_duplicate_and_removes_every_copy() {
         let k = keys();
         let c = login(
             &k,
@@ -757,11 +748,11 @@ mod tests {
         p.set = vec![("bwss:label".into(), "New".into(), false)];
         p.remove = vec!["bwss:content-type".into()];
         let body = apply(&c, &p, &k).unwrap();
-        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:label", "bwss:label", "bwss:content-type"]);
+        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:label", "bwss:label"]);
         let after = body["fields"].as_array().unwrap();
         assert_eq!(dec_with(&k.user, &after[1]["value"]), "New");
         assert_eq!(after[2], c["fields"][2]);
-        assert_eq!(after[3], c["fields"][4]);
+        // removing a field removes every copy (ADR 0014); changing one changes the first only
     }
 
     #[test]
@@ -907,12 +898,33 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_notes_mark_lets_strip_clear_the_notes() {
+    fn strip_clears_the_notes_for_a_padded_mark_only() {
         let k = keys();
-        for odd in [" notes ", "notes\n", "Notes", ""] {
-            let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", odd, false)], Some("mine"));
-            assert_eq!(strip(&c, &k).unwrap()["notes"], c["notes"], "{odd:?}");
+        for mark in ["notes", " notes ", "notes\n"] {
+            let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", mark, false)], Some("mine"));
+            assert!(strip(&c, &k).unwrap()["notes"].is_null(), "{mark:?}");
         }
+        for other in ["Notes", "", "  "] {
+            let c = note(&k, &[("bwss:id", "x", false), ("bwss:location", other, false)], Some("mine"));
+            assert_eq!(strip(&c, &k).unwrap()["notes"], c["notes"], "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_padded_mark_is_a_mark_when_writing() {
+        let k = keys();
+        let id = ("bwss:id", "x", false);
+        let pw = ("bwss:password", "old", true);
+        // fitting value: the stale copy behind a padded mark is cleared
+        let c = login(&k, &[id, pw, ("bwss:location", " notes\n", false)], None, Some("stale"));
+        let body = apply(&c, &set_secret(&c, &k, b"short"), &k).unwrap();
+        assert!(body["notes"].is_null());
+        assert_eq!(field(&body, &k.user, "bwss:location"), None);
+        // oversize value: the notes behind a padded mark are reused, not NotesTaken
+        let big = vec![b'a'; 6000];
+        let c = login(&k, &[id, pw, ("bwss:location", " notes ", false)], None, Some("old big"));
+        let body = apply(&c, &set_secret(&c, &k, &big), &k).unwrap();
+        assert_eq!(dec_with(&k.user, &body["notes"]).as_bytes(), big.as_slice());
     }
 
     #[test]
