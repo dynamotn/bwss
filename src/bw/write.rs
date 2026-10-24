@@ -203,7 +203,7 @@ fn write_owned_field(body: &mut Map<String, Value>, fields: &mut Fields, stored:
         // clear it and its mark in the same write.
         if bwss_notes {
             body.insert("notes".into(), Value::Null);
-            fields.remove_first(F_LOCATION);
+            fields.remove_all(F_LOCATION);
         }
         return Ok(());
     }
@@ -884,23 +884,26 @@ mod tests {
     }
 
     #[test]
-    fn clearing_the_mark_removes_only_the_first_location() {
+    fn clearing_the_stale_copy_drops_every_location_mark() {
         let k = keys();
-        let c = login(
-            &k,
-            &[
-                ("bwss:id", "x", false),
-                ("bwss:password", "old", true),
-                ("bwss:location", "notes", false),
-                ("bwss:location", " ", false),
-            ],
-            None,
-            Some("stale"),
-        );
-        let body = apply(&c, &set_secret(&c, &k, b"short"), &k).unwrap();
-        assert!(body["notes"].is_null());
-        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:password", "bwss:location"]);
-        assert_eq!(field(&body, &k.user, "bwss:location"), Some((" ".into(), 0)));
+        for second in ["notes", "attachment"] {
+            let c = login(
+                &k,
+                &[
+                    ("bwss:id", "x", false),
+                    ("bwss:password", "old", true),
+                    ("bwss:location", "notes", false),
+                    ("bwss:location", second, false),
+                ],
+                None,
+                Some("stale"),
+            );
+            let body = apply(&c, &set_secret(&c, &k, b"short"), &k).unwrap();
+            assert!(body["notes"].is_null(), "second {second:?}");
+            assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:password"], "second {second:?}");
+            assert_eq!(field(&body, &k.user, "bwss:location"), None);
+            marked(&as_server(&body), &k);
+        }
     }
 
     #[test]
