@@ -825,6 +825,20 @@ impl BitwardenBackend {
                     return Err(BackendError::Unavailable(format!("a queued change waits: {why}")));
                 }
                 Err(Failure::Conflict) => {
+                    // Only the value can conflict: keep the label, attribute
+                    // and ACL changes merged with it, and send them alone.
+                    if let Some(Op::Patch(p)) = queue.first()
+                        && !matches!(p.value, ValueChange::Keep)
+                    {
+                        tracing::warn!(
+                            "dropping a queued secret change: the secret was changed elsewhere; \
+                             the item's other queued changes are kept"
+                        );
+                        let rest = Patch { value: ValueChange::Keep, ..p.clone() };
+                        queue[0] = Op::Patch(rest);
+                        self.save_queue(queue, &seal_key);
+                        continue;
+                    }
                     tracing::warn!("dropping a queued change: the secret was changed elsewhere");
                     (Effect::Nothing, None)
                 }

@@ -503,6 +503,39 @@ async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
     assert_eq!(v.dec(&c["name"]), "Renamed");
 }
 
+#[tokio::test]
+async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    v.fake.with(|s| s.down = true);
+    let mut item = v.item_offline("gh").await;
+    item.secret = Zeroizing::new(b"ours".to_vec());
+    item.label = "Queued".into();
+    item.attributes.insert("user".into(), "me".into());
+    item.acl.push("/usr/bin/app".into());
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queued().await, 1);
+
+    // Another device changes the password meanwhile.
+    let theirs = k.encrypt_str("theirs");
+    v.fake.with(|s| {
+        s.down = false;
+        s.rev += 1;
+        let rev = s.revision();
+        let c = s.find("c1").unwrap();
+        c["login"]["password"] = json!(theirs);
+        c["revisionDate"] = json!(rev);
+    });
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!((v.queued().await, v.queue_file()), (0, 0));
+    let m = v.marked("c1");
+    assert_eq!(&*m.item.secret, b"theirs", "the other device's password stays");
+    assert_eq!(m.item.label, "Queued");
+    assert_eq!(m.item.attributes.get("user").map(String::as_str), Some("me"));
+    assert_eq!(m.item.acl, ["/usr/bin/app"]);
+}
+
 impl Vault {
     /// The item as the backend shows it, without a refresh.
     async fn item_offline(&self, id: &str) -> ItemData {
