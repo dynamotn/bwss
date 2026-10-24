@@ -54,6 +54,11 @@ keyring of every other machine running bwss.
 - **Locked, but findable.** A locked keyring still answers searches from a
   salted attribute index, so apps trigger the unlock prompt instead of
   failing silently after a reboot.
+- **The rest of your vault, too, if you want it.** With `whole_vault = true`,
+  every other login and secure note of your vault shows up in a read-only
+  `vault` collection, searchable by `bwss:name`, `bwss:username`, `bwss:uri`
+  and `bwss:folder`:
+  `secret-tool lookup bwss:name "Bank"`.
 - **Your Bitwarden data stays intact.** Editing an item keeps its username,
   URIs, custom fields, attachments and history, and the previous secret
   goes into password history.
@@ -90,6 +95,7 @@ flowchart LR
 | secret | login password (notes for very large secrets; base64 for binary data) |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
+| `vault` collection (with `whole_vault = true`) | every other personal item, read-only |
 
 - **Encryption**: bwss implements Bitwarden's client-side crypto itself:
   PBKDF2 or Argon2id, HKDF, and AES-256-CBC with HMAC.

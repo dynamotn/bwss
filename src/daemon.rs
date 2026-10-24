@@ -13,7 +13,7 @@ use crate::backend::{Backend, BackendError};
 use crate::config::{AclMode, Config};
 use crate::dbus::{CollectionObj, ItemObj, ServiceObj};
 use crate::keyring::{Diff, Keyring};
-use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, now, path_segment};
+use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, VAULT_COLLECTION, now, path_segment};
 use crate::prompter::{Confirm, Prompter};
 use crate::session::Session;
 
@@ -74,6 +74,15 @@ impl From<BackendError> for SecretError {
 }
 
 pub type SResult<T> = Result<T, SecretError>;
+
+/// Items of the `vault` collection belong to the user's Bitwarden vault, not
+/// to the keyring: apps may read them but never change them.
+pub fn ensure_writable(collection: &str) -> SResult<()> {
+    if collection == VAULT_COLLECTION {
+        return Err(SecretError::NotSupported("items of the vault collection are read-only".into()));
+    }
+    Ok(())
+}
 
 /// What a secret looks like on the wire: (session, parameters, value, content type).
 pub type WireSecret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
@@ -312,6 +321,9 @@ impl Daemon {
             let item = k.item(item_id).ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
             (item.label.clone(), item.acl.clone(), item.collection.clone())
         };
+        if action != "read" {
+            ensure_writable(&collection)?;
+        }
         if self.config.acl == AclMode::Off || collection == SESSION_COLLECTION || acl.iter().any(|a| a == caller) {
             return Ok(());
         }
@@ -371,6 +383,7 @@ impl Daemon {
             if k.collection(collection).is_none() {
                 return Err(SecretError::NoSuchObject(format!("no collection {collection}")));
             }
+            ensure_writable(collection)?;
             if k.collection_locked(collection) {
                 return Err(SecretError::IsLocked("the collection is locked".into()));
             }
@@ -434,6 +447,7 @@ impl Daemon {
         let item = {
             let k = self.keyring.lock().await;
             let mut item = k.item(id).cloned().ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
+            ensure_writable(&item.collection)?;
             f(&mut item);
             item.modified = now();
             item
@@ -456,6 +470,7 @@ impl Daemon {
             .item(id)
             .cloned()
             .ok_or_else(|| SecretError::IsLocked("the item is locked".into()))?;
+        ensure_writable(&item.collection)?;
         if item.collection != SESSION_COLLECTION {
             self.backend.delete_item(&item).await?;
         }
@@ -476,7 +491,7 @@ impl Daemon {
     }
 
     pub async fn delete_collection(self: &Arc<Self>, id: &str) -> SResult<()> {
-        if id == LOGIN_COLLECTION || id == SESSION_COLLECTION {
+        if id == LOGIN_COLLECTION || id == SESSION_COLLECTION || id == VAULT_COLLECTION {
             return Err(SecretError::NotSupported("built-in collections cannot be deleted".into()));
         }
         if !self.keyring.lock().await.is_unlocked() {

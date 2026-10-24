@@ -21,6 +21,12 @@ pub const F_LOCATION: &str = "bwss:location";
 pub const F_ACL: &str = "bwss:acl";
 pub const F_CREATED: &str = "bwss:created";
 
+/// Searchable attributes of items outside the keyring folders (`whole_vault`).
+pub const A_NAME: &str = "bwss:name";
+pub const A_USERNAME: &str = "bwss:username";
+pub const A_URI: &str = "bwss:uri";
+pub const A_FOLDER: &str = "bwss:folder";
+
 const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
 const FIELD_TEXT: u64 = 0;
@@ -118,6 +124,23 @@ pub fn decode(cipher: &Value, user_key: &SymmetricKey, collection: &str) -> Resu
         modified,
         acl: get(F_ACL).map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
     })
+}
+
+/// Attributes that make an ordinary vault item findable: its name, login
+/// username, first URI and folder. Empty values are left out.
+pub fn vault_attributes(cipher: &Value, user_key: &SymmetricKey, folder: Option<&str>) -> Result<Attributes, MapError> {
+    let key = item_key(cipher, user_key)?;
+    let mut out = Attributes::new();
+    let mut put = |name: &str, value: Option<String>| {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            out.insert(name.to_owned(), v);
+        }
+    };
+    put(A_NAME, dec(cipher.get("name"), &key)?.map(|s| s.to_string()));
+    put(A_USERNAME, dec(cipher.pointer("/login/username"), &key)?.map(|s| s.to_string()));
+    put(A_URI, dec(cipher.pointer("/login/uris/0/uri"), &key)?.map(|s| s.to_string()));
+    put(A_FOLDER, folder.map(str::to_owned));
+    Ok(out)
 }
 
 /// Response-only properties that must not be echoed back in a write.
@@ -343,6 +366,24 @@ mod tests {
         let note = json!({ "id": "n", "type": 2, "name": key.encrypt_str("Note"), "notes": key.encrypt_str("text"), "revisionDate": "" });
         assert_eq!(&*decode(&note, &key, "login").unwrap().secret, b"text");
         assert!(matches!(decode(&json!({ "type": 3 }), &key, "login"), Err(MapError::UnsupportedType(3))));
+    }
+
+    #[test]
+    fn vault_items_get_searchable_attributes() {
+        let key = SymmetricKey::generate();
+        let login = json!({
+            "id": "1", "type": 1, "name": key.encrypt_str("Bank"),
+            "login": { "username": key.encrypt_str("me"), "password": key.encrypt_str("p"),
+                       "uris": [{ "uri": key.encrypt_str("https://bank.example") }, { "uri": key.encrypt_str("https://b2") }] }
+        });
+        let attrs = vault_attributes(&login, &key, Some("Finance")).unwrap();
+        assert_eq!(attrs.get(A_NAME).map(String::as_str), Some("Bank"));
+        assert_eq!(attrs.get(A_USERNAME).map(String::as_str), Some("me"));
+        assert_eq!(attrs.get(A_URI).map(String::as_str), Some("https://bank.example"));
+        assert_eq!(attrs.get(A_FOLDER).map(String::as_str), Some("Finance"));
+        let note = json!({ "id": "n", "type": 2, "name": key.encrypt_str("Note"), "notes": key.encrypt_str("x") });
+        let attrs = vault_attributes(&note, &key, None).unwrap();
+        assert_eq!(attrs.keys().collect::<Vec<_>>(), vec![A_NAME]);
     }
 
     #[test]

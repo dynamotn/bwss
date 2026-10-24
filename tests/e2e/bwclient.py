@@ -166,7 +166,7 @@ class Account:
         return out
 
     def add_login(self, folder, name, password, fields=None):
-        fid = self.folder_id(folder)
+        fid = self.folder_id(folder) if folder else None
         k = self.user_key
         body = {
             "type": 1,

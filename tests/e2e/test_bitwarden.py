@@ -23,8 +23,8 @@ def account():
     return Account(URL)
 
 
-def bitwarden_daemon(account, server=None):
-    d = Daemon({"backend": "bitwarden", "folder": FOLDER, "acl": "off"})
+def bitwarden_daemon(account, server=None, **config):
+    d = Daemon({"backend": "bitwarden", "folder": FOLDER, "acl": "off", **config})
     # `bwss login` keeps the other settings and stores the API key with mode 0600.
     d.cli("login", "--email", account.email, "--server", server or URL, "--client-id", account.client_id,
           "--client-secret-stdin", input=account.client_secret + "\n")
@@ -140,5 +140,61 @@ def test_wrong_password_is_reported(account):
     try:
         r = d.cli("unlock", "--password-stdin", input="not it\n", check=False)
         assert r.returncode != 0 and "wrong master password" in (r.stderr + r.stdout).lower()
+    finally:
+        d.stop()
+
+
+def test_whole_vault_is_searchable_and_read_only(account):
+    account.add_login("Personal", "Mail", "m41l")
+    account.add_login(None, "Loose", "l00se")
+    hidden = bitwarden_daemon(account).start()
+    try:
+        unlock(hidden, account)
+        assert hidden.tool("lookup", "bwss:name", "Mail", check=False).stdout == ""
+    finally:
+        hidden.stop()
+
+    d = bitwarden_daemon(account, whole_vault=True).start()
+    try:
+        unlock(d, account)
+        assert d.tool("lookup", "bwss:name", "Mail").stdout == "m41l"
+        assert d.tool("lookup", "bwss:folder", "Personal", "bwss:username", "someone").stdout == "m41l"
+        assert d.tool("lookup", "bwss:name", "Loose").stdout == "l00se"
+        # Neither secret-tool nor a direct D-Bus client can change or delete a vault item.
+        d.tool("clear", "bwss:name", "Mail", check=False)
+        bus = secretstorage.dbus_init()
+        vault = secretstorage.Collection(bus, "/org/freedesktop/secrets/collection/vault")
+        with pytest.raises(Exception):
+            vault.create_item("new", {"a": "b"}, b"x")
+        item = next(vault.search_items({"bwss:name": "Mail"}))
+        with pytest.raises(Exception):
+            item.set_secret(b"changed")
+        with pytest.raises(Exception):
+            vault.delete()
+        bus.close()
+        mail = account.items("Personal")["Mail"]
+        assert mail["password"] == "m41l"
+        assert not any(name.startswith("bwss:") for name in mail["fields"])
+    finally:
+        d.stop()
+
+
+def test_always_allow_on_vault_items_is_kept_locally(account):
+    c = account.add_login("Personal", "Shared", "sh4red")
+    d = bitwarden_daemon(account, whole_vault=True, acl="prompt").start()
+    try:
+        unlock(d, account)
+        d.pinentry(confirm="always")
+        assert d.tool("lookup", "bwss:name", "Shared").stdout == "sh4red"
+        d.pinentry(confirm="deny")
+        # A remote edit rebuilds the keyring; the rule survives it, and a restart.
+        account.set_password(c["id"], "sh4red2")
+        d.cli("sync")
+        assert d.tool("lookup", "bwss:name", "Shared").stdout == "sh4red2"
+        d.stop()
+        d.start()
+        unlock(d, account)
+        assert d.tool("lookup", "bwss:name", "Shared").stdout == "sh4red2"
+        assert not any(name.startswith("bwss:") for name in account.items("Personal")["Shared"]["fields"])
     finally:
         d.stop()

@@ -11,6 +11,8 @@ pub type Attributes = BTreeMap<String, String>;
 pub const LOGIN_COLLECTION: &str = "login";
 /// In-memory collection for secrets that must not be persisted.
 pub const SESSION_COLLECTION: &str = "session";
+/// Read-only collection holding the rest of the Bitwarden vault (`whole_vault`).
+pub const VAULT_COLLECTION: &str = "vault";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ItemData {

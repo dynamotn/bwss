@@ -30,6 +30,8 @@ pub struct Config {
     pub email: String,
     /// Root Bitwarden folder; collections are its sub-folders.
     pub folder: String,
+    /// Also expose every other vault item, read-only, in the `vault` collection.
+    pub whole_vault: bool,
     /// pinentry-compatible program used for every prompt.
     pub prompter: String,
     pub acl: AclMode,
@@ -48,6 +50,7 @@ impl Default for Config {
             server_url: "https://vault.bitwarden.com".into(),
             email: String::new(),
             folder: "secret-service".into(),
+            whole_vault: false,
             prompter: "pinentry".into(),
             acl: AclMode::Prompt,
             idle_lock_minutes: 0,

@@ -104,6 +104,7 @@ flowchart TB
 | Secret | `login.password`. Base64 plus `bwss:encoding=base64` when the bytes are not UTF-8. It moves to `notes` (with `bwss:location=notes`) when its encrypted form exceeds the 5,000-character password limit, and is refused above the 10,000-character notes limit. |
 | Attributes | text fields `bwss:attr:<name>` |
 | Bookkeeping | `bwss:id` (stable id shared by all devices), `bwss:content-type`, `bwss:acl` (hidden field), `bwss:created` |
+| Collection `vault` (`whole_vault = true`) | every other personal login and secure note, in any folder or none; read-only |
 
 Notes:
 
@@ -116,6 +117,23 @@ Notes:
 - **Per-item keys** (`cipher.key`) are used for reading and kept on write.
 - **Items without `bwss:id`** (made by other clients) get the id `c<cipher
   id>`.
+- **The whole vault** (`whole_vault = true`):
+  - items outside `<root>` and its sub-folders land in the `vault`
+    collection. Their attributes are derived: `bwss:name` (item name),
+    `bwss:username`, `bwss:uri` (the first URI) and `bwss:folder`, each
+    left out when empty. The `bwss:` prefix keeps an app's ordinary query
+    (`service=…`, `username=…`) from matching them by accident.
+  - they are read-only: creating, changing or deleting them, and deleting
+    the collection, fail with `NotSupported`, before any access prompt.
+  - their "Always allow" rules are not written into the item (it is not
+    ours) but into `~/.local/state/bwss/vault-acl`, encrypted with the user
+    key, so another process cannot grant itself access by editing the
+    file. Those rules stay on the machine that made them.
+  - a sub-folder `<root>/Vault` would clash with the collection id; it is
+    skipped with a warning and its items show up in `vault`.
+  - the locked index covers them too, so it reveals how many items the
+    vault holds (still never labels, values or secrets).
+  - organization items are still not read.
 - **Duplicates**: duplicate folder names resolve to the lowest folder id,
   and duplicate `bwss:id`s keep the first item. Both rules make every device
   agree.
@@ -189,7 +207,8 @@ in the config):
   (`SetSecret`, `Label`, `Attributes`, `CreateItem` with `replace`), deletes
   (`Item.Delete`, and `Collection.Delete` for every item it contains).
 - **New items** get their creator in `bwss:acl`, so the creator is never
-  asked.
+  asked. Items of the `vault` collection have no creator: every app is
+  asked the first time.
 - **"Always allow"** appends the executable to the ACL and stores it in
   Bitwarden. The decision therefore follows the item to every device,
   matched by executable path.
@@ -381,7 +400,8 @@ including 600k-iteration PBKDF2 unlocks against Vaultwarden.
 - **Not implemented**: `ChangeLock` (the lock is the Bitwarden master
   password) and aliases other than `default`.
 - **Unsupported item formats**: organization items and COSE (type 7) items
-  are not read.
+  are not read, even with `whole_vault`; neither are cards, identities and
+  SSH keys.
 - **No Flatpak portal**: `org.freedesktop.impl.portal.Secret` is not
   implemented.
 - **ACL identity**: executable paths only. Interpreters and scripts are not

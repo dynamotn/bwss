@@ -232,6 +232,7 @@ impl CollectionObj {
     async fn delete(&self, #[zbus(header)] header: Header<'_>) -> Result<OwnedObjectPath, SecretError> {
         // Deleting a collection deletes its items: the caller needs the same
         // permission it would need to delete each one of them.
+        crate::daemon::ensure_writable(&self.id)?;
         let caller = caller_executable(self.daemon.conn(), &header).await;
         let ids = self.daemon.keyring.lock().await.items_in(&self.id);
         for id in ids {
@@ -254,6 +255,7 @@ impl CollectionObj {
         replace: bool,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretError> {
+        crate::daemon::ensure_writable(&self.id)?;
         let (plain, content_type) = self.daemon.decode_secret(&secret, sender(&header).as_deref())?;
         let caller = caller_executable(self.daemon.conn(), &header).await;
         let label = prop_string(&properties, PROP_ITEM_LABEL);

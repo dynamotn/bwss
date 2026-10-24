@@ -1,4 +1,6 @@
 //! Bitwarden backend: a root folder and its sub-folders hold the keyring.
+//! With `whole_vault`, every other item is shown read-only in the `vault`
+//! collection.
 //!
 //! * Online: API-key login, `/sync`, writes straight to the server.
 //! * Offline: the last sync response (still Bitwarden ciphertext) is cached,
@@ -12,6 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use super::{Backend, BackendError};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
@@ -19,7 +22,7 @@ use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key}
 use crate::bw::items::{self, MapError};
 use crate::config::{Config, Credentials, Paths};
 use crate::fsutil::write_private;
-use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, now, path_segment};
+use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, Snapshot, VAULT_COLLECTION, now, path_segment};
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
@@ -50,17 +53,21 @@ struct Unlocked {
     folders: BTreeMap<String, String>,
     /// Item id → cipher id.
     ciphers: HashMap<String, String>,
+    /// "Always allow" rules of `vault` items, kept locally: those items are not ours to edit.
+    vault_acl: BTreeMap<String, Vec<String>>,
 }
 
 pub struct BitwardenBackend {
     email: String,
     root: String,
+    whole_vault: bool,
     api: Mutex<Api>,
     key: ApiKey,
     state: Mutex<Option<Unlocked>>,
     cache_path: PathBuf,
     queue_path: PathBuf,
     queue: Mutex<Vec<QueuedOp>>,
+    vault_acl_path: PathBuf,
 }
 
 fn unavailable(e: impl std::fmt::Display) -> BackendError {
@@ -69,6 +76,10 @@ fn unavailable(e: impl std::fmt::Display) -> BackendError {
 
 fn map_api(e: ApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
+}
+
+fn read_only() -> BackendError {
+    BackendError::Rejected("items of the vault collection are read-only".into())
 }
 
 fn map_err(e: MapError) -> BackendError {
@@ -92,12 +103,14 @@ impl BitwardenBackend {
         Ok(BitwardenBackend {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
+            whole_vault: config.whole_vault,
             api: Mutex::new(Api::new(urls, device_id)?),
             key: ApiKey { client_id: creds.client_id, client_secret: creds.client_secret },
             state: Mutex::new(None),
             cache_path: paths.cache.join("sync.json"),
             queue_path,
             queue: Mutex::new(queue),
+            vault_acl_path: paths.state.join("vault-acl"),
         })
     }
 
@@ -127,13 +140,35 @@ impl BitwardenBackend {
         }
     }
 
+    /// The `vault` access rules, encrypted with the user key so that another
+    /// process cannot grant itself access by editing the file.
+    fn load_vault_acl(&self, key: &SymmetricKey) -> BTreeMap<String, Vec<String>> {
+        let Ok(text) = std::fs::read_to_string(&self.vault_acl_path) else { return BTreeMap::new() };
+        match key.decrypt_str(text.trim()).ok().and_then(|plain| serde_json::from_str(&plain).ok()) {
+            Some(acl) => acl,
+            None => {
+                tracing::warn!("ignoring {}: it does not belong to this vault", self.vault_acl_path.display());
+                BTreeMap::new()
+            }
+        }
+    }
+
+    fn save_vault_acl(&self, state: &Unlocked) {
+        let plain = Zeroizing::new(serde_json::to_string(&state.vault_acl).unwrap_or_default());
+        if let Err(e) = write_private(&self.vault_acl_path, state.user_key.encrypt_str(&plain).as_bytes()) {
+            tracing::warn!("could not save the access rules of vault items: {e}");
+        }
+    }
+
     /// Builds the keyring view of a sync response.
     fn snapshot(
         &self,
         sync: &Value,
         key: &SymmetricKey,
+        vault_acl: &BTreeMap<String, Vec<String>>,
     ) -> (Snapshot, BTreeMap<String, String>, HashMap<String, String>) {
         let mut folders: BTreeMap<String, String> = BTreeMap::new();
+        let mut names: HashMap<String, String> = HashMap::new();
         let mut collections = Vec::new();
         for f in sync.get("folders").and_then(Value::as_array).into_iter().flatten() {
             let (Some(id), Some(name)) = (f.get("id").and_then(Value::as_str), f.get("name").and_then(Value::as_str))
@@ -141,12 +176,20 @@ impl BitwardenBackend {
                 continue;
             };
             let Ok(name) = key.decrypt_str(name) else { continue };
+            names.insert(id.to_owned(), name.to_string());
             let collection = if *name == self.root {
                 LOGIN_COLLECTION.to_owned()
             } else if let Some(sub) =
                 name.strip_prefix(&format!("{}/", self.root)).filter(|s| !s.is_empty() && !s.contains('/'))
             {
                 let cid = path_segment(&sub.to_lowercase());
+                if self.whole_vault && cid == VAULT_COLLECTION {
+                    tracing::warn!(
+                        "folder \"{}\" clashes with the vault collection; its items show up there",
+                        name.as_str()
+                    );
+                    continue;
+                }
                 collections.push(CollectionData { id: cid.clone(), label: sub.to_owned(), created: 0, modified: 0 });
                 cid
             } else {
@@ -162,16 +205,35 @@ impl BitwardenBackend {
             }
             folders.insert(id.to_owned(), collection);
         }
+        if self.whole_vault {
+            collections.push(CollectionData {
+                id: VAULT_COLLECTION.to_owned(),
+                label: "Bitwarden vault".to_owned(),
+                created: 0,
+                modified: 0,
+            });
+        }
         let mut items = Vec::new();
         let mut ciphers = HashMap::new();
         for c in sync.get("ciphers").and_then(Value::as_array).into_iter().flatten() {
-            let Some(collection) = c.get("folderId").and_then(Value::as_str).and_then(|f| folders.get(f)) else {
-                continue;
+            let folder_id = c.get("folderId").and_then(Value::as_str);
+            let collection = match folder_id.and_then(|f| folders.get(f)) {
+                Some(collection) => collection.as_str(),
+                None if self.whole_vault => VAULT_COLLECTION,
+                None => continue,
             };
             if !c.get("deletedDate").is_none_or(Value::is_null) || !c.get("organizationId").is_none_or(Value::is_null) {
                 continue;
             }
-            match items::decode(c, key, collection) {
+            let decoded = items::decode(c, key, collection).and_then(|mut item| {
+                if collection == VAULT_COLLECTION {
+                    let folder = folder_id.and_then(|f| names.get(f)).map(String::as_str);
+                    item.attributes.extend(items::vault_attributes(c, key, folder)?);
+                    item.acl = vault_acl.get(&item.id).cloned().unwrap_or_default();
+                }
+                Ok(item)
+            });
+            match decoded {
                 Ok(item) => {
                     if let Some(cid) = c.get("id").and_then(Value::as_str) {
                         // Two items claiming one id: keep the first, the later one is ignored.
@@ -372,8 +434,9 @@ impl Backend for BitwardenBackend {
         if !from_cache {
             self.save_cache(kdf, &sync);
         }
-        let (snap, folders, ciphers) = self.snapshot(&sync, &user_key);
-        *self.state.lock().await = Some(Unlocked { user_key, kdf, sync, folders, ciphers });
+        let vault_acl = if self.whole_vault { self.load_vault_acl(&user_key) } else { BTreeMap::new() };
+        let (snap, folders, ciphers) = self.snapshot(&sync, &user_key, &vault_acl);
+        *self.state.lock().await = Some(Unlocked { user_key, kdf, sync, folders, ciphers, vault_acl });
         if !from_cache && let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
         }
@@ -398,7 +461,7 @@ impl Backend for BitwardenBackend {
         if !changed {
             return Ok(None);
         }
-        let (snap, folders, ciphers) = self.snapshot(&sync, &state.user_key);
+        let (snap, folders, ciphers) = self.snapshot(&sync, &state.user_key, &state.vault_acl);
         state.sync = sync;
         state.folders = folders;
         state.ciphers = ciphers;
@@ -412,11 +475,17 @@ impl Backend for BitwardenBackend {
             return Err(BackendError::Rejected("a collection needs a label".into()));
         }
         let id = path_segment(&label.to_lowercase());
+        if self.whole_vault && id == VAULT_COLLECTION {
+            return Err(BackendError::Rejected(format!("\"{label}\" is reserved for the vault collection")));
+        }
         self.ensure_folder(&id, &label).await?;
         Ok(CollectionData { id, label, created: now(), modified: now() })
     }
 
     async fn delete_collection(&self, id: &str) -> Result<(), BackendError> {
+        if id == VAULT_COLLECTION {
+            return Err(read_only());
+        }
         let (folder, item_ciphers) = {
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
@@ -444,6 +513,14 @@ impl Backend for BitwardenBackend {
     }
 
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        if item.collection == VAULT_COLLECTION {
+            // The daemon only lets the access rules of a vault item change.
+            let mut guard = self.state.lock().await;
+            let state = guard.as_mut().ok_or(BackendError::Locked)?;
+            state.vault_acl.insert(item.id.clone(), item.acl.clone());
+            self.save_vault_acl(state);
+            return Ok(());
+        }
         match self.put_once(item).await {
             Err(BackendError::Rejected(msg)) if msg.to_lowercase().contains("out of date") => {
                 // Another device changed the item: take its revision, re-apply ours.
@@ -455,6 +532,9 @@ impl Backend for BitwardenBackend {
     }
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        if item.collection == VAULT_COLLECTION {
+            return Err(read_only());
+        }
         let cipher_id = {
             let guard = self.state.lock().await;
             guard.as_ref().ok_or(BackendError::Locked)?.ciphers.get(&item.id).cloned()
@@ -474,6 +554,10 @@ impl Backend for BitwardenBackend {
     async fn describe(&self) -> String {
         let queued = self.queue.lock().await.len();
         let urls = self.api.lock().await.urls().clone();
-        format!("Bitwarden {} ({}), folder \"{}\", {queued} queued change(s)", self.email, urls.identity, self.root)
+        let scope = if self.whole_vault { " + whole vault (read-only)" } else { "" };
+        format!(
+            "Bitwarden {} ({}), folder \"{}\"{scope}, {queued} queued change(s)",
+            self.email, urls.identity, self.root
+        )
     }
 }
