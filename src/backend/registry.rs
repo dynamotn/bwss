@@ -11,7 +11,10 @@ pub const REGISTRY_ID: &str = "_collections";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
+    /// Absent in a bare `{ "deleted": true }` tombstone (design §4).
+    #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub created: u64,
     #[serde(default)]
     pub deleted: bool,
@@ -130,6 +133,13 @@ mod tests {
     fn extra_keys_are_ignored_and_deleted_defaults_false() {
         let r = Registry::try_parse(r#"{"a":{"label":"A","created":1,"extra":true}}"#).unwrap();
         assert_eq!(r.0["a"], entry("A", 1, false));
+    }
+
+    #[test]
+    fn a_bare_tombstone_parses() {
+        let r = Registry::try_parse(r#"{"a":{"deleted":true}}"#).unwrap();
+        assert_eq!(r.0["a"], entry("", 0, true));
+        assert_eq!(r.live().count(), 0);
     }
 
     #[test]
