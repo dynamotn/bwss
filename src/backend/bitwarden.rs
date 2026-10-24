@@ -9,6 +9,7 @@
 //! Writes go through the op runner (`runner.rs`): bwss changes only its own
 //! fields and the value source of an item (design §5).
 
+use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ use crate::bw::items::item_key;
 use crate::bw::scan::{Keys, MarkedItem, Scan, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
 use crate::config::{Config, Credentials, Paths};
-use crate::fsutil::write_private;
+use crate::fsutil::{write_json_private, write_private};
 use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
 
 const FORMAT: u64 = 2;
@@ -38,16 +39,27 @@ pub(super) const KIND_COLLECTIONS: &str = "collections";
 /// Cipher id of an item created by a queued op: it is not on the server yet.
 pub(super) const QUEUED: &str = "";
 
-/// `sync.json`: the last `/sync` response, still ciphertext.
-#[derive(Serialize, Deserialize)]
+/// `sync.json`: the last `/sync` response, still ciphertext. The `format`
+/// key is written (`CacheRef`) but not read back.
+#[derive(Deserialize)]
 struct Cache {
-    format: u64,
     kdf: KdfParams,
     email: String,
     /// Raw `/accounts/revision-date` answer at the time of the sync.
     #[serde(default)]
     revision: Option<String>,
     sync: Value,
+}
+
+/// What `save_cache` writes: `Cache` by reference, so a write never copies
+/// the vault.
+#[derive(Serialize)]
+struct CacheRef<'a> {
+    format: u64,
+    kdf: KdfParams,
+    email: &'a str,
+    revision: Option<&'a str>,
+    sync: &'a Value,
 }
 
 /// The keyring as read from one copy of the vault.
@@ -90,26 +102,51 @@ pub(super) fn ciphers(sync: &Value) -> &[Value] {
     sync.get("ciphers").and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
+/// Why a registry note could not be read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RegistryError {
+    /// The item key of the note does not decrypt.
+    Key,
+    /// The field names or the `bwss:kind` value do not decrypt.
+    Fields,
+    /// The notes do not decrypt.
+    Notes,
+    /// The notes are not a registry document.
+    Parse,
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Key => "its item key does not decrypt",
+            Self::Fields => "its fields do not decrypt",
+            Self::Notes => "its notes do not decrypt",
+            Self::Parse => "its notes are not a collection registry",
+        })
+    }
+}
+
 /// A marked item with the registry id: `Ok(Some)` for a registry note,
 /// `Ok(None)` for anything else, `Err` when its notes cannot be read.
-pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Registry>, ()> {
+pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Registry>, RegistryError> {
+    use RegistryError::{Fields, Key, Notes, Parse};
     if cipher.get("type").and_then(Value::as_u64) != Some(TYPE_SECURE_NOTE) {
         return Ok(None);
     }
-    let key = item_key(cipher, &keys.user).map_err(|_| ())?;
-    let names = field_names(cipher, &key).map_err(|_| ())?;
+    let key = item_key(cipher, &keys.user).map_err(|_| Key)?;
+    let names = field_names(cipher, &key).map_err(|_| Fields)?;
     let Some(i) = first_index(&names, F_KIND) else { return Ok(None) };
-    if field_value(cipher, i, &key).map_err(|_| ())?.trim() != KIND_COLLECTIONS {
+    if field_value(cipher, i, &key).map_err(|_| Fields)?.trim() != KIND_COLLECTIONS {
         return Ok(None);
     }
     let notes = match cipher.get("notes").and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => key.decrypt_str(s).map_err(|_| ())?,
+        Some(s) if !s.is_empty() => key.decrypt_str(s).map_err(|_| Notes)?,
         _ => return Ok(Some(Registry::default())),
     };
     if notes.trim().is_empty() {
         return Ok(Some(Registry::default()));
     }
-    Registry::try_parse(&notes).map(Some).map_err(|_| ())
+    Registry::try_parse(&notes).map(Some).map_err(|_| Parse)
 }
 
 /// Builds the keyring from a copy of the vault (design §8.2 step 4).
@@ -118,6 +155,11 @@ pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Regist
 /// decrypted again) and the items to hold: a marked item whose cipher can
 /// no longer be inspected stays as last read (§3.4).
 pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Built {
+    build_list(ciphers(sync), keys, previous)
+}
+
+/// `build` over a list of ciphers, owned or borrowed.
+fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built>) -> Built {
     let held: HashMap<&str, &MarkedItem> =
         previous.map(|p| p.marked.values().map(|m| (m.cipher_id.as_str(), m)).collect()).unwrap_or_default();
     let mut found = Vec::new();
@@ -127,7 +169,7 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
     let mut registry_ciphers = Vec::new();
     let mut registry_unreadable = false;
 
-    for cipher in ciphers(sync) {
+    for cipher in list.iter().map(Borrow::borrow) {
         let cid = cipher.get("id").and_then(Value::as_str).unwrap_or_default();
         let key = cache_key(cipher);
         if let (Some(p), Some(k)) = (previous, &key)
@@ -147,8 +189,8 @@ pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Buil
                     tracing::warn!(cipher = cid, "{REGISTRY_ID} is reserved for the collection registry; skipped");
                     skipped.push((cid.to_owned(), format!("{cid}: {REGISTRY_ID} is reserved")));
                 }
-                Err(()) => {
-                    tracing::warn!(cipher = cid, "the collection registry cannot be read");
+                Err(why) => {
+                    tracing::warn!(cipher = cid, "the collection registry cannot be read: {why}");
                     registry_unreadable = true;
                     registry_ciphers.push(cid.to_owned());
                 }
@@ -240,51 +282,73 @@ pub(super) fn registry_with_queue(registry: &Registry, queue: &[Op]) -> Registry
     shown
 }
 
-/// Index in `list` of the cipher that holds `id` on the server.
-pub(super) fn find_marked(
-    list: &[Value],
-    id: &str,
+/// The winning marked cipher of every `bwss:id` in `list`, as its index.
+/// A winner that is a queued create has no server cipher and is left out.
+fn marked_positions<C: Borrow<Value>>(
+    list: &[C],
     keys: &Keys,
     unmarked: &HashSet<(String, String)>,
-) -> Option<usize> {
+) -> HashMap<String, usize> {
     let mut found = Vec::new();
-    for c in list {
+    for c in list.iter().map(Borrow::borrow) {
         if cache_key(c).is_some_and(|k| unmarked.contains(&k)) {
             continue;
         }
-        if let Scan::Marked(m) = scan(c, keys)
-            && m.item.id == id
-        {
+        if let Scan::Marked(m) = scan(c, keys) {
             found.push(*m);
         }
     }
     let (winners, _) = resolve_duplicates(found);
-    let cid = winners.into_iter().next().map(|m| m.cipher_id).filter(|c| c != QUEUED)?;
-    list.iter().position(|c| c.get("id").and_then(Value::as_str) == Some(&cid))
+    let mut by_cipher: HashMap<&str, usize> = HashMap::new();
+    for (i, c) in list.iter().map(Borrow::borrow).enumerate() {
+        if let Some(cid) = c.get("id").and_then(Value::as_str) {
+            by_cipher.entry(cid).or_insert(i);
+        }
+    }
+    winners
+        .into_iter()
+        .filter(|m| m.cipher_id != QUEUED)
+        .filter_map(|m| by_cipher.get(m.cipher_id.as_str()).map(|&i| (m.item.id, i)))
+        .collect()
 }
 
-/// The cache with every queued op applied, so pending writes stay visible
-/// (design §8.2 step 3).
-pub(super) fn with_queue(
-    sync: &Value,
+/// Index in `list` of the cipher that holds `id` on the server.
+pub(super) fn find_marked<C: Borrow<Value>>(
+    list: &[C],
+    id: &str,
+    keys: &Keys,
+    unmarked: &HashSet<(String, String)>,
+) -> Option<usize> {
+    marked_positions(list, keys, unmarked).get(id).copied()
+}
+
+/// The ciphers with every queued op applied, so pending writes stay visible
+/// (design §8.2 step 3). Only the ciphers the ops touch are copied; the rest
+/// stay borrowed from `sync`.
+pub(super) fn with_queue<'a>(
+    sync: &'a Value,
     queue: &[Op],
     keys: &Keys,
     folder: Option<&str>,
     unmarked: &HashSet<(String, String)>,
-) -> Value {
-    let mut view = sync.clone();
-    let Some(list) = view.get_mut("ciphers").and_then(Value::as_array_mut) else { return view };
+) -> Vec<Cow<'a, Value>> {
+    let mut list: Vec<Cow<'a, Value>> = ciphers(sync).iter().map(Cow::Borrowed).collect();
+    // Positions stay valid across patches (they keep the id and the dates);
+    // a create or a delete changes who wins, so it is scanned again.
+    let mut positions: Option<HashMap<String, usize>> = None;
     for op in queue {
         match op {
             Op::Create { item, .. } => match new_note(item, folder, keys) {
                 Ok(mut body) => {
                     body.insert("id".into(), json!(QUEUED));
-                    list.push(Value::Object(body));
+                    list.push(Cow::Owned(Value::Object(body)));
+                    positions = None;
                 }
                 Err(e) => tracing::warn!("a queued new item cannot be shown: {e}"),
             },
             Op::Patch(patch) => {
-                let Some(i) = find_marked(list, &patch.id, keys, unmarked) else { continue };
+                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, unmarked));
+                let Some(&i) = map.get(&patch.id) else { continue };
                 match apply(&list[i], patch, keys) {
                     Ok(mut body) => {
                         body.remove("lastKnownRevisionDate");
@@ -293,7 +357,7 @@ pub(super) fn with_queue(
                                 body.insert(k.into(), v.clone());
                             }
                         }
-                        list[i] = Value::Object(body);
+                        list[i] = Cow::Owned(Value::Object(body));
                     }
                     Err(e) => {
                         if first_report(("unshown", &patch.id, &patch.base_revision)) {
@@ -303,8 +367,10 @@ pub(super) fn with_queue(
                 }
             }
             Op::Delete { id, .. } => {
-                if let Some(i) = find_marked(list, id, keys, unmarked) {
+                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, unmarked));
+                if let Some(&i) = map.get(id) {
                     list.remove(i);
+                    positions = None;
                 }
             }
             // Shown through `build_view`: the registry note is merged, never
@@ -312,7 +378,7 @@ pub(super) fn with_queue(
             Op::Registry { .. } => {}
         }
     }
-    view
+    list
 }
 
 /// Builds the keyring from the cache with the queue applied.
@@ -322,7 +388,7 @@ fn build_view(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>, pre
     } else {
         let none = HashSet::new();
         let unmarked = previous.map_or(&none, |p| &p.unmarked);
-        build(&with_queue(sync, queue, keys, folder, unmarked), keys, previous)
+        build_list(&with_queue(sync, queue, keys, folder, unmarked), keys, previous)
     };
     if queue.iter().any(|op| matches!(op, Op::Registry { .. })) {
         // `built.registry` stays the server's: only what is shown changes.
@@ -472,20 +538,20 @@ impl BitwardenBackend {
     }
 
     fn save_cache(&self, state: &Unlocked) {
-        let cache = Cache {
+        let cache = CacheRef {
             format: FORMAT,
             kdf: state.kdf,
-            email: self.email.clone(),
-            revision: state.revision.clone(),
-            sync: state.sync.clone(),
+            email: &self.email,
+            revision: state.revision.as_deref(),
+            sync: &state.sync,
         };
-        if let Err(e) = write_private(&self.cache_path, &serde_json::to_vec(&cache).unwrap_or_default()) {
+        if let Err(e) = write_json_private(&self.cache_path, &cache) {
             tracing::warn!("could not write the offline cache: {e}");
         }
     }
 
     pub(super) fn save_queue(&self, queue: &[Op], key: &SymmetricKey) -> std::io::Result<()> {
-        let saved = write_private(&self.queue_path, &serde_json::to_vec(&seal(queue, key)).unwrap_or_default());
+        let saved = write_json_private(&self.queue_path, &seal(queue, key));
         if let Err(e) = &saved {
             tracing::warn!("could not write the offline queue: {e}");
         }
@@ -808,6 +874,47 @@ mod tests {
         assert!(b.registry_unreadable);
         assert_eq!(b.registry_ciphers, ["r1", "r2"]);
         assert_eq!(collection_ids(&b), ["home", "login"]);
+    }
+
+    #[test]
+    fn read_registry_reports_why() {
+        let k = keys();
+        let other = SymmetricKey::generate();
+        let kind = [("bwss:id", REGISTRY_ID), ("bwss:kind", "collections")];
+
+        let good = registry_note(&k, "r", r#"{"home":{"label":"Home","created":1}}"#);
+        assert_eq!(read_registry(&good, &k).unwrap().unwrap().0.len(), 1);
+        assert_eq!(read_registry(&login(&k, "c", &[("bwss:id", "x")]), &k), Ok(None));
+
+        assert_eq!(read_registry(&registry_note(&k, "r", "not json"), &k), Err(RegistryError::Parse));
+
+        let mut notes = registry_note(&k, "r", "{}");
+        notes["notes"] = json!(other.encrypt_str("{}"));
+        assert_eq!(read_registry(&notes, &k), Err(RegistryError::Notes));
+
+        let mut fields = note(&k, "r", &kind, "{}");
+        fields["fields"] = self::fields(&Keys { mark: other.derive("value-mark"), user: other }, &kind);
+        assert_eq!(read_registry(&fields, &k), Err(RegistryError::Fields));
+
+        let mut item_key = note(&k, "r", &kind, "{}");
+        item_key["key"] = json!(SymmetricKey::generate().encrypt_str("garbage"));
+        assert_eq!(read_registry(&item_key, &k), Err(RegistryError::Key));
+    }
+
+    #[test]
+    fn a_queued_view_copies_only_the_ciphers_the_ops_touch() {
+        let k = keys();
+        let s = sync(vec![
+            login(&k, "c1", &[("bwss:id", "a")]),
+            login(&k, "c2", &[("bwss:id", "b")]),
+            login(&k, "c3", &[("bwss:id", "c")]),
+        ]);
+        let queue = [Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) }];
+        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(ids, ["c1", "c3"]);
+        assert!(view.iter().all(|c| matches!(c, Cow::Borrowed(_))), "nothing was copied");
+        assert_eq!(ciphers(&s).len(), 3, "the cache is untouched");
     }
 
     #[test]

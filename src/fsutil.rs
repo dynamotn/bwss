@@ -23,6 +23,13 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Serializes `value` first and writes only a complete document: when it
+/// cannot be serialized the file on disk is left as it was.
+pub fn write_json_private(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    write_private(path, &bytes)
+}
+
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -31,4 +38,28 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("cannot serialize"))
+        }
+    }
+
+    #[test]
+    fn save_failure_never_writes_an_empty_file() {
+        let dir = std::env::temp_dir().join(format!("bwss-fsutil-{}", std::process::id()));
+        let path = dir.join("state.json");
+        write_json_private(&path, &serde_json::json!({ "kept": true })).unwrap();
+        let err = write_json_private(&path, &Unserializable).unwrap_err();
+        assert!(err.to_string().contains("cannot serialize"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"kept":true}"#);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

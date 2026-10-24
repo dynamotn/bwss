@@ -58,6 +58,8 @@ pub struct Keyring {
     collections: BTreeMap<String, CollectionData>,
     items: BTreeMap<String, ItemData>,
     index: LockedIndexFile,
+    /// `index.salt`, decoded once when the index is loaded.
+    salt: [u8; 32],
     index_path: Option<PathBuf>,
 }
 
@@ -77,16 +79,18 @@ fn builtin_collections() -> BTreeMap<String, CollectionData> {
 
 impl Keyring {
     pub fn new(index_path: Option<PathBuf>) -> Self {
-        let index = index_path
+        let decode = |i: &LockedIndexFile| <[u8; 32]>::try_from(B64.decode(&i.salt).ok()?).ok();
+        let stored = index_path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<LockedIndexFile>(&b).ok())
-            .filter(|i| i.format == INDEX_FORMAT && B64.decode(&i.salt).is_ok_and(|s| s.len() == 32))
-            .unwrap_or_else(|| {
-                let mut salt = [0u8; 32];
-                rand::fill(&mut salt);
-                LockedIndexFile { format: INDEX_FORMAT, salt: B64.encode(salt), ..Default::default() }
-            });
+            .filter(|i| i.format == INDEX_FORMAT)
+            .and_then(|i| decode(&i).map(|salt| (i, salt)));
+        let (index, salt) = stored.unwrap_or_else(|| {
+            let mut salt = [0u8; 32];
+            rand::fill(&mut salt);
+            (LockedIndexFile { format: INDEX_FORMAT, salt: B64.encode(salt), ..Default::default() }, salt)
+        });
         let mut collections = builtin_collections();
         for c in &index.collections {
             collections.entry(c.id.clone()).or_insert(CollectionData {
@@ -96,7 +100,7 @@ impl Keyring {
                 modified: 0,
             });
         }
-        Keyring { unlocked: false, collections, items: BTreeMap::new(), index, index_path }
+        Keyring { unlocked: false, collections, items: BTreeMap::new(), index, salt, index_path }
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -144,7 +148,7 @@ impl Keyring {
 
     fn hash_attr(&self, name: &str, value: &str) -> String {
         let mut h = Sha256::new();
-        h.update(B64.decode(&self.index.salt).unwrap_or_default());
+        h.update(self.salt);
         h.update(name.as_bytes());
         h.update([0]);
         h.update(value.as_bytes());
@@ -288,7 +292,7 @@ impl Keyring {
         self.index.items = items;
         self.index.collections = collections;
         if let Some(path) = &self.index_path
-            && let Err(e) = crate::fsutil::write_private(path, &serde_json::to_vec(&self.index).unwrap_or_default())
+            && let Err(e) = crate::fsutil::write_json_private(path, &self.index)
         {
             tracing::warn!("could not save the locked index: {e}");
         }

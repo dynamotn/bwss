@@ -172,14 +172,41 @@ fn target(op: &Op) -> Option<&str> {
 /// into it: two queued patches of one value could not both pass the value
 /// check, since the first changes what the second was read from. `server`
 /// is the base of the cached server copy of the patched item.
-pub(super) fn push_op(queue: &mut Vec<Op>, op: Op, server: Option<Base>) {
+pub(super) fn push_op(queue: &mut Vec<Op>, op: Op, server: Option<Base>) -> Undo {
     let Op::Patch(later) = op else {
         queue.push(op);
-        return;
+        return Undo::Pushed;
     };
-    match queue.iter_mut().rev().find(|o| target(o) == Some(later.id.as_str())) {
-        Some(Op::Patch(first)) => *first = merge_patches(first, later, server),
-        _ => queue.push(Op::Patch(later)),
+    match queue.iter().rposition(|o| target(o) == Some(later.id.as_str())) {
+        Some(i) if matches!(queue[i], Op::Patch(_)) => {
+            let Op::Patch(first) = &mut queue[i] else { unreachable!("matched a patch") };
+            let before = Op::Patch(first.clone());
+            *first = merge_patches(first, later, server);
+            Undo::Merged(i, Box::new(before))
+        }
+        _ => {
+            queue.push(Op::Patch(later));
+            Undo::Pushed
+        }
+    }
+}
+
+/// How to take back a `push_op`, without copying the whole queue.
+pub(super) enum Undo {
+    /// The op went to the end of the queue.
+    Pushed,
+    /// The op merged into the one at this index, which held this before.
+    Merged(usize, Box<Op>),
+}
+
+impl Undo {
+    pub(super) fn apply(self, queue: &mut Vec<Op>) {
+        match self {
+            Self::Pushed => {
+                queue.pop();
+            }
+            Self::Merged(i, before) => queue[i] = *before,
+        }
     }
 }
 
@@ -533,7 +560,7 @@ impl BitwardenBackend {
                                 (m.mark, m.revision_date, m.source, r)
                             }
                             (Scan::Uninspectable(why), _) => return Err(Failure::Wait(why)),
-                            (Scan::Marked(m), Err(())) if m.item.id == REGISTRY_ID => {
+                            (Scan::Marked(m), Err(_)) if m.item.id == REGISTRY_ID => {
                                 return Err(Failure::Wait(REGISTRY_UNREADABLE.into()));
                             }
                             // No longer a registry note: start a new one.
@@ -681,11 +708,10 @@ impl BitwardenBackend {
             Op::Patch(p) => server_base(state, &p.id),
             _ => None,
         };
-        let before = queue.clone();
-        push_op(queue, op, server);
+        let undo = push_op(queue, op, server);
         // Not on disk, not durable: the app is told, and nothing is kept.
         if let Err(e) = self.save_queue(queue, &state.keys.user) {
-            *queue = before;
+            undo.apply(queue);
             return Err(BackendError::Unavailable(format!("the change cannot be queued on disk: {e}")));
         }
         Self::rebuild(state, queue);
@@ -883,10 +909,9 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
     match op {
         Op::Create { item, .. } => new_note(item, None, &state.keys).map(|_| ()).or_else(refused),
         Op::Patch(p) => {
-            let view =
+            let list =
                 with_queue(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), &state.built.unmarked);
-            let list = ciphers(&view);
-            let Some(i) = find_marked(list, &p.id, &state.keys, &state.built.unmarked) else { return Ok(()) };
+            let Some(i) = find_marked(&list, &p.id, &state.keys, &state.built.unmarked) else { return Ok(()) };
             // Only the sizes are checked here: compare the value against the
             // copy it is applied to.
             let mut trial = p.clone();
@@ -1077,6 +1102,24 @@ mod tests {
         let mut queue = vec![Op::Delete { id: "a".into(), base_revision: "r".into(), cipher_id: None }];
         push_op(&mut queue, Op::Patch(patch(plan_put(Some(&old()), &old().item))), None);
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn undoing_a_push_restores_the_queue_without_a_copy() {
+        let mut queue = vec![Op::Patch(value_patch(set(ValueSource::LoginPassword, b"1", 1)))];
+
+        // A merge puts the earlier op back as it was.
+        let undo = push_op(&mut queue, Op::Patch(value_patch(set(ValueSource::LoginPassword, b"2", 1))), None);
+        assert_eq!(value(&patch(queue[0].clone()).value).1, b"2");
+        undo.apply(&mut queue);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(value(&patch(queue[0].clone()).value).1, b"1");
+
+        // A push is popped.
+        let undo = push_op(&mut queue, Op::Delete { id: "z".into(), base_revision: "r".into(), cipher_id: None }, None);
+        assert_eq!(queue.len(), 2);
+        undo.apply(&mut queue);
+        assert_eq!(queue.len(), 1);
     }
 
     fn set(source: ValueSource, secret: &[u8], mark: u8) -> ValueChange {
