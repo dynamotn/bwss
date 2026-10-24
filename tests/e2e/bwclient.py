@@ -145,7 +145,10 @@ class Account:
         return http("POST", f"{self.server}/api/folders", {"name": encrypt(name.encode(), self.user_key)}, self._auth())["id"]
 
     def _cipher(self, cipher_id):
-        return next(x for x in self.sync()["ciphers"] if x["id"] == cipher_id)
+        for x in self.sync()["ciphers"]:
+            if x["id"] == cipher_id:
+                return x
+        raise KeyError(f"no cipher with id {cipher_id}")
 
     def _dec(self, c):
         key = decrypt(c["key"], self.user_key) if c.get("key") else self.user_key
@@ -166,6 +169,8 @@ class Account:
             "history": [d(h["password"]) for h in (c.get("passwordHistory") or [])],
             "deleted": bool(c.get("deletedDate")),
             "folder": c.get("folderId"),
+            "type": c["type"],
+            "field_types": {d(f["name"]): f["type"] for f in (c.get("fields") or [])},
         }
 
     def items(self, folder):
@@ -188,7 +193,10 @@ class Account:
 
     def _enc_fields(self, c, fields):
         k = self.user_key if not c.get("key") else decrypt(c["key"], self.user_key)
-        return [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in fields]
+        # Keep each field's original type (hidden stays hidden); new fields are text.
+        d = self._dec(c)
+        types = {d(f["name"]): f["type"] for f in (c.get("fields") or [])}
+        return [{"type": types.get(n, 0), "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in fields]
 
     def _put(self, cipher_id, change):
         c = self._cipher(cipher_id)

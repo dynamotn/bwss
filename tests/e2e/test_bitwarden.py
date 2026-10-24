@@ -4,6 +4,7 @@ Needs BW_E2E_URL (e.g. http://127.0.0.1:80 when the test container shares
 the Vaultwarden container's network namespace).
 """
 
+import base64
 import json
 import os
 import time
@@ -43,6 +44,7 @@ def test_secret_tool_writes_land_in_bitwarden(account):
         d.tool("store", "--label=GitHub token", "service", "github", "user", "me", input="ghp_e2e")
         it = account.items(FOLDER)["GitHub token"]
         # A secure note: no login, the secret in the hidden bwss:password field.
+        assert it["type"] == 2
         assert it["password"] is None
         assert not it["notes"]
         assert it["fields"]["bwss:password"] == "ghp_e2e"
@@ -191,6 +193,33 @@ def test_bwss_password_field_keeps_login_password(account):
         assert it["fields"]["bwss:password"] == "app-token-2"
         assert it["password"] == "web-login"
         assert it["history"] == []
+    finally:
+        d.stop()
+
+
+def test_binary_secret_on_marked_login_goes_to_new_field(account):
+    d = bitwarden_daemon(account).start()
+    try:
+        unlock(d, account)
+        c = account.add_login(FOLDER, "Binary host", "web-pw", {"bwss:id": "bin1", "bwss:attr:bin": "1"})
+        before = account.item(c["id"])
+        d.cli("sync")
+        raw = b"\xff\x00\x01"
+        bus = secretstorage.dbus_init()
+        try:
+            coll = secretstorage.get_default_collection(bus)
+            coll.create_item("Binary host", {"bin": "1"}, raw, replace=True, content_type="application/octet-stream")
+            found = list(coll.search_items({"bin": "1"}))
+            assert len(found) == 1
+            assert found[0].get_secret() == raw
+        finally:
+            bus.close()
+        it = account.item(c["id"])
+        assert it["fields"]["bwss:password"] == base64.b64encode(raw).decode()
+        assert it["field_types"]["bwss:password"] == 1
+        assert it["fields"]["bwss:encoding"] == "base64"
+        assert it["password"] == "web-pw"
+        assert it["history"] == before["history"]
     finally:
         d.stop()
 
