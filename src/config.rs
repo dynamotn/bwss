@@ -33,9 +33,6 @@ pub const PROFILE_KEYS: &[&str] =
 /// The keys of `[bwss]` (ADR 0008).
 pub const BWSS_KEYS: &[&str] = &["profile", "folder", "backend", "memory_password"];
 
-/// Where a `pinentry` may live (ADR 0008).
-pub const SYSTEM_BIN_DIRS: &[&str] = &["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/run/current-system/sw/bin"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
@@ -197,26 +194,13 @@ impl Paths {
     }
 }
 
-const ACL_MOVED: &str = "turn the ACL off on this device with `bwss acl off` instead (ADR 0008)";
-
-/// Refuses an `acl` key at any depth: a synced file must not turn the ACL off.
-fn refuse_acl(table: &Table, at: &str) -> anyhow::Result<()> {
-    for (key, value) in table {
-        let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
-        if key == "acl" {
-            bail!("`acl` ({here}) is not read from the config file any more: {ACL_MOVED}");
-        }
-        match value {
-            Value::Table(t) => refuse_acl(t, &here)?,
-            Value::Array(items) => {
-                for t in items.iter().filter_map(Value::as_table) {
-                    refuse_acl(t, &here)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+/// `acl` where bwss reads keys: the top level, its profile or `[bwss]`.
+/// Other tools' tables are theirs and never read.
+fn acl_moved(at: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`acl` in {at} is not read from the config file any more: turn the ACL off on this device \
+         with `bwss acl off` instead (ADR 0008)"
+    )
 }
 
 fn string<'a>(table: &'a Table, key: &str, at: &str) -> anyhow::Result<Option<&'a str>> {
@@ -270,6 +254,7 @@ fn check_top_level(doc: &Table) -> anyhow::Result<()> {
             // Other tools' tables (and arrays of tables) are theirs.
             (_, Value::Table(_)) => {}
             (_, Value::Array(a)) if !a.is_empty() && a.iter().all(Value::is_table) => {}
+            ("acl", _) => return Err(acl_moved(AT)),
             (k, _) if TOP_LEVEL_KEYS.contains(&k) => {}
             (k, _) if PROFILE_KEYS.contains(&k) => bail!("`{k}` belongs in a profile, not at {AT}"),
             (k, _) => bail!("unknown key `{k}` at {AT}"),
@@ -282,6 +267,9 @@ fn check_profile(profile: &Table, at: &str) -> anyhow::Result<()> {
     for key in profile.keys() {
         if PROFILE_KEYS.contains(&key.as_str()) {
             continue;
+        }
+        if key == "acl" {
+            return Err(acl_moved(at));
         }
         if TOP_LEVEL_KEYS.contains(&key.as_str()) {
             bail!("`{key}` in {at} is shared by every profile: set it at the top level");
@@ -300,12 +288,14 @@ fn check_profile_name(name: &str) -> anyhow::Result<()> {
 
 /// Resolves bwss's settings from a parsed dybw file.
 pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
-    refuse_acl(doc, "")?;
     check_top_level(doc)?;
     // A `bwss` that is not a table was refused as an unknown key.
     let empty = Table::new();
     let bwss = doc.get("bwss").and_then(Value::as_table).unwrap_or(&empty);
     if let Some(key) = bwss.keys().find(|k| !BWSS_KEYS.contains(&k.as_str())) {
+        if key == "acl" {
+            return Err(acl_moved("[bwss]"));
+        }
         bail!("unknown key `{key}` in [bwss]");
     }
     let backend = match string(bwss, "backend", "[bwss]")? {
@@ -347,8 +337,9 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
         setting(key).and_then(Value::as_integer).and_then(|n| u64::try_from(n).ok()).unwrap_or(default)
     };
     let text = |key: &str, default: &'static str| setting(key).and_then(Value::as_str).unwrap_or(default).to_owned();
-    if backend == BackendKind::Bitwarden && text("auth", DEFAULT_AUTH) != DEFAULT_AUTH {
-        bail!("bwss logs in with an API key only: set `auth = \"api-key\"` for the profile it serves");
+    let auth = text("auth", DEFAULT_AUTH);
+    if backend == BackendKind::Bitwarden && auth != DEFAULT_AUTH {
+        bail!("bwss does not support `auth = {auth:?}`; it logs in with an API key only (`auth = \"api-key\"`)");
     }
     Ok(Settings {
         backend,
@@ -361,48 +352,94 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
     })
 }
 
+/// Why a pinentry was accepted (ADR 0008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinentryRule {
+    /// Neither the program nor any directory above it is writable by the user.
+    NotWritable,
+    /// It lies under bwss's own installation prefix (Homebrew).
+    SamePrefix(PathBuf),
+}
+
+impl std::fmt::Display for PinentryRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinentryRule::NotWritable => f.write_str("not writable by this user"),
+            PinentryRule::SamePrefix(p) => write!(f, "under bwss's own installation prefix {}", p.display()),
+        }
+    }
+}
+
 /// Which programs may ask for the master password.
+#[derive(Debug, Clone)]
 pub struct Trust {
-    pub dirs: Vec<PathBuf>,
     /// `PATH`, to resolve a bare program name.
     pub search: Option<OsString>,
     pub user: User,
+    /// bwss's installation prefix: the grandparent of its resolved
+    /// executable (`/opt/homebrew` for `/opt/homebrew/bin/bwss`); never `/`.
+    pub prefix: Option<PathBuf>,
 }
 
 impl Trust {
     pub fn system() -> anyhow::Result<Self> {
+        let exe = std::env::current_exe().and_then(std::fs::canonicalize).context("cannot find this executable")?;
+        let prefix = exe.parent().and_then(Path::parent).filter(|p| p.parent().is_some()).map(Path::to_owned);
         Ok(Trust {
-            dirs: SYSTEM_BIN_DIRS.iter().map(PathBuf::from).collect(),
             search: std::env::var_os("PATH"),
             user: User::current().context("cannot tell which user this is")?,
+            prefix,
         })
     }
 
-    /// The absolute path of `pinentry`, if it is a trusted program.
-    pub fn check(&self, pinentry: &str) -> anyhow::Result<PathBuf> {
+    /// The resolved path of `pinentry`, if it is a trusted program, and why.
+    pub fn check(&self, pinentry: &str) -> anyhow::Result<(PathBuf, PinentryRule)> {
         let path = self.locate(pinentry)?;
-        let dir = path.parent().unwrap_or(Path::new("/"));
-        if !self.dirs.iter().any(|d| d == dir) {
-            bail!(
-                "pinentry {} is not in {}: only a system directory may hold the program that asks for the master password",
-                path.display(),
-                self.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
-            );
+        let resolved = std::fs::canonicalize(&path).with_context(|| format!("pinentry {}", path.display()))?;
+        let rule = self.verify(&resolved)?;
+        Ok((resolved, rule))
+    }
+
+    /// The rule again for a path `check` resolved: run before every spawn.
+    pub fn verify(&self, resolved: &Path) -> anyhow::Result<PinentryRule> {
+        let shown = resolved.display();
+        let now = std::fs::canonicalize(resolved).with_context(|| format!("pinentry {shown}"))?;
+        ensure!(now == resolved, "pinentry {shown} now resolves to {}", now.display());
+        let meta = std::fs::metadata(resolved).with_context(|| format!("pinentry {shown}"))?;
+        ensure!(meta.is_file(), "pinentry {shown} is not a program");
+        let Some(writable) = self.writable_part(resolved) else {
+            return Ok(PinentryRule::NotWritable);
+        };
+        match &self.prefix {
+            Some(prefix) if resolved.starts_with(prefix) => Ok(PinentryRule::SamePrefix(prefix.clone())),
+            _ => bail!(
+                "pinentry {shown}: {} is writable by this user, so the program cannot be trusted",
+                writable.display()
+            ),
         }
-        let file = std::fs::metadata(&path).with_context(|| format!("pinentry {}", path.display()))?;
-        if !file.is_file() {
-            bail!("pinentry {} is not a program", path.display());
+    }
+
+    /// The program itself, or the first directory above it, that this user
+    /// could change. A sticky directory (`/tmp`) counts only when the user
+    /// owns the entry below it, which is all the sticky bit lets them replace.
+    fn writable_part(&self, file: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let changeable = |p: &Path| std::fs::metadata(p).map_or(true, |m| self.user.may_write_file(&m));
+        if changeable(file) {
+            return Some(file.to_owned());
         }
-        for (what, meta) in [(path.as_path(), file), (dir, std::fs::metadata(dir)?)] {
-            if self.user.may_write_file(&meta) {
-                bail!(
-                    "pinentry {}: {} is writable by this user, so it cannot be trusted",
-                    path.display(),
-                    what.display()
-                );
+        let mut below = file;
+        for dir in file.ancestors().skip(1) {
+            let meta = std::fs::metadata(dir);
+            let open = meta.as_ref().map_or(true, |m| self.user.may_write_file(m));
+            let sticky = meta.as_ref().is_ok_and(|m| m.mode() & 0o1000 != 0);
+            let entry_ours = std::fs::symlink_metadata(below).map_or(true, |m| m.uid() == self.user.uid);
+            if open && !(sticky && self.user.uid != 0 && !entry_ours) {
+                return Some(dir.to_owned());
             }
+            below = dir;
         }
-        Ok(path)
+        None
     }
 
     /// `pinentry` as an absolute path: as given, or the first match on `PATH`.
@@ -424,6 +461,15 @@ impl Trust {
             .find(|p| p.is_file())
             .with_context(|| format!("pinentry {pinentry:?} not found in PATH"))
     }
+}
+
+/// bwss holds one user's vault and never runs as root (ADR 0008).
+pub fn refuse_root(user: &User) -> anyhow::Result<()> {
+    ensure!(
+        user.uid != 0,
+        "bwss does not run as root: it serves one user's vault, and root can replace any program it would trust"
+    );
+    Ok(())
 }
 
 /// Reads the dybw file; `None` when there is none.
@@ -453,7 +499,8 @@ pub fn load_settings(paths: &Paths) -> anyhow::Result<Settings> {
 /// Everything the daemon needs, checked.
 pub fn load(paths: &Paths, trust: &Trust) -> anyhow::Result<Config> {
     let s = load_settings(paths)?;
-    let pinentry = trust.check(&s.pinentry).with_context(|| paths.config.display().to_string())?;
+    let (pinentry, rule) = trust.check(&s.pinentry).with_context(|| paths.config.display().to_string())?;
+    tracing::info!("pinentry {} accepted: {rule}", pinentry.display());
     let (profile, server_url, email) = match s.account {
         Some(a) => (Some(a.profile), a.server_url, a.email),
         None => (None, String::new(), String::new()),
@@ -516,7 +563,7 @@ pub fn load_credentials(path: &Path, user: &User, origin: &str) -> anyhow::Resul
     }
     let mut text = Zeroizing::new(String::new());
     file.read_to_string(&mut text).with_context(|| shown.to_string())?;
-    let creds: Credentials = toml::from_str(&text).with_context(|| shown.to_string())?;
+    let creds: Credentials = parse_secret_toml(&text, path)?;
     if creds.identity_origin != origin {
         bail!(
             "the API key in {shown} was saved for {}, and the profile's server is now {origin}; \
@@ -525,6 +572,31 @@ pub fn load_credentials(path: &Path, user: &User, origin: &str) -> anyhow::Resul
         );
     }
     Ok(creds)
+}
+
+/// Parses a file that holds a secret. A TOML error quotes the source line,
+/// so it is never passed on: only the path, the position, and the name of a
+/// missing key (one of ours). An unknown key is not named: it could be a
+/// pasted secret.
+pub fn parse_secret_toml<T: serde::de::DeserializeOwned>(text: &str, path: &Path) -> anyhow::Result<T> {
+    let e = match toml::from_str::<T>(text) {
+        Ok(value) => return Ok(value),
+        Err(e) => e,
+    };
+    let message = e.message();
+    let missing = message.strip_prefix("missing field `").and_then(|rest| rest.split('`').next());
+    let what = match missing {
+        Some(key) => format!("missing key `{key}`"),
+        None if message.starts_with("unknown field") => "an unknown key".to_owned(),
+        None => "not valid TOML for this file".to_owned(),
+    };
+    let at = e.span().map(|span| {
+        let before = text.get(..span.start).unwrap_or_default();
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        format!(" (line {line}, column {column})")
+    });
+    bail!("{}: {what}{}", path.display(), at.unwrap_or_default())
 }
 
 pub fn save_credentials(path: &Path, creds: &Credentials) -> anyhow::Result<()> {
@@ -752,26 +824,43 @@ mod tests {
     fn bwss_logs_in_with_an_api_key_only() {
         let base = format!("default = \"personal\"\n{ACCOUNT}");
         let e = err(&format!("auth = \"password\"\n{base}"));
-        assert!(e.contains("api-key"), "{e}");
+        assert!(e.contains("auth = \"password\"") && e.contains("api-key"), "the method is named: {e}");
         // Another profile's password login is not bwss's business.
         let ok = format!("{base}[profiles.cli]\nserver_url = \"https://x.org\"\nemail = \"e\"\nauth = \"password\"\n");
         assert!(resolve(&doc(&ok)).is_ok());
     }
 
     #[test]
-    fn an_acl_key_anywhere_is_an_error() {
+    fn an_acl_key_where_bwss_reads_is_an_error() {
         let base = format!("default = \"personal\"\n{ACCOUNT}");
-        for text in [
-            format!("acl = \"off\"\n{base}"),
-            format!("{base}acl = \"off\"\n"),
-            format!("{base}[bwss]\nacl = \"off\"\n"),
-            format!("{base}[obsidian]\nacl = \"prompt\"\n"),
-            format!("{base}[profiles.other]\nacl = \"off\"\n"),
-            format!("{base}[[tools]]\nacl = \"off\"\n"),
+        for (text, at) in [
+            (format!("acl = \"off\"\n{base}"), "the top level"),
+            (format!("{base}acl = \"off\"\n"), "[profiles.personal]"),
+            (format!("{base}[bwss]\nacl = \"off\"\n"), "[bwss]"),
         ] {
             let e = err(&text);
-            assert!(e.contains("`acl`") && e.contains("bwss acl off"), "{text}: {e}");
+            assert!(e.contains("`acl`") && e.contains(at) && e.contains("bwss acl off"), "{text}: {e}");
         }
+    }
+
+    #[test]
+    fn an_acl_key_in_another_tools_table_is_not_bwss_business() {
+        let base = format!("default = \"personal\"\n{ACCOUNT}");
+        for text in [
+            format!("{base}[obsidian]\nacl = \"off\"\n"),
+            format!("{base}[profiles.other]\nacl = \"off\"\n"),
+            format!("{base}[[tools]]\nacl = \"off\"\n"),
+            format!("{base}[some_tool.nested]\nacl = \"off\"\n"),
+        ] {
+            assert!(resolve(&doc(&text)).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn root_is_refused() {
+        let e = format!("{:#}", refuse_root(&User { uid: 0, groups: None }).unwrap_err());
+        assert!(e.contains("root"), "{e}");
+        assert!(refuse_root(&User { uid: 1000, groups: Some(vec![]) }).is_ok());
     }
 
     // ---- paths and device state --------------------------------------------
@@ -855,100 +944,156 @@ mod tests {
 
         use super::*;
 
-        /// A trusted directory owned by "someone else" (a uid that is not ours).
+        /// A tree owned by "someone else": `me` is a uid that is not ours, so
+        /// nothing in it is writable unless a write bit says so.
         struct Fixture {
             _dir: tempfile::TempDir,
+            root: PathBuf,
             bin: PathBuf,
             other: PathBuf,
             me: User,
         }
 
+        fn chmod(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
         fn fixture() -> Fixture {
             let dir = tempfile::tempdir().unwrap();
-            let bin = dir.path().join("bin");
-            let other = dir.path().join("other");
+            let root = dir.path().canonicalize().unwrap().join("prefix");
+            let bin = root.join("bin");
+            let other = root.join("other");
             for d in [&bin, &other] {
-                std::fs::create_dir(d).unwrap();
+                std::fs::create_dir_all(d).unwrap();
                 for name in ["pinentry", "pinentry-qt"] {
                     let f = d.join(name);
                     std::fs::write(&f, "#!/bin/sh\n").unwrap();
-                    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    chmod(&f, 0o755);
                 }
-                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+                chmod(d, 0o755);
             }
+            chmod(&root, 0o755);
             let owner = std::fs::metadata(&bin).unwrap().uid();
-            // Seen as another, unprivileged user, the files are not writable.
             let me = User { uid: owner.wrapping_add(1).max(1), groups: Some(vec![]) };
-            Fixture { _dir: dir, bin, other, me }
+            Fixture { _dir: dir, root, bin, other, me }
         }
 
         fn trust(f: &Fixture, user: User) -> Trust {
-            Trust { dirs: vec![f.bin.clone()], search: Some(std::env::join_paths([&f.other, &f.bin]).unwrap()), user }
+            Trust { search: Some(std::env::join_paths([&f.other, &f.bin]).unwrap()), user, prefix: None }
+        }
+
+        fn refusal(t: &Trust, pinentry: &Path) -> String {
+            format!("{:#}", t.check(pinentry.to_str().unwrap()).unwrap_err())
         }
 
         #[test]
-        fn a_program_in_a_trusted_directory_is_resolved_to_its_path() {
+        fn a_program_nobody_but_its_owner_can_write_is_accepted_resolved() {
             let f = fixture();
             let t = Trust { search: Some(f.bin.clone().into_os_string()), ..trust(&f, f.me.clone()) };
-            assert_eq!(t.check("pinentry-qt").unwrap(), f.bin.join("pinentry-qt"));
-            let abs = f.bin.join("pinentry");
-            assert_eq!(t.check(abs.to_str().unwrap()).unwrap(), abs);
-        }
-
-        #[test]
-        fn a_program_outside_the_trusted_directories_is_refused() {
-            let f = fixture();
-            let t = trust(&f, f.me.clone());
-            // The search finds the untrusted copy first: refused, not skipped.
-            let e = format!("{:#}", t.check("pinentry").unwrap_err());
-            assert!(e.contains(&f.other.join("pinentry").display().to_string()), "{e}");
-            let e = format!("{:#}", t.check(f.other.join("pinentry").to_str().unwrap()).unwrap_err());
-            assert!(e.contains("not in"), "{e}");
-            let dotdot = f.bin.join("../other/pinentry");
-            assert!(t.check(dotdot.to_str().unwrap()).is_err());
+            assert_eq!(t.check("pinentry-qt").unwrap(), (f.bin.join("pinentry-qt"), PinentryRule::NotWritable));
+            // A link is followed: the program run is the one checked.
+            std::os::unix::fs::symlink(f.other.join("pinentry"), f.bin.join("link")).unwrap();
+            assert_eq!(t.check(f.bin.join("link").to_str().unwrap()).unwrap().0, f.other.join("pinentry"));
             assert!(format!("{:#}", t.check("bin/pinentry").unwrap_err()).contains("absolute"));
             assert!(format!("{:#}", t.check("pinentry-none").unwrap_err()).contains("not found"));
             assert!(t.check("").is_err());
+            assert!(t.check(f.bin.join("missing").to_str().unwrap()).is_err());
             let none = Trust { search: None, ..trust(&f, f.me.clone()) };
             assert!(format!("{:#}", none.check("pinentry").unwrap_err()).contains("not found"));
+        }
+
+        #[test]
+        fn a_link_into_a_writable_directory_is_refused() {
+            let f = fixture();
+            chmod(&f.other, 0o777);
+            std::os::unix::fs::symlink(f.other.join("pinentry"), f.bin.join("link")).unwrap();
+            let e = refusal(&trust(&f, f.me.clone()), &f.bin.join("link"));
+            assert!(e.contains("writable") && e.contains(&f.other.display().to_string()), "{e}");
         }
 
         #[test]
         fn a_program_the_user_can_write_is_refused() {
             let f = fixture();
             let p = f.bin.join("pinentry");
-            let path = p.to_str().unwrap();
             // Owned by the user: refused even without a write bit.
             let owner = User { uid: std::fs::metadata(&p).unwrap().uid(), groups: Some(vec![]) };
-            let e = format!("{:#}", trust(&f, owner).check(path).unwrap_err());
-            assert!(e.contains("writable"), "{e}");
-            // root can write anything.
-            assert!(trust(&f, User { uid: 0, groups: None }).check(path).is_err());
+            assert!(refusal(&trust(&f, owner), &p).contains("writable"));
 
             let t = trust(&f, f.me.clone());
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o757)).unwrap();
-            assert!(format!("{:#}", t.check(path).unwrap_err()).contains("writable"));
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o775)).unwrap();
+            chmod(&p, 0o757);
+            assert!(refusal(&t, &p).contains("writable"));
+            chmod(&p, 0o775);
             let gid = std::fs::metadata(&p).unwrap().gid();
-            let in_group = User { groups: Some(vec![gid]), ..f.me.clone() };
-            assert!(trust(&f, in_group).check(path).is_err());
-            assert!(t.check(path).is_ok(), "group-writable, but not our group");
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(trust(&f, User { groups: Some(vec![gid]), ..f.me.clone() }).check(p.to_str().unwrap()).is_err());
+            assert!(t.check(p.to_str().unwrap()).is_ok(), "group-writable, but not our group");
+            chmod(&p, 0o755);
 
-            // The directory counts too.
-            std::fs::set_permissions(&f.bin, std::fs::Permissions::from_mode(0o777)).unwrap();
-            let e = format!("{:#}", t.check(path).unwrap_err());
+            chmod(&f.bin, 0o777);
+            let e = refusal(&t, &p);
             assert!(e.contains("writable") && e.contains(&f.bin.display().to_string()), "{e}");
-            std::fs::set_permissions(&f.bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(t.check(path).is_ok());
+            chmod(&f.bin, 0o755);
+            assert!(t.check(p.to_str().unwrap()).is_ok());
         }
 
         #[test]
-        fn a_directory_is_not_a_program() {
+        fn every_directory_above_the_program_counts() {
             let f = fixture();
-            std::fs::create_dir(f.bin.join("pinentry-dir")).unwrap();
             let t = trust(&f, f.me.clone());
-            assert!(t.check(f.bin.join("pinentry-dir").to_str().unwrap()).is_err());
+            let p = f.bin.join("pinentry");
+            chmod(&f.root, 0o777);
+            let e = refusal(&t, &p);
+            assert!(e.contains(&format!("{} is writable", f.root.display())), "{e}");
+            // A sticky directory (like /tmp) only lets the user replace what
+            // the user owns.
+            chmod(&f.root, 0o1777);
+            assert_eq!(t.check(p.to_str().unwrap()).unwrap().1, PinentryRule::NotWritable);
+            let owner = User { uid: std::fs::metadata(&f.bin).unwrap().uid(), groups: Some(vec![]) };
+            chmod(&f.bin, 0o555);
+            chmod(&p, 0o555);
+            assert!(trust(&f, owner).check(p.to_str().unwrap()).is_err(), "the owner's own entry");
+            chmod(&f.root, 0o755);
+            chmod(&f.bin, 0o755);
+        }
+
+        #[test]
+        fn bwss_own_prefix_is_trusted_even_when_writable() {
+            let f = fixture();
+            chmod(&f.bin, 0o777);
+            let p = f.bin.join("pinentry");
+            assert!(refusal(&trust(&f, f.me.clone()), &p).contains("writable"));
+            let t = Trust { prefix: Some(f.root.clone()), ..trust(&f, f.me.clone()) };
+            assert_eq!(t.check(p.to_str().unwrap()).unwrap().1, PinentryRule::SamePrefix(f.root.clone()));
+            assert!(PinentryRule::SamePrefix(f.root.clone()).to_string().contains("prefix"));
+            assert!(PinentryRule::NotWritable.to_string().contains("not writable"));
+            // Another prefix does not help.
+            let elsewhere = Trust { prefix: Some(f.other.clone()), ..trust(&f, f.me.clone()) };
+            assert!(elsewhere.check(p.to_str().unwrap()).is_err());
+            chmod(&f.bin, 0o755);
+        }
+
+        #[test]
+        fn the_rule_is_checked_again_before_each_use() {
+            let f = fixture();
+            let t = trust(&f, f.me.clone());
+            let (p, _) = t.check(f.bin.join("pinentry").to_str().unwrap()).unwrap();
+            assert_eq!(t.verify(&p).unwrap(), PinentryRule::NotWritable);
+            chmod(&p, 0o757);
+            assert!(format!("{:#}", t.verify(&p).unwrap_err()).contains("writable"));
+            chmod(&p, 0o755);
+            // Replaced by a link since it was checked: refused.
+            std::fs::remove_file(&p).unwrap();
+            std::os::unix::fs::symlink(f.other.join("pinentry"), &p).unwrap();
+            assert!(format!("{:#}", t.verify(&p).unwrap_err()).contains("resolves"));
+            std::fs::create_dir(f.bin.join("dir")).unwrap();
+            assert!(format!("{:#}", t.verify(&f.bin.join("dir")).unwrap_err()).contains("not a program"));
+        }
+
+        #[test]
+        fn the_system_trust_uses_this_user_and_prefix() {
+            let t = Trust::system().unwrap();
+            assert_eq!(t.user, User::current().unwrap());
+            let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+            assert_eq!(t.prefix.as_deref(), exe.parent().and_then(Path::parent));
         }
 
         #[test]
@@ -967,6 +1112,7 @@ mod tests {
             set_acl_off(&p, true).unwrap();
             assert_eq!(load(&p, &trust(&f, f.me.clone())).unwrap().acl, AclMode::Off);
 
+            chmod(&f.other, 0o777);
             std::fs::write(
                 &p.config,
                 format!("pinentry = {:?}\ndefault = \"personal\"\n{ACCOUNT}", f.other.join("pinentry")),
@@ -1040,6 +1186,49 @@ mod tests {
 
             std::fs::write(&path, "client_id = \"no origin\"\n").unwrap();
             assert!(load_credentials(&path, &user, ORIGIN).is_err());
+        }
+
+        #[test]
+        fn credentials_have_exactly_three_keys() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials");
+            save_credentials(&path, &creds()).unwrap();
+            let user = me(&path);
+            let saved: Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let mut keys: Vec<&str> = saved.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["client_id", "client_secret", "identity_origin"]);
+
+            let full = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{full}extra = 1\n")).unwrap();
+            let e = format!("{:#}", load_credentials(&path, &user, ORIGIN).unwrap_err());
+            assert!(e.contains("an unknown key") && !e.contains("extra"), "{e}");
+            std::fs::write(&path, "identity_origin = \"https://identity.example.org\"\nclient_id = \"cid\"\n").unwrap();
+            let e = format!("{:#}", load_credentials(&path, &user, ORIGIN).unwrap_err());
+            assert!(e.contains("missing key `client_secret`"), "{e}");
+        }
+
+        #[test]
+        fn a_broken_credentials_file_never_shows_its_secret() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials");
+            save_credentials(&path, &creds()).unwrap();
+            let user = me(&path);
+            for text in [
+                "identity_origin = \"https://identity.example.org\"\nclient_id = \"cid\"\nclient_secret = \"s3cr3t-leak\n",
+                "client_secret = 's3cr3t-leak' 'more'\n",
+                "client_secret = \"s3cr3t-leak\"\nclient_secret = \"s3cr3t-leak\"\n",
+                "identity_origin = 1\nclient_id = \"s3cr3t-leak\"\nclient_secret = \"x\"\n",
+                "s3cr3t-leak = 1\n",
+            ] {
+                std::fs::write(&path, text).unwrap();
+                let e = format!("{:#}", load_credentials(&path, &user, ORIGIN).unwrap_err());
+                assert!(!e.contains("s3cr3t"), "{e}");
+                assert!(e.contains(&path.display().to_string()), "{e}");
+            }
+            std::fs::write(&path, "client_secret = \"s3cr3t-leak\n").unwrap();
+            let e = format!("{:#}", load_credentials(&path, &user, ORIGIN).unwrap_err());
+            assert!(e.contains("line 1"), "the position is kept: {e}");
         }
     }
 }

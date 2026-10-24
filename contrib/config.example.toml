@@ -12,9 +12,9 @@ default = "personal"             # the profile bwss serves unless [bwss] says ot
 lock_timeout_minutes = 60        # lock after this long without use (0 = never)
 sync_interval_seconds = 300      # pull changes from Bitwarden this often
 # The program that asks for the master password: pinentry-gnome3,
-# pinentry-qt, pinentry-gtk-2, ... It must live in /usr/bin, /usr/local/bin,
-# /opt/homebrew/bin or /run/current-system/sw/bin, and neither it nor its
-# directory may be writable by you; otherwise bwss refuses to start.
+# pinentry-qt, pinentry-gtk-2, ... Neither it (links followed) nor any
+# directory above it may be writable by you, unless it is installed under
+# the same prefix as bwss (Homebrew); otherwise bwss refuses to start.
 pinentry = "pinentry"
 
 [profiles.personal]

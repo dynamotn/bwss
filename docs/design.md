@@ -704,21 +704,39 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
   there is an error, and so is a shared key (`default`,
   `clipboard_clear_seconds`) inside a profile. Every other table
   (`[ssh_agent]`, `[obsidian]`, other profiles, a newer tool's section) is
-  ignored. The registry is a test fixture
+  ignored, whatever it holds. The registry is a test fixture
   (`tests/fixtures/config-registry.toml`) that mirrors the table in dybw.
 - **Nothing in the file weakens a check**, because it may be synced:
-  - an `acl` key anywhere is an error. Turning the ACL off is device
+  - an `acl` key at the top level, in the served profile or in `[bwss]` is
+    an error (other tools' tables are theirs). Turning the ACL off is device
     state: `bwss acl off` (asked on the terminal, refused when stdin is not
     one) creates `$XDG_STATE_HOME/dybw/tools/bwss/acl-off`, and `bwss acl
-    on` removes it. The daemon reads it at start.
-  - `pinentry` is resolved to an absolute path (a bare name through
-    `PATH`). The daemon refuses to start unless that path is in `/usr/bin`,
-    `/usr/local/bin`, `/opt/homebrew/bin` or `/run/current-system/sw/bin`,
-    and neither the program (after links) nor that directory is writable by
-    the user: owned by them, writable by a group they are in or by anyone,
-    or the user is root.
+    on` removes it. The daemon reads it at start. The confirmation stops a
+    synced file or a script without a terminal from turning the ACL off; it
+    is a speed bump, not a defence against local malware, which can create
+    the file itself.
+  - `pinentry` is resolved to an absolute path: a bare name through `PATH`,
+    then every symlink (`canonicalize`). bwss runs that resolved path. It is
+    accepted, and the daemon logs which rule accepted it, when either
+    - neither the program nor any directory above it, up to `/`, is
+      writable by the user (owned by them, writable by a group they are in
+      or by anyone). A sticky directory such as `/tmp` counts only when
+      the user owns the entry below it. Checking every ancestor is stricter
+      than the ADR (controller ruling R14); or
+    - it lies under bwss's own installation prefix: the grandparent of
+      bwss's resolved executable (`/opt/homebrew` for
+      `/opt/homebrew/bin/bwss`, `/usr` for `/usr/bin/bwss`; never `/`).
+      This is the Homebrew case: whoever can write that prefix can replace
+      bwss itself.
+
+    Otherwise the daemon refuses to start. The rule is checked again right
+    before every pinentry start, which is refused if it no longer holds.
+  - bwss never runs as root (every command refuses uid 0): it holds one
+    user's vault, and root can write every path, so the pinentry rule
+    could never hold.
 - **The API key** lives in `$XDG_STATE_HOME/dybw/profiles/<profile>/credentials`
-  (TOML: `identity_origin`, `client_id`, `client_secret`), mode 0600,
+  (TOML with exactly `identity_origin`, `client_id`, `client_secret`; an
+  unknown or missing key is an error), mode 0600,
   shared with the dybw CLI. It must be a regular file owned by the user,
   not a link. `identity_origin` is the `scheme://host[:port]` of the
   identity URL it was entered for. When the profile's server resolves to
@@ -788,7 +806,7 @@ boundary for `--password-stdin`.
 | User data in marked items | Writes touch bwss fields and the value source only; a new secret never goes into the user's password or notes; trash only when no foreign content (other tools' fields included) is left |
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
-| Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a system program the user cannot replace (§10) |
+| Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a program the user cannot replace or one under bwss's own prefix (§10); bwss refuses to run as root |
 | Disk | Bitwarden ciphertext only (cache, queue, ACL confirmations); hashed locked index |
 | Server input | KDF bounds, MAC checked before decrypt, error text clipped |
 
@@ -856,8 +874,10 @@ config, fsutil), since none of those change in substance.
 
 ## 14. Compatibility with `legacy`
 
-None, by decision. There is no migration and no special case for items or
-files that the folder-based bwss (branch `legacy`) wrote:
+None for vault items, by decision: there is no special case for items or
+cache files that the folder-based bwss (branch `legacy`) wrote. Its config
+file is migrated like any older bwss config, with `bwss config migrate`
+(§10).
 
 - Items `legacy` created carry `bwss:id`, so they are simply marked items
   under the rules above. Their secret is read from `login.password` or the

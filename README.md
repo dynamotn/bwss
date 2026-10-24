@@ -75,8 +75,9 @@ secure note, in any folder, with any Bitwarden client.
 bwss follows the dybw data model 1.1, shared with the Obsidian plugin
 keychain-bitwarden.
 
-**Coming from the old folder-based bwss?** There is no migration: start over.
-Items it created carry `bwss:id`, so they show up as marked items, but its
+**Coming from the old folder-based bwss?** Its config moves with `bwss config
+migrate` (see Quick start); there is no migration for vault items. Items it
+created carry `bwss:id`, so they show up as marked items, but its
 folder-based collections are not recognised, and `bwss config migrate`
 refuses an old config with a key this version no longer has (remove that
 key, such as `whole_vault`, first).
@@ -237,9 +238,10 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 - The config file may be synced with your dotfiles, so nothing in it can
   weaken a check. Per-app access control is turned off only on the device,
   with `bwss acl off` (confirmed on the terminal; `bwss acl on` undoes it).
-  The pinentry must be a program in a system directory (`/usr/bin`,
-  `/usr/local/bin`, `/opt/homebrew/bin`, `/run/current-system/sw/bin`) that
-  you cannot write to, or the daemon refuses to start.
+  The pinentry must be a program that you cannot write to, nor any
+  directory above it, or one installed under the same prefix as bwss
+  itself (Homebrew); otherwise the daemon refuses to start. bwss never runs
+  as root.
 - The API key is bound to the identity server it was entered for and is
   never sent to another one.
 - Access grants (`bwss:acl`) sync, but a device honours one only after it
@@ -263,8 +265,8 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 210 pass, 1 ignored (perf) |
-| End-to-end against Vaultwarden 1.37.4 | 54 pass (17 Bitwarden, 19 Secret Service, 8 bus names, 10 config) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 223 pass, 1 ignored (perf) |
+| End-to-end against Vaultwarden 1.37.4 | 55 pass (17 Bitwarden, 19 Secret Service, 8 bus names, 11 config) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
 **Not tested yet**: bitwarden.com itself (all server tests used

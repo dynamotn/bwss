@@ -21,6 +21,8 @@ pub enum Confirm {
 pub enum PromptError {
     #[error("could not run the prompter {0:?}: {1}")]
     Spawn(String, std::io::Error),
+    #[error("refusing to run the prompter: {0}")]
+    Untrusted(String),
     #[error("prompter protocol error: {0}")]
     Protocol(String),
     #[error("the prompt timed out")]
@@ -41,10 +43,15 @@ fn is_users_no(err: &str) -> bool {
     matches!(err_code(err), ERR_CANCELED | ERR_NOT_CONFIRMED)
 }
 
+/// Checks the program again right before it runs (ADR 0008: a pinentry
+/// that became writable since the daemon started is refused).
+pub type Guard = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Prompter {
     program: String,
     timeout: Duration,
+    guard: Option<Guard>,
 }
 
 struct Conversation {
@@ -150,7 +157,19 @@ impl Conversation {
 
 impl Prompter {
     pub fn new(program: impl Into<String>, timeout: Duration) -> Self {
-        Prompter { program: program.into(), timeout }
+        Prompter { program: program.into(), timeout, guard: None }
+    }
+
+    /// A prompter that runs `guard` on the program before every start.
+    pub fn guarded(program: impl Into<String>, timeout: Duration, guard: Guard) -> Self {
+        Prompter { guard: Some(guard), ..Self::new(program, timeout) }
+    }
+
+    async fn start(&self) -> Result<Conversation, PromptError> {
+        if let Some(guard) = &self.guard {
+            guard(&self.program).map_err(PromptError::Untrusted)?;
+        }
+        Conversation::start(&self.program).await
     }
 
     /// Asks for a password; `None` when the user cancelled.
@@ -160,7 +179,7 @@ impl Prompter {
         error: Option<&str>,
     ) -> Result<Option<Zeroizing<String>>, PromptError> {
         tokio::time::timeout(self.timeout, async {
-            let mut c = Conversation::start(&self.program).await?;
+            let mut c = self.start().await?;
             c.set("SETTITLE", "Unlock keyring").await?;
             c.set("SETDESC", description).await?;
             c.set("SETPROMPT", "Master password:").await?;
@@ -183,7 +202,7 @@ impl Prompter {
     /// there is no second question: the answer is `Once` or `Deny`.
     pub async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError> {
         tokio::time::timeout(self.timeout, async {
-            let mut c = Conversation::start(&self.program).await?;
+            let mut c = self.start().await?;
             c.set("SETTITLE", "Keyring access").await?;
             c.set("SETDESC", description).await?;
             c.set("SETOK", "Allow").await?;
@@ -218,6 +237,25 @@ impl Prompter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_guarded_prompter_checks_the_program_before_each_start() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let refuse: Guard = std::sync::Arc::new(move |p: &str| {
+            log.lock().map_err(|e| e.to_string())?.push(p.to_owned());
+            Err(format!("{p} became writable"))
+        });
+        let p = Prompter::guarded("/nonexistent/pinentry", Duration::from_secs(1), refuse);
+        let e = p.password("x", None).await.err().map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!(e, "refusing to run the prompter: /nonexistent/pinentry became writable");
+        assert!(matches!(p.confirm("x", true).await, Err(PromptError::Untrusted(_))));
+        assert_eq!(seen.lock().map(|s| s.len()).unwrap_or_default(), 2, "checked before every start");
+
+        let allow: Guard = std::sync::Arc::new(|_: &str| Ok(()));
+        let p = Prompter::guarded("/nonexistent/pinentry", Duration::from_secs(1), allow);
+        assert!(matches!(p.password("x", None).await, Err(PromptError::Spawn(..))), "allowed, then started");
+    }
 
     #[test]
     fn escaping_round_trips() {

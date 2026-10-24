@@ -96,9 +96,26 @@ fn header_line(lines: &[&str], name: &str) -> Option<usize> {
     })
 }
 
-/// `path`, or where it points when it is a link (a dotfile manager's).
-fn real_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+/// `path`, or where it points when it is a link (a dotfile manager's). A
+/// link to nothing is refused rather than replaced by a file.
+fn real_path(path: &Path) -> anyhow::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).with_context(|| {
+            let to = std::fs::read_link(path).unwrap_or_default();
+            format!(
+                "{} is a link to {}, which does not exist; create it or remove the link",
+                path.display(),
+                to.display()
+            )
+        }),
+        _ => Ok(path.to_owned()),
+    }
+}
+
+/// The permission bits of `path`, or 0600 for a new file.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o7777)
 }
 
 /// Renames `path` to the first free `<path>.migrated[.N]`.
@@ -126,7 +143,7 @@ pub fn migrate(
         bail!("nothing to migrate: {} does not exist", old.display());
     };
     let legacy: Legacy = toml::from_str(&legacy_text).with_context(|| old.display().to_string())?;
-    let target = real_path(&paths.config);
+    let target = real_path(&paths.config)?;
     let original = read_optional(&target)?.unwrap_or_default();
     let doc: Table = toml::from_str(&original).with_context(|| paths.config.display().to_string())?;
     if doc.contains_key("bwss") {
@@ -272,9 +289,11 @@ pub fn migrate(
             if std::fs::symlink_metadata(&creds).is_ok() {
                 report.push(format!("kept the API key already in {}", creds.display()));
             } else {
-                let found: LegacyCredentials =
-                    toml::from_str(&raw).with_context(|| paths.legacy_credentials.display().to_string())?;
-                let origin = identity_origin(&legacy.server_url).map_err(anyhow::Error::msg)?;
+                let found: LegacyCredentials = config::parse_secret_toml(&raw, &paths.legacy_credentials)?;
+                // Bound to the server bwss will send it to: the profile's.
+                let server =
+                    own.and_then(|t| t.get("server_url")).and_then(Value::as_str).unwrap_or(&legacy.server_url);
+                let origin = identity_origin(server).map_err(anyhow::Error::msg)?;
                 let moved = Credentials {
                     identity_origin: origin.clone(),
                     client_id: found.client_id,
@@ -296,7 +315,8 @@ pub fn migrate(
         }
     }
 
-    crate::fsutil::write_private(&target, text.as_bytes()).with_context(|| target.display().to_string())?;
+    crate::fsutil::write_atomic(&target, text.as_bytes(), mode_of(&target))
+        .with_context(|| target.display().to_string())?;
     report.push(format!("wrote [bwss] to {}", paths.config.display()));
     if acl_off {
         config::set_acl_off(paths, true)?;
@@ -308,9 +328,19 @@ pub fn migrate(
                 .to_owned(),
         );
     }
+    let mut left = Vec::new();
     for file in old_files {
-        let aside = set_aside(&file)?;
-        report.push(format!("renamed {} to {}", file.display(), aside.display()));
+        match set_aside(&file) {
+            Ok(aside) => report.push(format!("renamed {} to {}", file.display(), aside.display())),
+            Err(e) => left.push(format!("{} ({e:#})", file.display())),
+        }
+    }
+    if !left.is_empty() {
+        bail!(
+            "the migration is done, but these old files were not renamed; rename them yourself: {}\n{}",
+            left.join(", "),
+            report.join("\n")
+        );
     }
     Ok(report)
 }
@@ -334,7 +364,7 @@ mod tests {
 
     fn home() -> Home {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
+        let bin = dir.path().canonicalize().unwrap().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let pinentry = bin.join("pinentry-qt");
         std::fs::write(&pinentry, "#!/bin/sh\n").unwrap();
@@ -342,9 +372,9 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let owner = std::fs::metadata(&bin).unwrap().uid();
         let trust = Trust {
-            dirs: vec![bin.clone()],
             search: Some(bin.clone().into_os_string()),
             user: User { uid: owner.wrapping_add(1).max(1), groups: Some(vec![]) },
+            prefix: None,
         };
         let h = dir.path().as_os_str().to_owned();
         let paths = Paths::with(move |v| (v == "HOME").then(|| h.clone()));
@@ -592,6 +622,68 @@ mod tests {
         assert_eq!(std::fs::read_to_string(migrated(&h.paths.legacy_config)).unwrap(), "earlier\n");
         let second = PathBuf::from(format!("{}.migrated.2", h.paths.legacy_config.display()));
         assert_eq!(std::fs::read_to_string(second).unwrap(), "email = \"me@example.org\"\n");
+    }
+
+    #[test]
+    fn broken_old_credentials_never_show_their_secret() {
+        let h = home();
+        h.legacy("email = \"me@example.org\"\n");
+        write(&h.paths.legacy_credentials, "client_id = \"cid\"\nclient_secret = \"s3cr3t-leak\n");
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(!e.contains("s3cr3t") && e.contains("credentials.toml"), "{e}");
+        assert!(!h.paths.config.exists(), "nothing written");
+    }
+
+    #[test]
+    fn the_key_is_bound_to_the_reused_profiles_server() {
+        let h = home();
+        // Same server, spelt differently: the profile's spelling decides.
+        h.dybw("[profiles.p]\nserver_url = \"https://VAULT.example.org/\"\nemail = \"me@example.org\"\n");
+        h.legacy("server_url = \"https://vault.example.org\"\nemail = \"me@example.org\"\n");
+        h.legacy_credentials();
+        h.run(false).unwrap();
+        let text = std::fs::read_to_string(h.paths.credentials("p")).unwrap();
+        assert!(text.contains("identity_origin = \"https://vault.example.org\""), "{text}");
+    }
+
+    #[test]
+    fn the_dybw_file_keeps_its_mode() {
+        let h = home();
+        h.dybw("# mine\n");
+        std::fs::set_permissions(&h.paths.config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        h.legacy("email = \"me@example.org\"\n");
+        h.run(false).unwrap();
+        assert_eq!(std::fs::metadata(&h.paths.config).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn a_dangling_link_is_not_replaced() {
+        let h = home();
+        std::fs::create_dir_all(h.paths.config.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(h.dir.path().join("gone/config.toml"), &h.paths.config).unwrap();
+        h.legacy("email = \"me@example.org\"\n");
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(e.contains("link") && e.contains("gone/config.toml"), "{e}");
+        assert!(std::fs::symlink_metadata(&h.paths.config).unwrap().file_type().is_symlink());
+        assert!(h.paths.legacy_config.exists());
+    }
+
+    #[test]
+    fn files_left_behind_by_a_failed_rename_are_named() {
+        let h = home();
+        h.legacy("email = \"me@example.org\"\n");
+        h.legacy_credentials();
+        let dir = h.paths.legacy_config.parent().unwrap().to_owned();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = std::fs::File::create(dir.join("probe"));
+        if probe.is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return; // permissions not enforced (running as root)
+        }
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(e.contains("not renamed") && e.contains("config.toml") && e.contains("credentials.toml"), "{e}");
+        assert!(e.contains("wrote [bwss]"), "what was done is reported too: {e}");
     }
 
     #[test]

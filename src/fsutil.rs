@@ -5,6 +5,11 @@ use std::io::Write;
 use std::path::Path;
 
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic(path, data, 0o600)
+}
+
+/// Replaces `path` atomically with a file of permission bits `mode`.
+pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
@@ -15,9 +20,15 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(mode);
         }
         let mut f = opts.open(&tmp)?;
+        // The umask may have taken bits away: set exactly `mode`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(data)?;
         f.sync_all()?;
     }

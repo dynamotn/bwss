@@ -252,7 +252,15 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             (Arc::new(b), Some(paths.cache.join("locked-index.json")))
         }
     };
-    let prompter = Prompter::new(config.pinentry.clone(), Duration::from_secs(120));
+    // The pinentry is checked again right before every start (ADR 0008).
+    let guard = Arc::new(trust);
+    let prompter = Prompter::guarded(
+        config.pinentry.clone(),
+        Duration::from_secs(120),
+        Arc::new(move |program: &str| {
+            guard.verify(std::path::Path::new(program)).map(|_| ()).map_err(|e| format!("{e:#}"))
+        }),
+    );
     let daemon = Daemon::new(Keyring::new(index), backend, prompter, config.clone());
     daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
 
@@ -298,6 +306,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    config::refuse_root(&fsutil::User::current().context("cannot tell which user this is")?)?;
     match cli.command {
         Command::Daemon { replace } => run_daemon(replace).await,
         Command::Unlock { password_stdin: true } => {

@@ -13,7 +13,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from conftest import BWSS, HERE, PINENTRY, PROFILE, Daemon
+from conftest import BWSS, PINENTRY, PROFILE, Daemon
 
 SERVER = "http://127.0.0.1:9"
 EMAIL = "me@example.org"
@@ -73,6 +73,8 @@ def test_login_saves_the_profiles_key_bound_to_its_origin():
         assert d.cli("status").stdout.startswith("locked")
     finally:
         d.stop()
+    log = (d.home / "daemon.log").read_text()
+    assert f"pinentry {PINENTRY} accepted: not writable by this user" in log, log
     device = d.state / "profiles" / PROFILE / "devices" / "bwss"
     assert mode(device) == 0o600 and device.read_text().strip()
     for private in (d.home / "cache" / "bwss", d.home / "state" / "bwss", device.parent):
@@ -97,6 +99,16 @@ def test_the_key_is_refused_for_another_server_until_login_again():
     d.stop()
 
 
+def test_a_broken_credentials_file_never_shows_the_secret():
+    d = bitwarden_home()
+    login(d)
+    creds = d.state / "profiles" / PROFILE / "credentials"
+    creds.write_text(creds.read_text().replace('client_secret = "csecret"', 'client_secret = "s3cr3t-leak'))
+    r = run_daemon(d)
+    assert r.returncode != 0 and str(creds) in r.stderr and "line 3" in r.stderr, r.stderr
+    assert "s3cr3t" not in r.stderr
+
+
 def test_login_needs_a_profile():
     d = Daemon({"backend": "memory"})
     r = d.cli("login", "--client-id", "x", "--client-secret-stdin", input="s\n", check=False)
@@ -107,7 +119,13 @@ def test_the_file_cannot_turn_the_acl_off():
     d = Daemon({"backend": "memory", "acl": "off"})
     r = run_daemon(d)
     assert r.returncode != 0
-    assert "`acl`" in r.stderr and "bwss acl off" in r.stderr, r.stderr
+    assert "`acl` in [bwss]" in r.stderr and "bwss acl off" in r.stderr, r.stderr
+    # Another tool's table is its own business.
+    d.write_config({"backend": "memory"})
+    with d.config.open("a") as f:
+        f.write('\n[obsidian]\nacl = "off"\n')
+    d.start()
+    d.stop()
 
 
 def test_unknown_keys_stop_the_daemon():
@@ -116,20 +134,31 @@ def test_unknown_keys_stop_the_daemon():
     assert r.returncode != 0 and "unknown key `idle_lock_minutes`" in r.stderr, r.stderr
 
 
-def test_a_pinentry_the_user_could_replace_is_refused():
-    # The fake pinentry in the source tree is not in a system directory.
-    d = Daemon({"backend": "memory"}, top={"pinentry": str(HERE / "fake_pinentry.py")})
-    r = run_daemon(d)
-    assert r.returncode != 0 and "fake_pinentry.py is not in" in r.stderr, r.stderr
-
-    # Nor is a copy in the user's own directory, found through PATH.
+def user_pinentry(d):
+    """A copy of the fake pinentry that the user owns, so could replace."""
     bin_dir = d.home / "bin"
-    bin_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
     shutil.copy(PINENTRY, bin_dir / "pinentry")
-    d.write_config({"backend": "memory"}, top={"pinentry": "pinentry"})
-    d.env["PATH"] = f"{bin_dir}:{d.env['PATH']}"
+    return bin_dir / "pinentry"
+
+
+def test_a_pinentry_the_user_could_replace_is_refused():
+    d = Daemon({"backend": "memory"})
+    mine = user_pinentry(d)
+    d.write_config({"backend": "memory"}, top={"pinentry": str(mine)})
     r = run_daemon(d)
-    assert r.returncode != 0 and str(bin_dir / "pinentry") in r.stderr, r.stderr
+    assert r.returncode != 0 and f"pinentry {mine.resolve()}" in r.stderr and "writable" in r.stderr, r.stderr
+
+    # Found through PATH, or reached through a link: still refused.
+    d.write_config({"backend": "memory"}, top={"pinentry": "pinentry"})
+    d.env["PATH"] = f"{mine.parent}:{d.env['PATH']}"
+    r = run_daemon(d)
+    assert r.returncode != 0 and str(mine.resolve()) in r.stderr, r.stderr
+    link = d.home / "link"
+    link.symlink_to(mine)
+    d.write_config({"backend": "memory"}, top={"pinentry": str(link)})
+    r = run_daemon(d)
+    assert r.returncode != 0 and str(mine.resolve()) in r.stderr, r.stderr
 
 
 def other_tool(d):
@@ -242,7 +271,7 @@ def test_migrating_acl_off_asks_on_the_terminal():
 
 def test_a_migration_with_an_untrusted_prompter_changes_nothing():
     d, old = legacy_home(acl="prompt")
-    text = (old / "config.toml").read_text().replace(PINENTRY, str(HERE / "fake_pinentry.py"))
+    text = (old / "config.toml").read_text().replace(PINENTRY, str(user_pinentry(d)))
     (old / "config.toml").write_text(text)
     r = d.cli("config", "migrate", check=False)
     assert r.returncode != 0 and "`prompter`" in r.stderr, r.stderr
