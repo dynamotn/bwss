@@ -144,6 +144,30 @@ class Account:
                 return f["id"]
         return http("POST", f"{self.server}/api/folders", {"name": encrypt(name.encode(), self.user_key)}, self._auth())["id"]
 
+    def _cipher(self, cipher_id):
+        return next(x for x in self.sync()["ciphers"] if x["id"] == cipher_id)
+
+    def _dec(self, c):
+        key = decrypt(c["key"], self.user_key) if c.get("key") else self.user_key
+        return lambda v: decrypt(v, key).decode() if v else None
+
+    def _view(self, c):
+        d = self._dec(c)
+        fields = [(d(f["name"]), d(f["value"])) for f in (c.get("fields") or [])]
+        login = c.get("login") or {}
+        return {
+            "id": c["id"],
+            "name": d(c["name"]),
+            "password": d(login.get("password")),
+            "username": d(login.get("username")),
+            "notes": d(c.get("notes")),
+            "fields": dict(fields),
+            "field_list": fields,
+            "history": [d(h["password"]) for h in (c.get("passwordHistory") or [])],
+            "deleted": bool(c.get("deletedDate")),
+            "folder": c.get("folderId"),
+        }
+
     def items(self, folder):
         """Decrypted view of the live items in a folder: {name: {...}}."""
         fid = self.folder_id(folder)
@@ -151,41 +175,78 @@ class Account:
         for c in self.sync()["ciphers"]:
             if c.get("folderId") != fid or c.get("deletedDate"):
                 continue
-            key = decrypt(c["key"], self.user_key) if c.get("key") else self.user_key
-            d = lambda v: decrypt(v, key).decode() if v else None
-            fields = {d(f["name"]): d(f["value"]) for f in (c.get("fields") or [])}
-            login = c.get("login") or {}
-            out[d(c["name"])] = {
-                "id": c["id"],
-                "password": d(login.get("password")),
-                "username": d(login.get("username")),
-                "notes": d(c.get("notes")),
-                "fields": fields,
-                "history": [d(h["password"]) for h in (c.get("passwordHistory") or [])],
-            }
+            v = self._view(c)
+            out[v["name"]] = v
         return out
 
-    def add_login(self, folder, name, password, fields=None):
-        fid = self.folder_id(folder)
-        k = self.user_key
-        body = {
-            "type": 1,
-            "folderId": fid,
-            "organizationId": None,
-            "name": encrypt(name.encode(), k),
-            "notes": None,
-            "favorite": False,
-            "reprompt": 0,
-            "login": {"username": encrypt(b"someone", k), "password": encrypt(password.encode(), k), "uris": None, "totp": None},
-            "fields": [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in (fields or {}).items()],
-            "encryptedFor": self.user_id,
-        }
-        return http("POST", f"{self.server}/api/ciphers", body, self._auth())
+    def item(self, cipher_id):
+        """Decrypted view of one item, trashed or not."""
+        return self._view(self._cipher(cipher_id))
 
-    def set_password(self, cipher_id, password):
-        c = next(x for x in self.sync()["ciphers"] if x["id"] == cipher_id)
+    def fields(self, cipher_id):
+        return self.item(cipher_id)["field_list"]
+
+    def _enc_fields(self, c, fields):
+        k = self.user_key if not c.get("key") else decrypt(c["key"], self.user_key)
+        return [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in fields]
+
+    def _put(self, cipher_id, change):
+        c = self._cipher(cipher_id)
         body = {k: v for k, v in c.items() if k not in ("id", "revisionDate", "creationDate", "deletedDate", "object", "edit", "viewPassword", "permissions", "collectionIds", "attachments", "organizationUseTotp", "data")}
-        body["login"]["password"] = encrypt(password.encode(), self.user_key)
+        change(c, body)
         body["lastKnownRevisionDate"] = c["revisionDate"]
         body["encryptedFor"] = self.user_id
         return http("PUT", f"{self.server}/api/ciphers/{cipher_id}", body, self._auth())
+
+    def _new(self, folder, type_, name, notes, login, fields):
+        k = self.user_key
+        body = {
+            "type": type_,
+            "folderId": self.folder_id(folder) if folder else None,
+            "organizationId": None,
+            "name": encrypt(name.encode(), k),
+            "notes": encrypt(notes.encode(), k) if notes else None,
+            "favorite": False,
+            "reprompt": 0,
+            "fields": [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in (fields or {}).items()],
+            "encryptedFor": self.user_id,
+        }
+        if type_ == 1:
+            body["login"] = login
+        else:
+            body["secureNote"] = {"type": 0}
+        return http("POST", f"{self.server}/api/ciphers", body, self._auth())
+
+    def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None):
+        """Add a login; `folder` may be None for no folder."""
+        k = self.user_key
+        login = {
+            "username": encrypt(username.encode(), k) if username else None,
+            "password": encrypt(password.encode(), k),
+            "uris": [{"uri": encrypt(uri.encode(), k), "match": None}] if uri else None,
+            "totp": None,
+        }
+        return self._new(folder, 1, name, notes, login, fields)
+
+    def add_note(self, folder, name, notes, fields=None):
+        return self._new(folder, 2, name, notes, None, fields)
+
+    def set_fields(self, cipher_id, fields):
+        def change(c, body):
+            body["fields"] = self._enc_fields(c, fields)
+        return self._put(cipher_id, change)
+
+    def remove_field(self, cipher_id, name):
+        return self.set_fields(cipher_id, [(n, v) for n, v in self.fields(cipher_id) if n != name])
+
+    def set_password(self, cipher_id, password):
+        def change(c, body):
+            body["login"]["password"] = encrypt(password.encode(), self.user_key)
+        return self._put(cipher_id, change)
+
+    def clone(self, cipher_id):
+        """Duplicate an item the way "Clone item" does: same content, new id."""
+        c = self._cipher(cipher_id)
+        body = {k: v for k, v in c.items() if k not in ("id", "revisionDate", "creationDate", "deletedDate", "object", "edit", "viewPassword", "permissions", "collectionIds", "attachments", "organizationUseTotp", "data", "passwordHistory")}
+        body["encryptedFor"] = self.user_id
+        return http("POST", f"{self.server}/api/ciphers", body, self._auth())["id"]
