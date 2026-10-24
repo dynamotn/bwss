@@ -239,9 +239,10 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
   weaken a check. Per-app access control is turned off only on the device,
   with `bwss acl off` (confirmed on the terminal; `bwss acl on` undoes it).
   The pinentry must be a program that you cannot write to, nor any
-  directory above it, or one installed under the same prefix as bwss
-  itself (Homebrew); otherwise the daemon refuses to start. bwss never runs
-  as root.
+  directory above it. A Homebrew-installed bwss also accepts a pinentry
+  from the same Homebrew prefix (`bin`, `sbin`, `opt/*/bin`, a keg's
+  `bin`), but never from under your home directory. Otherwise the daemon
+  refuses to start. bwss never runs as root.
 - The API key is bound to the identity server it was entered for and is
   never sent to another one.
 - Access grants (`bwss:acl`) sync, but a device honours one only after it
@@ -265,7 +266,7 @@ you trust it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 223 pass, 1 ignored (perf) |
+| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config) | 228 pass, 1 ignored (perf) |
 | End-to-end against Vaultwarden 1.37.4 | 55 pass (17 Bitwarden, 19 Secret Service, 8 bus names, 11 config) |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 

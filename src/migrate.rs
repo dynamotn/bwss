@@ -100,10 +100,10 @@ fn header_line(lines: &[&str], name: &str) -> Option<usize> {
 /// link to nothing is refused rather than replaced by a file.
 fn real_path(path: &Path) -> anyhow::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).with_context(|| {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).map_err(|e| {
             let to = std::fs::read_link(path).unwrap_or_default();
-            format!(
-                "{} is a link to {}, which does not exist; create it or remove the link",
+            anyhow::anyhow!(
+                "{} is a link to {} that cannot be followed ({e}); fix or remove the link",
                 path.display(),
                 to.display()
             )
@@ -374,7 +374,8 @@ mod tests {
         let trust = Trust {
             search: Some(bin.clone().into_os_string()),
             user: User { uid: owner.wrapping_add(1).max(1), groups: Some(vec![]) },
-            prefix: None,
+            exe: None,
+            home: None,
         };
         let h = dir.path().as_os_str().to_owned();
         let paths = Paths::with(move |v| (v == "HOME").then(|| h.clone()));
@@ -663,9 +664,17 @@ mod tests {
         std::os::unix::fs::symlink(h.dir.path().join("gone/config.toml"), &h.paths.config).unwrap();
         h.legacy("email = \"me@example.org\"\n");
         let e = format!("{:#}", h.run(false).unwrap_err());
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound).to_string();
         assert!(e.contains("link") && e.contains("gone/config.toml"), "{e}");
+        assert!(e.contains(&missing) || e.contains("No such file"), "the real reason: {e}");
         assert!(std::fs::symlink_metadata(&h.paths.config).unwrap().file_type().is_symlink());
         assert!(h.paths.legacy_config.exists());
+
+        // A loop says so, rather than "does not exist".
+        std::fs::remove_file(&h.paths.config).unwrap();
+        std::os::unix::fs::symlink(&h.paths.config, &h.paths.config).unwrap();
+        let e = format!("{:#}", h.run(false).unwrap_err());
+        assert!(!e.contains("does not exist") && e.to_lowercase().contains("symbolic links"), "{e}");
     }
 
     #[test]

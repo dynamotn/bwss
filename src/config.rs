@@ -376,19 +376,67 @@ pub struct Trust {
     /// `PATH`, to resolve a bare program name.
     pub search: Option<OsString>,
     pub user: User,
-    /// bwss's installation prefix: the grandparent of its resolved
-    /// executable (`/opt/homebrew` for `/opt/homebrew/bin/bwss`); never `/`.
-    pub prefix: Option<PathBuf>,
+    /// bwss's own resolved executable, for the install-prefix rule.
+    pub exe: Option<PathBuf>,
+    /// The user's resolved home: no prefix in, at or above it is trusted.
+    pub home: Option<PathBuf>,
+}
+
+/// bwss's installation prefix: the parent of a `Cellar` directory in its
+/// path (a Homebrew keg: `/opt/homebrew` for
+/// `/opt/homebrew/Cellar/bwss/1.0/bin/bwss`), otherwise the grandparent of
+/// the executable.
+pub fn install_prefix(exe: &Path) -> Option<PathBuf> {
+    match exe.ancestors().find(|dir| dir.file_name().is_some_and(|n| n == "Cellar")) {
+        Some(cellar) => cellar.parent().map(Path::to_owned),
+        None => exe.parent().and_then(Path::parent).map(Path::to_owned),
+    }
+}
+
+/// Why `prefix` cannot be trusted as an installation prefix, if it cannot.
+fn prefix_problem(prefix: &Path, home: Option<&Path>) -> Option<String> {
+    let shown = prefix.display();
+    if prefix.parent().is_none() {
+        return Some("bwss's prefix would be `/`".to_owned());
+    }
+    let Some(home) = home else {
+        return Some("the home directory is unknown".to_owned());
+    };
+    if prefix == home {
+        Some(format!("bwss's prefix {shown} is your home"))
+    } else if home.starts_with(prefix) {
+        Some(format!("bwss's prefix {shown} contains your home"))
+    } else if prefix.starts_with(home) {
+        Some(format!("bwss's prefix {shown} is inside your home"))
+    } else {
+        None
+    }
+}
+
+/// Whether `file` is in one of the prefix's program directories:
+/// `bin`, `sbin`, `opt/*/bin` or `Cellar/*/*/bin`.
+fn in_prefix_bin(prefix: &Path, file: &Path) -> bool {
+    let Ok(rest) = file.strip_prefix(prefix) else { return false };
+    let parts: Vec<&str> = rest.iter().map(|p| p.to_str().unwrap_or("/")).collect();
+    matches!(parts.as_slice(), ["bin" | "sbin", _] | ["opt", _, "bin", _] | ["Cellar", _, _, "bin", _])
+}
+
+/// Whether a sticky directory keeps the user from replacing the entry below
+/// it: world-writable and sticky, owned by someone else, and the entry not
+/// the user's either.
+fn sticky_shields(dir_mode: u32, dir_uid: u32, entry_uid: u32, user: &User) -> bool {
+    let sticky_and_open = dir_mode & 0o1000 != 0 && dir_mode & 0o002 != 0;
+    sticky_and_open && user.uid != 0 && dir_uid != user.uid && entry_uid != user.uid
 }
 
 impl Trust {
     pub fn system() -> anyhow::Result<Self> {
         let exe = std::env::current_exe().and_then(std::fs::canonicalize).context("cannot find this executable")?;
-        let prefix = exe.parent().and_then(Path::parent).filter(|p| p.parent().is_some()).map(Path::to_owned);
         Ok(Trust {
             search: std::env::var_os("PATH"),
             user: User::current().context("cannot tell which user this is")?,
-            prefix,
+            exe: Some(exe),
+            home: std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok()),
         })
     }
 
@@ -410,18 +458,44 @@ impl Trust {
         let Some(writable) = self.writable_part(resolved) else {
             return Ok(PinentryRule::NotWritable);
         };
-        match &self.prefix {
-            Some(prefix) if resolved.starts_with(prefix) => Ok(PinentryRule::SamePrefix(prefix.clone())),
-            _ => bail!(
-                "pinentry {shown}: {} is writable by this user, so the program cannot be trusted",
+        match self.prefix_rule(resolved) {
+            Ok(prefix) => Ok(PinentryRule::SamePrefix(prefix)),
+            Err(why) => bail!(
+                "pinentry {shown}: {} is writable by this user, so the program cannot be trusted \
+                 (and the install-prefix rule does not apply: {why})",
                 writable.display()
             ),
         }
     }
 
+    /// The prefix under which `resolved` is trusted as bwss's neighbour
+    /// (controller ruling R15, stricter than ADR 0008), or why not.
+    fn prefix_rule(&self, resolved: &Path) -> Result<PathBuf, String> {
+        let exe = self.exe.as_deref().ok_or("bwss's own executable is unknown")?;
+        let exe_writable = std::fs::metadata(exe).is_ok_and(|m| self.user.may_write_file(&m));
+        if !exe_writable {
+            return Err(format!(
+                "bwss itself ({}) is not writable by this user, so nothing beside it is trusted for that",
+                exe.display()
+            ));
+        }
+        let prefix = install_prefix(exe).ok_or_else(|| format!("{} has no installation prefix", exe.display()))?;
+        if let Some(problem) = prefix_problem(&prefix, self.home.as_deref()) {
+            return Err(problem);
+        }
+        if !in_prefix_bin(&prefix, resolved) {
+            return Err(format!(
+                "it is not in a program directory of bwss's prefix {} (bin, sbin, opt/*/bin, Cellar/*/*/bin)",
+                prefix.display()
+            ));
+        }
+        Ok(prefix)
+    }
+
     /// The program itself, or the first directory above it, that this user
-    /// could change. A sticky directory (`/tmp`) counts only when the user
-    /// owns the entry below it, which is all the sticky bit lets them replace.
+    /// could change. A sticky directory (`/tmp`) owned by someone else does
+    /// not count when the entry below it is not the user's either: the
+    /// sticky bit lets the user replace only their own entries.
     fn writable_part(&self, file: &Path) -> Option<PathBuf> {
         use std::os::unix::fs::MetadataExt;
         let changeable = |p: &Path| std::fs::metadata(p).map_or(true, |m| self.user.may_write_file(&m));
@@ -432,9 +506,11 @@ impl Trust {
         for dir in file.ancestors().skip(1) {
             let meta = std::fs::metadata(dir);
             let open = meta.as_ref().map_or(true, |m| self.user.may_write_file(m));
-            let sticky = meta.as_ref().is_ok_and(|m| m.mode() & 0o1000 != 0);
-            let entry_ours = std::fs::symlink_metadata(below).map_or(true, |m| m.uid() == self.user.uid);
-            if open && !(sticky && self.user.uid != 0 && !entry_ours) {
+            let shielded = match (&meta, std::fs::symlink_metadata(below)) {
+                (Ok(dir), Ok(entry)) => sticky_shields(dir.mode(), dir.uid(), entry.uid(), &self.user),
+                _ => false,
+            };
+            if open && !shielded {
                 return Some(dir.to_owned());
             }
             below = dir;
@@ -979,7 +1055,7 @@ mod tests {
         }
 
         fn trust(f: &Fixture, user: User) -> Trust {
-            Trust { search: Some(std::env::join_paths([&f.other, &f.bin]).unwrap()), user, prefix: None }
+            Trust { search: Some(std::env::join_paths([&f.other, &f.bin]).unwrap()), user, exe: None, home: None }
         }
 
         fn refusal(t: &Trust, pinentry: &Path) -> String {
@@ -1043,8 +1119,8 @@ mod tests {
             chmod(&f.root, 0o777);
             let e = refusal(&t, &p);
             assert!(e.contains(&format!("{} is writable", f.root.display())), "{e}");
-            // A sticky directory (like /tmp) only lets the user replace what
-            // the user owns.
+            // A sticky directory (like /tmp) owned by someone else only lets
+            // the user replace what the user owns.
             chmod(&f.root, 0o1777);
             assert_eq!(t.check(p.to_str().unwrap()).unwrap().1, PinentryRule::NotWritable);
             let owner = User { uid: std::fs::metadata(&f.bin).unwrap().uid(), groups: Some(vec![]) };
@@ -1055,20 +1131,117 @@ mod tests {
             chmod(&f.bin, 0o755);
         }
 
-        #[test]
-        fn bwss_own_prefix_is_trusted_even_when_writable() {
+        /// A Homebrew-like prefix the user can write, with bwss in a keg.
+        struct Brew {
+            f: Fixture,
+            prefix: PathBuf,
+            exe: PathBuf,
+            home: PathBuf,
+        }
+
+        fn brew() -> Brew {
             let f = fixture();
-            chmod(&f.bin, 0o777);
-            let p = f.bin.join("pinentry");
-            assert!(refusal(&trust(&f, f.me.clone()), &p).contains("writable"));
-            let t = Trust { prefix: Some(f.root.clone()), ..trust(&f, f.me.clone()) };
-            assert_eq!(t.check(p.to_str().unwrap()).unwrap().1, PinentryRule::SamePrefix(f.root.clone()));
-            assert!(PinentryRule::SamePrefix(f.root.clone()).to_string().contains("prefix"));
+            let prefix = f.root.join("brew");
+            let exe = prefix.join("Cellar/bwss/1.0/bin/bwss");
+            let pin = prefix.join("Cellar/pinentry-mac/1.4/bin/pinentry-mac");
+            for file in [&exe, &pin, &prefix.join("share/pinentry"), &prefix.join("opt/pe/bin/pinentry")] {
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, "#!/bin/sh\n").unwrap();
+                chmod(file, 0o757); // writable by everyone, so by `me`
+            }
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            std::os::unix::fs::symlink(&pin, prefix.join("bin/pinentry-mac")).unwrap();
+            chmod(&prefix.join("bin"), 0o777);
+            let home = f.root.join("home");
+            std::fs::create_dir(&home).unwrap();
+            Brew { f, prefix, exe, home }
+        }
+
+        fn brew_trust(b: &Brew) -> Trust {
+            Trust { exe: Some(b.exe.clone()), home: Some(b.home.clone()), ..trust(&b.f, b.f.me.clone()) }
+        }
+
+        fn brew_check(t: &Trust, file: &Path) -> Result<PinentryRule, String> {
+            t.check(file.to_str().unwrap()).map(|(_, rule)| rule).map_err(|e| format!("{e:#}"))
+        }
+
+        #[test]
+        fn a_homebrew_pinentry_beside_a_homebrew_bwss_is_trusted() {
+            let b = brew();
+            let t = brew_trust(&b);
+            let rule = PinentryRule::SamePrefix(b.prefix.clone());
+            assert_eq!(brew_check(&t, &b.prefix.join("bin/pinentry-mac")), Ok(rule.clone()), "a link into a keg");
+            assert_eq!(brew_check(&t, &b.prefix.join("opt/pe/bin/pinentry")), Ok(rule.clone()));
+            assert!(rule.to_string().contains("prefix"));
             assert!(PinentryRule::NotWritable.to_string().contains("not writable"));
-            // Another prefix does not help.
-            let elsewhere = Trust { prefix: Some(f.other.clone()), ..trust(&f, f.me.clone()) };
-            assert!(elsewhere.check(p.to_str().unwrap()).is_err());
-            chmod(&f.bin, 0o755);
+            // Without the rule, the same file is refused.
+            let e = brew_check(&trust(&b.f, b.f.me.clone()), &b.prefix.join("bin/pinentry-mac")).unwrap_err();
+            assert!(e.contains("writable"), "{e}");
+        }
+
+        #[test]
+        fn only_the_prefix_program_directories_count() {
+            let b = brew();
+            let e = brew_check(&brew_trust(&b), &b.prefix.join("share/pinentry")).unwrap_err();
+            assert!(e.contains("not in a program directory"), "{e}");
+        }
+
+        #[test]
+        fn a_bwss_the_user_cannot_write_never_uses_the_prefix_rule() {
+            let b = brew();
+            chmod(&b.exe, 0o755);
+            let e = brew_check(&brew_trust(&b), &b.prefix.join("bin/pinentry-mac")).unwrap_err();
+            assert!(e.contains("bwss itself") && e.contains("not writable"), "{e}");
+            let unknown = Trust { exe: None, ..brew_trust(&b) };
+            assert!(brew_check(&unknown, &b.prefix.join("bin/pinentry-mac")).unwrap_err().contains("unknown"));
+        }
+
+        #[test]
+        fn no_prefix_in_or_above_home_is_trusted() {
+            let b = brew();
+            // `cargo install`: ~/.cargo/bin/bwss and a pinentry beside it.
+            let cargo = b.home.join(".cargo/bin");
+            std::fs::create_dir_all(&cargo).unwrap();
+            for name in ["bwss", "pinentry"] {
+                std::fs::write(cargo.join(name), "#!/bin/sh\n").unwrap();
+                chmod(&cargo.join(name), 0o757);
+            }
+            let t = Trust { exe: Some(cargo.join("bwss")), ..brew_trust(&b) };
+            let e = brew_check(&t, &cargo.join("pinentry")).unwrap_err();
+            assert!(e.contains("inside your home"), "{e}");
+
+            let at_home = Trust { home: Some(b.prefix.clone()), ..brew_trust(&b) };
+            assert!(brew_check(&at_home, &b.prefix.join("bin/pinentry-mac")).unwrap_err().contains("is your home"));
+            let above = Trust { home: Some(b.prefix.join("users/me")), ..brew_trust(&b) };
+            assert!(brew_check(&above, &b.prefix.join("bin/pinentry-mac")).unwrap_err().contains("contains your home"));
+        }
+
+        #[test]
+        fn the_prefix_is_the_keg_root_or_the_grandparent() {
+            let p = |s: &str| install_prefix(Path::new(s));
+            assert_eq!(p("/opt/homebrew/Cellar/bwss/1.0/bin/bwss"), Some(PathBuf::from("/opt/homebrew")));
+            assert_eq!(
+                p("/home/linuxbrew/.linuxbrew/Cellar/bwss/1/bin/bwss"),
+                Some(PathBuf::from("/home/linuxbrew/.linuxbrew"))
+            );
+            assert_eq!(p("/usr/local/bin/bwss"), Some(PathBuf::from("/usr/local")));
+            assert_eq!(p("/bin/bwss"), Some(PathBuf::from("/")));
+            assert_eq!(p("/bwss"), None);
+
+            let home = Some(Path::new("/home/me"));
+            assert!(prefix_problem(Path::new("/"), home).unwrap().contains("`/`"));
+            assert!(prefix_problem(Path::new("/opt/homebrew"), None).unwrap().contains("home"));
+            assert_eq!(prefix_problem(Path::new("/home/linuxbrew/.linuxbrew"), home), None);
+            assert_eq!(prefix_problem(Path::new("/opt/homebrew"), home), None);
+
+            let prefix = Path::new("/opt/homebrew");
+            for ok in ["bin/x", "sbin/x", "opt/pe/bin/x", "Cellar/pe/1.0/bin/x"] {
+                assert!(in_prefix_bin(prefix, &prefix.join(ok)), "{ok}");
+            }
+            for no in ["x", "share/x", "bin/sub/x", "opt/bin/x", "Cellar/pe/bin/x", "lib/pe/bin/x"] {
+                assert!(!in_prefix_bin(prefix, &prefix.join(no)), "{no}");
+            }
+            assert!(!in_prefix_bin(prefix, Path::new("/usr/bin/x")));
         }
 
         #[test]
@@ -1089,11 +1262,23 @@ mod tests {
         }
 
         #[test]
-        fn the_system_trust_uses_this_user_and_prefix() {
+        fn a_sticky_directory_shields_only_others_entries_in_others_directories() {
+            let me = User { uid: 1000, groups: Some(vec![]) };
+            assert!(sticky_shields(0o1777, 0, 0, &me), "/tmp/<root's dir>");
+            assert!(!sticky_shields(0o1777, 0, 1000, &me), "our own entry");
+            assert!(!sticky_shields(0o1777, 1000, 0, &me), "our own sticky directory");
+            assert!(!sticky_shields(0o0777, 0, 0, &me), "not sticky");
+            assert!(!sticky_shields(0o1775, 0, 0, &me), "sticky but not world-writable");
+            assert!(!sticky_shields(0o1777, 0, 0, &User { uid: 0, groups: None }), "root");
+        }
+
+        #[test]
+        fn the_system_trust_uses_this_user_exe_and_home() {
             let t = Trust::system().unwrap();
             assert_eq!(t.user, User::current().unwrap());
-            let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
-            assert_eq!(t.prefix.as_deref(), exe.parent().and_then(Path::parent));
+            assert_eq!(t.exe, Some(std::env::current_exe().unwrap().canonicalize().unwrap()));
+            let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| h.canonicalize().ok());
+            assert_eq!(t.home, home);
         }
 
         #[test]

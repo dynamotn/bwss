@@ -13,8 +13,8 @@ lock_timeout_minutes = 60        # lock after this long without use (0 = never)
 sync_interval_seconds = 300      # pull changes from Bitwarden this often
 # The program that asks for the master password: pinentry-gnome3,
 # pinentry-qt, pinentry-gtk-2, ... Neither it (links followed) nor any
-# directory above it may be writable by you, unless it is installed under
-# the same prefix as bwss (Homebrew); otherwise bwss refuses to start.
+# directory above it may be writable by you, unless bwss and it come from
+# the same Homebrew prefix; otherwise bwss refuses to start.
 pinentry = "pinentry"
 
 [profiles.personal]

@@ -720,14 +720,26 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
     accepted, and the daemon logs which rule accepted it, when either
     - neither the program nor any directory above it, up to `/`, is
       writable by the user (owned by them, writable by a group they are in
-      or by anyone). A sticky directory such as `/tmp` counts only when
-      the user owns the entry below it. Checking every ancestor is stricter
-      than the ADR (controller ruling R14); or
-    - it lies under bwss's own installation prefix: the grandparent of
-      bwss's resolved executable (`/opt/homebrew` for
-      `/opt/homebrew/bin/bwss`, `/usr` for `/usr/bin/bwss`; never `/`).
-      This is the Homebrew case: whoever can write that prefix can replace
-      bwss itself.
+      or by anyone). A sticky, world-writable directory such as `/tmp`
+      does not count when it is owned by someone else and the entry below
+      it is not the user's either. Checking every ancestor is stricter than
+      the ADR (controller ruling R14); or
+    - the install-prefix rule (the Homebrew case; controller ruling R15,
+      stricter than the ADR) applies, which needs all of:
+      - bwss's own resolved executable is writable by the user, so a
+        pinentry beside it adds nothing an attacker could not already do
+        by replacing bwss (a root-owned `/usr/bin/bwss` never needs this
+        rule);
+      - the prefix is the parent of a `Cellar` directory in that path (a
+        Homebrew keg: `/opt/homebrew` for
+        `/opt/homebrew/Cellar/bwss/1.0/bin/bwss`), otherwise the
+        executable's grandparent;
+      - the prefix is not `/`, not `$HOME`, not above `$HOME` and not
+        inside it (so `~/.cargo`, `~/.local` and `~/bin` never qualify);
+      - the pinentry lies in `<prefix>/bin`, `<prefix>/sbin`,
+        `<prefix>/opt/*/bin` or `<prefix>/Cellar/*/*/bin`.
+
+      The refusal names the condition that failed.
 
     Otherwise the daemon refuses to start. The rule is checked again right
     before every pinentry start, which is refused if it no longer holds.
