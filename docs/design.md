@@ -1,6 +1,6 @@
 # bwss — redesign
 
-This design follows the **dybw data model, version 1.1**
+This design follows the **dybw data model, version 1.3**
 (`docs/data-model.md` in the dybw umbrella repository). That spec is
 normative and wins over this document; this document adds the `bwss`
 namespace's own rules (its fields are registered in dybw's
@@ -89,11 +89,11 @@ These would make it a failure even if every test passed:
 | `bwss:id` | text | The marker and the item's stable id. bwss generates a UUID (32 hex digits) for items it creates; the user may type any value on items they mark. |
 | `bwss:password` | hidden | Holds the secret when the field is present, even empty. New items keep their secret here. |
 | `bwss:label` | text | The Secret Service label, when present. Label edits go here. |
-| `bwss:attr:<name>` | text | One lookup attribute each. |
+| `bwss:attr:<name>` | text | One lookup attribute each: a common field of the data model (spec §3.4), matched exactly in the `bwss` namespace only. |
 | `bwss:collection` | text | Collection id; absent means `login` (alias `default`). |
 | `bwss:content-type` | text | Content type of the secret; absent means `text/plain`. |
 | `bwss:encoding` | text | `base64` when the stored secret is base64 of non-UTF-8 bytes. Valid only with a source bwss owns: `bwss:password`, or the notes with `bwss:location=notes`. |
-| `bwss:location` | text | `notes` when bwss itself moved an oversize secret into the notes (§5.2). |
+| `bwss:location` | text | `notes` when bwss itself moved an oversize secret into the notes (§5.2). Only that value is a mark: an empty or blank value counts as absent (spec §6.4, ADR 0010). |
 | `bwss:acl` | hidden | Executables allowed without asking, one path per line. |
 | `bwss:created` | text | Unix seconds when the item joined the keyring. |
 
@@ -248,6 +248,11 @@ else passes through unchanged.
   - otherwise the write fails with an error: bwss never overwrites notes
     the user wrote.
   - Above 10,000 the write fails.
+- **Stale copy** (spec §6.4, ADR 0010): when a write puts a value into
+  `bwss:password` and it fits, while the notes carry
+  `bwss:location=notes`, bwss clears the notes and removes
+  `bwss:location` in the same write, because they hold an older copy of
+  its secret.
 
 ### 5.3 Changing the label or attributes
 
@@ -969,6 +974,18 @@ written; in bwss's terms:
   `viewPassword: false` are skipped.
 - `bwss:acl` on an organization item grants nothing without a local
   confirmation.
+- **A binding is pull-only until the user confirms a write** (spec §9,
+  ADR 0009). This holds for a binding made by a silent pull and for one
+  made by a confirmed claim.
+- **The first write of a local value into an organization item needs a
+  pinentry confirmation** that names the organization (its name from the
+  sync profile, or its id). The app's write waits for the answer and
+  fails when the user declines. The confirmation belongs to one cipher
+  and is stored in that id's entry of the device-local base; a different
+  cipher, for example after a new claim, starts without one.
+- `CreateItem(replace=true)` never writes into an organization item
+  without that confirmation (TM-004). An item with `edit: false` is
+  reported as not uploaded and never asked about.
 
 ## 13. Architecture
 

@@ -134,8 +134,10 @@ fn read_marked(
     };
 
     let location = field(F_LOCATION)?;
-    let in_notes = match location.as_deref().map(String::as_str) {
-        None => false,
+    // Only the value `notes` is a mark; an empty or blank one counts as
+    // absent (spec §5, §6.4, ADR 0010).
+    let in_notes = match location.as_deref().map(|l| l.trim()) {
+        None | Some("") => false,
         Some("notes") => true,
         Some(_) => return Ok(Scan::Skipped(format!("{cipher_id}: unknown {F_LOCATION}"))),
     };
@@ -454,9 +456,12 @@ mod tests {
         // "bwss:id" present but blank after trim -> Unmarked
         let c = login(&k, &[f("bwss:id", "  ")], Some("pw"), None);
         assert!(matches!(scan(&c, &k), Scan::Unmarked));
-        // empty bwss:location -> Skipped
-        let c = login(&k, &[id.clone(), f("bwss:location", "")], Some("pw"), None);
-        assert!(matches!(scan(&c, &k), Scan::Skipped(_)));
+        // empty or blank bwss:location counts as absent (ADR 0010)
+        for blank in ["", "  ", "\t\n"] {
+            let c = login(&k, &[id.clone(), f("bwss:location", blank)], Some("pw"), Some("mine"));
+            let m = marked(scan(&c, &k));
+            assert_eq!((m.source, m.item.secret.as_slice()), (ValueSource::LoginPassword, b"pw".as_slice()));
+        }
         // undecryptable field names -> Uninspectable
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
         c["fields"][0]["name"] = json!("2.bad|bad|bad");

@@ -189,14 +189,20 @@ fn now_rfc3339() -> String {
 /// and the notes are empty or already bwss's (design §5.2).
 fn write_owned_field(body: &mut Map<String, Value>, fields: &mut Fields, stored: &str) -> Result<(), WriteError> {
     let enc = fields.key.encrypt_str(stored);
+    let bwss_notes = fields.value(F_LOCATION)?.is_some_and(|l| l.as_str() == "notes");
     if enc.len() <= MAX_FIELD_ENC {
         fields.set_enc(F_PASSWORD, enc, true);
+        // The notes held an older copy of the secret (spec §6.4, ADR 0010):
+        // clear it and its mark in the same write.
+        if bwss_notes {
+            body.insert("notes".into(), Value::Null);
+            fields.remove_all(F_LOCATION);
+        }
         return Ok(());
     }
     if enc.len() > MAX_NOTES_ENC {
         return Err(WriteError::TooLarge);
     }
-    let bwss_notes = fields.value(F_LOCATION)?.is_some_and(|l| l.as_str() == "notes");
     let notes_empty = match body.get("notes").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => fields.key.decrypt_str(s)?.is_empty(),
         _ => true,
@@ -842,6 +848,32 @@ mod tests {
 
         let c = note(&k, &[("bwss:id", "x", false)], Some("body"));
         assert!(matches!(apply(&c, &set_secret(&c, &k, &[b'x'; 8_000]), &k), Err(WriteError::TooLarge)));
+    }
+
+    #[test]
+    fn a_fitting_value_clears_the_stale_notes_copy() {
+        let k = keys();
+        let small = b"short".to_vec();
+        let pw = ("bwss:password", "old", true);
+        let id = ("bwss:id", "x", false);
+
+        // fits, notes marked as bwss's: notes cleared, location removed, same write
+        let c = login(&k, &[id, pw, ("bwss:location", "notes", false)], None, Some("stale copy"));
+        let body = apply(&c, &set_secret(&c, &k, &small), &k).unwrap();
+        assert!(body["notes"].is_null());
+        assert_eq!(names(&body, &k.user), ["bwss:id", "bwss:password"]);
+        assert_eq!(field(&body, &k.user, "bwss:password"), Some(("short".into(), 1)));
+
+        // fits, notes hold something else, location is blank or absent: nothing cleared
+        for loc in ["", "  "] {
+            let c = login(&k, &[id, pw, ("bwss:location", loc, false)], None, Some("mine"));
+            let body = apply(&c, &set_secret(&c, &k, &small), &k).unwrap();
+            assert_eq!(dec_with(&k.user, &body["notes"]), "mine", "location {loc:?}");
+            assert_eq!(field(&body, &k.user, "bwss:location"), Some((loc.into(), 0)), "location {loc:?}");
+        }
+        let c = login(&k, &[id, pw], None, Some("mine"));
+        let body = apply(&c, &set_secret(&c, &k, &small), &k).unwrap();
+        assert_eq!(dec_with(&k.user, &body["notes"]), "mine");
     }
 
     #[test]
