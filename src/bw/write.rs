@@ -916,7 +916,7 @@ mod tests {
 
         // value source changed on the server (mark differs)
         let mut fresh = c.clone();
-        fresh["login"]["password"] = json!(k.user.encrypt_str("pw"));
+        fresh["login"]["password"] = json!(k.user.encrypt_str("theirs"));
         assert!(matches!(apply(&fresh, &p, &k), Err(WriteError::Conflict)));
         // a bwss:password appeared: the source itself changed
         let mut fresh = c.clone();
@@ -958,6 +958,37 @@ mod tests {
         assert_eq!(body["fields"][1], fresh["fields"][1]);
         assert_eq!(body["name"], fresh["name"]);
         assert_eq!(dec_with(&k.user, &body["login"]["password"]), "new");
+    }
+
+    #[test]
+    fn a_value_re_encrypted_elsewhere_is_not_a_conflict() {
+        // Official clients re-encrypt every EncString with a fresh IV on any
+        // save: renaming the item must not look like a new password.
+        let k = keys();
+        for c in [
+            login(&k, &[("bwss:id", "x", false)], Some("pw"), None),
+            login(&k, &[("bwss:id", "x", false), ("bwss:password", "pw", true)], None, None),
+            note(&k, &[("bwss:id", "x", false)], Some("body")),
+        ] {
+            let p = set_secret(&c, &k, b"new");
+            let mut fresh = c.clone();
+            fresh["name"] = json!(k.user.encrypt_str("Renamed"));
+            if c["type"] == 2 {
+                fresh["notes"] = json!(k.user.encrypt_str("body"));
+            } else if c["login"]["password"].is_string() {
+                fresh["login"]["password"] = json!(k.user.encrypt_str("pw"));
+            } else {
+                fresh["fields"][1]["value"] = json!(k.user.encrypt_str("pw"));
+            }
+            assert_ne!(fresh, c);
+            assert!(apply(&fresh, &p, &k).is_ok());
+        }
+        // A different value is still a conflict.
+        let c = login(&k, &[("bwss:id", "x", false)], Some("pw"), None);
+        let mut fresh = c.clone();
+        fresh["name"] = json!(k.user.encrypt_str("Renamed"));
+        fresh["login"]["password"] = json!(k.user.encrypt_str("theirs"));
+        assert!(matches!(apply(&fresh, &set_secret(&c, &k, b"new"), &k), Err(WriteError::Conflict)));
     }
 
     #[test]

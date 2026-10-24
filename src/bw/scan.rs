@@ -41,7 +41,8 @@ pub struct MarkedItem {
     pub creation_date: Option<u64>,
     pub organization: bool,
     pub source: ValueSource,
-    /// Mark of the stored value at `source`.
+    /// Mark of the stored text at `source`: decrypted, before any base64
+    /// decoding, so a client re-encrypting the same value keeps the mark.
     pub mark: [u8; 32],
     /// `id` is the trimmed `bwss:id`, raw.
     pub item: ItemData,
@@ -171,7 +172,9 @@ fn read_marked(
     } else {
         Zeroizing::new(text.as_bytes().to_vec())
     };
-    let mark = value_mark(&keys.mark, stored);
+    // Over the decrypted text, never the ciphertext: official clients
+    // re-encrypt every value with a fresh IV on any save.
+    let mark = value_mark(&keys.mark, &text);
 
     // Derived attributes and the item name.
     let name = dec_opt(str_at(cipher, "/name"), key)?;
@@ -335,8 +338,8 @@ mod tests {
         let c = note(&k, &[f("bwss:id", "x"), f("bwss:encoding", "base64"), f("bwss:password", "AAE=")], None);
         let s = marked(scan(&c, &k));
         assert_eq!(s.item.secret.as_slice(), &[0u8, 1][..]);
-        // the mark follows the stored text
-        assert_eq!(s.mark, value_mark(&k.mark, c["fields"][2]["value"].as_str().unwrap()));
+        // the mark follows the stored text, decrypted but not decoded
+        assert_eq!(s.mark, value_mark(&k.mark, "AAE="));
     }
 
     #[test]

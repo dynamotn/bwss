@@ -99,8 +99,9 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-/// A mark of `stored` (an encrypted string as kept in the vault): HMAC-SHA256
-/// under the MAC half of `mark_key`. Equal marks mean the stored text is unchanged.
+/// A mark of `stored` (a value's decrypted text as kept in the vault, before
+/// any base64 decoding): HMAC-SHA256 under the MAC half of `mark_key`. Equal
+/// marks mean the stored text is unchanged, whatever IV it was encrypted with.
 pub fn value_mark(mark_key: &SymmetricKey, stored: &str) -> [u8; 32] {
     hmac(&mark_key.mac, &[stored.as_bytes()])
 }

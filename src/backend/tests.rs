@@ -471,6 +471,37 @@ async fn offline_writes_queue_merge_and_replay() {
     assert_eq!(v.queued().await, 0);
 }
 
+#[tokio::test]
+async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    v.fake.with(|s| s.down = true);
+    let mut item = v.item_offline("gh").await;
+    item.secret = Zeroizing::new(b"queued".to_vec());
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queued().await, 1);
+
+    // Another client renames the item; saving re-encrypts every value with
+    // a fresh IV, the unchanged password included.
+    let (name, pw) = (k.encrypt_str("Renamed"), k.encrypt_str("pw"));
+    v.fake.with(|s| {
+        s.down = false;
+        s.rev += 1;
+        let rev = s.revision();
+        let c = s.find("c1").unwrap();
+        assert_ne!(c["login"]["password"], json!(pw));
+        c["name"] = json!(name);
+        c["login"]["password"] = json!(pw);
+        c["revisionDate"] = json!(rev);
+    });
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    let c = v.fake.cipher("c1");
+    assert_eq!(v.dec(&c["login"]["password"]), "queued");
+    assert_eq!(v.dec(&c["name"]), "Renamed");
+}
+
 impl Vault {
     /// The item as the backend shows it, without a refresh.
     async fn item_offline(&self, id: &str) -> ItemData {
