@@ -128,6 +128,34 @@ def test_the_file_cannot_turn_the_acl_off():
     d.stop()
 
 
+def test_the_file_cannot_put_derived_attributes_in_the_locked_index():
+    d = Daemon({"backend": "memory", "index_derived_attributes": True})
+    r = run_daemon(d)
+    assert r.returncode != 0
+    assert "`index_derived_attributes` in [bwss]" in r.stderr and "bwss index derived on" in r.stderr, r.stderr
+
+
+def test_derived_attributes_in_the_index_need_a_confirmation_on_a_terminal():
+    d = Daemon({"backend": "memory"})
+    flag = d.state / "tools" / "bwss" / "index-derived"
+    r = d.cli("index", "derived", "on", input="yes\n", check=False)
+    assert r.returncode != 0 and "terminal" in r.stderr, r.stderr
+    assert not flag.exists()
+
+    code, _, shown = on_terminal(d, "index", "derived", "on", answer="no")
+    assert code != 0 and "usernames and URIs" in shown and "guessable offline from ~/.cache" in shown, shown
+    assert str(d.home / "cache" / "bwss" / "locked-index.json") in shown.replace("\r\n", "\n").replace("\n", "")
+    assert not flag.exists()
+
+    code, out, _ = on_terminal(d, "index", "derived", "on", answer="yes")
+    assert code == 0 and "in the locked index on this device" in out, out
+    assert flag.exists() and mode(flag) == 0o600
+
+    # Off needs no question.
+    assert "out of the locked index" in d.cli("index", "derived", "off").stdout
+    assert not flag.exists()
+
+
 def test_unknown_keys_stop_the_daemon():
     d = Daemon({"backend": "memory"}, top={"idle_lock_minutes": 5})
     r = run_daemon(d)

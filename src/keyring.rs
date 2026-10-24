@@ -5,6 +5,8 @@
 //! locked), a *locked index* of salted attribute hashes is kept on disk, the
 //! same trade-off gnome-keyring makes: it reveals which items exist and lets
 //! someone with the file test guesses of attribute values, never secrets.
+//! Derived attributes (item name, username, URI, id) are left out unless
+//! this device opted in (design §7).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,10 +15,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::bw::fields::DERIVED;
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, now};
 
-/// Version of the locked index file; an index without it is not read.
-const INDEX_FORMAT: u64 = 2;
+/// Version of the locked index file; an index of another version is not
+/// read. Format 2 mixed derived attributes in with the others.
+const INDEX_FORMAT: u64 = 3;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LockedIndexFile {
@@ -37,7 +41,11 @@ struct IndexedCollection {
 struct IndexedItem {
     id: String,
     collection: String,
+    /// Hashes of the attributes the app set.
     attrs: BTreeSet<String>,
+    /// Hashes of the derived attributes, only when this device opted in.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    derived: BTreeSet<String>,
 }
 
 /// What changed when a new snapshot replaced the old one.
@@ -61,6 +69,10 @@ pub struct Keyring {
     /// `index.salt`, decoded once when the index is loaded.
     salt: [u8; 32],
     index_path: Option<PathBuf>,
+    /// The device flag that puts derived attributes in the index.
+    derived_flag: Option<PathBuf>,
+    /// Whether the flag was set at start or at the last index write.
+    index_derived: bool,
 }
 
 fn builtin_collections() -> BTreeMap<String, CollectionData> {
@@ -78,19 +90,35 @@ fn builtin_collections() -> BTreeMap<String, CollectionData> {
 }
 
 impl Keyring {
-    pub fn new(index_path: Option<PathBuf>) -> Self {
+    /// The keyring, locked, with the index kept in `index_path`. Derived
+    /// attributes go in the index while the file `derived_flag` exists; it
+    /// is read now and at every index write.
+    pub fn new(index_path: Option<PathBuf>, derived_flag: Option<PathBuf>) -> Self {
+        let index_derived = derived_flag.as_deref().is_some_and(crate::config::flag_set);
         let decode = |i: &LockedIndexFile| <[u8; 32]>::try_from(B64.decode(&i.salt).ok()?).ok();
-        let stored = index_path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice::<LockedIndexFile>(&b).ok())
+        let bytes = index_path.as_ref().and_then(|p| std::fs::read(p).ok());
+        let stored = bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<LockedIndexFile>(b).ok())
             .filter(|i| i.format == INDEX_FORMAT)
             .and_then(|i| decode(&i).map(|salt| (i, salt)));
-        let (index, salt) = stored.unwrap_or_else(|| {
+        // An index that cannot be used, or holds derived attributes this
+        // device no longer wants, leaves the disk now, not at the next unlock.
+        let mut rewrite = bytes.is_some() && stored.is_none();
+        let (mut index, salt) = stored.unwrap_or_else(|| {
             let mut salt = [0u8; 32];
             rand::fill(&mut salt);
             (LockedIndexFile { format: INDEX_FORMAT, salt: B64.encode(salt), ..Default::default() }, salt)
         });
+        if !index_derived {
+            for item in index.items.iter_mut().filter(|i| !i.derived.is_empty()) {
+                item.derived.clear();
+                rewrite = true;
+            }
+        }
+        if rewrite && let Some(path) = &index_path {
+            write_index(path, &index);
+        }
         let mut collections = builtin_collections();
         for c in &index.collections {
             collections.entry(c.id.clone()).or_insert_with(|| CollectionData {
@@ -100,7 +128,16 @@ impl Keyring {
                 modified: 0,
             });
         }
-        Keyring { unlocked: false, collections, items: BTreeMap::new(), index, salt, index_path }
+        Keyring {
+            unlocked: false,
+            collections,
+            items: BTreeMap::new(),
+            index,
+            salt,
+            index_path,
+            derived_flag,
+            index_derived,
+        }
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -166,7 +203,10 @@ impl Keyring {
         }
         if !self.unlocked {
             let wanted: BTreeSet<String> = query.iter().map(|(k, v)| self.hash_attr(k, v)).collect();
-            for e in self.index.items.iter().filter(|e| in_scope(&e.collection) && wanted.is_subset(&e.attrs)) {
+            let indexed =
+                |e: &IndexedItem, h: &String| e.attrs.contains(h) || (self.index_derived && e.derived.contains(h));
+            for e in self.index.items.iter().filter(|e| in_scope(&e.collection) && wanted.iter().all(|h| indexed(e, h)))
+            {
                 locked.push((e.collection.clone(), e.id.clone()));
             }
         }
@@ -273,14 +313,24 @@ impl Keyring {
         if !self.unlocked {
             return;
         }
+        self.index_derived = self.derived_flag.as_deref().is_some_and(crate::config::flag_set);
         let items = self
             .items
             .values()
             .filter(|i| i.collection != SESSION_COLLECTION)
-            .map(|i| IndexedItem {
-                id: i.id.clone(),
-                collection: i.collection.clone(),
-                attrs: i.attributes.iter().map(|(k, v)| self.hash_attr(k, v)).collect(),
+            .map(|i| {
+                let (derived, own): (Vec<_>, Vec<_>) =
+                    i.attributes.iter().partition(|(k, _)| DERIVED.contains(&k.as_str()));
+                IndexedItem {
+                    id: i.id.clone(),
+                    collection: i.collection.clone(),
+                    attrs: own.into_iter().map(|(k, v)| self.hash_attr(k, v)).collect(),
+                    derived: if self.index_derived {
+                        derived.into_iter().map(|(k, v)| self.hash_attr(k, v)).collect()
+                    } else {
+                        BTreeSet::new()
+                    },
+                }
             })
             .collect();
         let collections = self
@@ -291,11 +341,15 @@ impl Keyring {
             .collect();
         self.index.items = items;
         self.index.collections = collections;
-        if let Some(path) = &self.index_path
-            && let Err(e) = crate::fsutil::write_json_private(path, &self.index)
-        {
-            tracing::warn!("could not save the locked index: {e}");
+        if let Some(path) = &self.index_path {
+            write_index(path, &self.index);
         }
+    }
+}
+
+fn write_index(path: &std::path::Path, index: &LockedIndexFile) {
+    if let Err(e) = crate::fsutil::write_json_private(path, index) {
+        tracing::warn!("could not save the locked index: {e}");
     }
 }
 
@@ -327,7 +381,7 @@ mod tests {
     fn search_unlocked_and_locked_through_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
-        let mut k = Keyring::new(Some(path.clone()));
+        let mut k = Keyring::new(Some(path.clone()), None);
         k.load(Snapshot {
             collections: vec![],
             items: vec![
@@ -340,7 +394,7 @@ mod tests {
         assert!(k.item("a").is_none());
 
         // A fresh daemon (restart) still finds locked items, but never the secret.
-        let k2 = Keyring::new(Some(path.clone()));
+        let k2 = Keyring::new(Some(path.clone()), None);
         let (unlocked, locked) = k2.search(&q(&[("service", "gh")]), None);
         assert!(unlocked.is_empty());
         assert_eq!(locked, vec![("login".into(), "a".into())]);
@@ -350,30 +404,110 @@ mod tests {
         assert!(!text.contains("\"gh\"") && !text.contains("\"me\""));
     }
 
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn index_without_format_2_is_ignored_and_rebuilt() {
+    fn an_index_of_another_format_is_ignored_and_replaced_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
-        let mut k = Keyring::new(Some(path.clone()));
+        let mut k = Keyring::new(Some(path.clone()), None);
         k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
-        let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["format"], 2);
-        assert_eq!(Keyring::new(Some(path.clone())).search(&q(&[("service", "gh")]), None).1.len(), 1);
+        let mut saved = read_json(&path);
+        assert_eq!(saved["format"], 3);
+        assert_eq!(Keyring::new(Some(path.clone()), None).search(&q(&[("service", "gh")]), None).1.len(), 1);
 
-        // The same index as an older version wrote it is not read.
-        saved.as_object_mut().unwrap().remove("format");
-        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
-        let mut old = Keyring::new(Some(path.clone()));
-        assert!(old.search(&q(&[("service", "gh")]), None).1.is_empty());
-        assert_ne!(old.index.salt, saved["salt"].as_str().unwrap());
-        old.load(Snapshot::default());
-        let rebuilt: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(rebuilt["format"], 2);
+        // Format 2 mixed derived attributes in: it is not read, and it
+        // leaves the disk when the daemon starts, not at the next unlock.
+        for older in [Some(2), None] {
+            match older {
+                Some(f) => saved["format"] = f.into(),
+                None => drop(saved.as_object_mut().unwrap().remove("format")),
+            }
+            std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            let old = Keyring::new(Some(path.clone()), None);
+            assert!(old.search(&q(&[("service", "gh")]), None).1.is_empty());
+            assert_ne!(old.index.salt, saved["salt"].as_str().unwrap());
+            let replaced = read_json(&path);
+            assert_eq!(replaced["format"], 3);
+            assert_eq!(replaced["salt"].as_str().unwrap(), old.index.salt);
+            assert_eq!(replaced["items"], serde_json::json!([]));
+        }
+    }
+
+    const DERIVED: [(&str, &str); 4] =
+        [("bwss:id", "a"), ("bwss:name", "GitHub"), ("bwss:username", "me"), ("bwss:uri", "https://github.com")];
+
+    fn derived_item() -> ItemData {
+        let mut attrs = vec![("service", "gh")];
+        attrs.extend(DERIVED);
+        item("a", "login", &attrs)
+    }
+
+    /// How many attribute hashes the index file holds for its only item.
+    fn hashes_on_disk(path: &std::path::Path) -> usize {
+        let saved = read_json(path);
+        let item = &saved["items"][0];
+        ["attrs", "derived"].iter().map(|k| item[k].as_array().map_or(0, Vec::len)).sum()
+    }
+
+    #[test]
+    fn derived_attributes_stay_out_of_the_locked_index_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let flag = dir.path().join("index-derived");
+        let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        // Unlocked, the item is still found by its derived attributes.
+        assert_eq!(k.search(&q(&[("bwss:name", "GitHub")]), None).0.len(), 1);
+        k.lock();
+        assert_eq!(hashes_on_disk(&path), 1, "only the attribute the app set");
+
+        let restarted = Keyring::new(Some(path.clone()), Some(flag));
+        assert_eq!(restarted.search(&q(&[("service", "gh")]), None).1, vec![("login".into(), "a".into())]);
+        for (name, value) in DERIVED {
+            assert!(restarted.search(&q(&[(name, value)]), None).1.is_empty(), "{name}");
+            assert!(restarted.search(&q(&[("service", "gh"), (name, value)]), None).1.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_device_flag_indexes_derived_attributes_until_it_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let flag = dir.path().join("index-derived");
+        std::fs::write(&flag, "on\n").unwrap();
+        let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        assert_eq!(hashes_on_disk(&path), 5);
+        k.lock();
+        let on = Keyring::new(Some(path.clone()), Some(flag.clone()));
+        for (name, value) in DERIVED {
+            assert_eq!(on.search(&q(&[("service", "gh"), (name, value)]), None).1.len(), 1, "{name}");
+        }
+
+        // Turned off while the daemon runs: the next index write drops them.
+        std::fs::remove_file(&flag).unwrap();
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        assert_eq!(hashes_on_disk(&path), 1);
+        k.lock();
+        assert!(k.search(&q(&[("bwss:name", "GitHub")]), None).1.is_empty());
+
+        // Turned off while it was stopped: they leave the disk at start.
+        std::fs::write(&flag, "on\n").unwrap();
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        assert_eq!(hashes_on_disk(&path), 5);
+        std::fs::remove_file(&flag).unwrap();
+        let off = Keyring::new(Some(path.clone()), Some(flag));
+        assert_eq!(hashes_on_disk(&path), 1);
+        assert!(off.search(&q(&[("bwss:name", "GitHub")]), None).1.is_empty());
+        assert_eq!(off.search(&q(&[("service", "gh")]), None).1.len(), 1, "the rest of the index is kept");
     }
 
     #[test]
     fn diff_after_refresh() {
-        let mut k = Keyring::new(None);
+        let mut k = Keyring::new(None, None);
         k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[]), item("b", "login", &[])] });
         let mut changed = item("a", "login", &[]);
         changed.label = "renamed".into();
@@ -385,7 +519,7 @@ mod tests {
 
     #[test]
     fn session_collection_is_never_locked_or_persisted() {
-        let mut k = Keyring::new(None);
+        let mut k = Keyring::new(None, None);
         k.upsert(item("tmp", SESSION_COLLECTION, &[("k", "v")]));
         k.lock();
         assert!(!k.item_locked("tmp"));
@@ -396,7 +530,7 @@ mod tests {
 
     #[test]
     fn upsert_after_lock_keeps_nothing() {
-        let mut k = Keyring::new(None);
+        let mut k = Keyring::new(None, None);
         k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[])] });
         k.lock();
         assert!(!k.upsert(item("late", "login", &[("k", "v")])));

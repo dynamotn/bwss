@@ -82,7 +82,12 @@ enum Command {
     /// Turn per-application access control off or on, on this device.
     Acl {
         #[arg(value_enum)]
-        mode: AclSwitch,
+        mode: Switch,
+    },
+    /// Choose what the locked index holds on this device.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     /// Manage the configuration.
     Config {
@@ -92,9 +97,19 @@ enum Command {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum AclSwitch {
+enum Switch {
     Off,
     On,
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Put the derived attributes (bwss:id, bwss:name, bwss:username,
+    /// bwss:uri) in the locked index, or take them out (the default).
+    Derived {
+        #[arg(value_enum)]
+        mode: Switch,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +121,17 @@ enum ConfigCommand {
 const ACL_OFF_QUESTION: &str = "Turn off per-application access control on this device?\n\
     Every program running as you could then use every keyring item without being asked.\n\
     Type \"yes\" to turn it off: ";
+
+/// The question before derived attributes go in the locked index at `index`.
+fn index_derived_question(index: &std::path::Path) -> String {
+    format!(
+        "Put derived attributes (bwss:id, bwss:name, bwss:username, bwss:uri) in the locked index on this device?\n\
+         Item names, usernames and URIs then become guessable offline from ~/.cache: anyone who can read\n\
+         {} can test guesses of them without the master password.\n\
+         Type \"yes\" to turn it on: ",
+        index.display()
+    )
+}
 
 /// Asks `question` on the terminal; only "yes" confirms.
 fn confirm(question: &str, tty: bool, input: &mut dyn BufRead, out: &mut dyn Write) -> anyhow::Result<bool> {
@@ -251,7 +277,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
             let creds = config::load_credentials(&paths.credentials(profile), &trust.user, &origin)?;
             let b = BitwardenBackend::new(&config, creds, &paths)?;
-            (Arc::new(b), Some(paths.cache.join("locked-index.json")))
+            (Arc::new(b), Some(paths.locked_index()))
         }
     };
     // The pinentry is checked again right before every start (ADR 0008).
@@ -263,7 +289,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             guard.verify(std::path::Path::new(program)).map(|_| ()).map_err(|e| format!("{e:#}"))
         }),
     );
-    let daemon = Daemon::new(Keyring::new(index), backend, prompter, config.clone());
+    let daemon = Daemon::new(Keyring::new(index, Some(paths.index_derived())), backend, prompter, config.clone());
     daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
 
     let conn = zbus::connection::Builder::session().build().await?;
@@ -375,7 +401,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Acl { mode } => {
             let paths = Paths::from_env();
-            let off = matches!(mode, AclSwitch::Off);
+            let off = matches!(mode, Switch::Off);
             if off && !confirm_on_terminal(ACL_OFF_QUESTION)? {
                 bail!("not confirmed; access control stays on");
             }
@@ -383,6 +409,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!(
                 "access control is {} on this device; restart the bwss daemon to apply it",
                 if off { "off" } else { "on" }
+            );
+            Ok(())
+        }
+        Command::Index { command: IndexCommand::Derived { mode } } => {
+            let paths = Paths::from_env();
+            let on = matches!(mode, Switch::On);
+            if on && !confirm_on_terminal(&index_derived_question(&paths.locked_index()))? {
+                bail!("not confirmed; derived attributes stay out of the locked index");
+            }
+            config::set_index_derived(&paths, on).with_context(|| format!("{}", paths.index_derived().display()))?;
+            println!(
+                "derived attributes are {} the locked index on this device from its next write \
+                 (the next unlock or change)",
+                if on { "in" } else { "out of" }
             );
             Ok(())
         }
@@ -432,6 +472,14 @@ mod tests {
         let (refused, said) = ask(false, "yes\n");
         assert!(refused.is_err_and(|e| e.contains("terminal")));
         assert!(said.is_empty(), "nothing is asked without a terminal");
+    }
+
+    #[test]
+    fn turning_derived_attributes_on_says_what_becomes_guessable() {
+        let q = index_derived_question(std::path::Path::new("/home/u/.cache/bwss/locked-index.json"));
+        assert!(q.contains("usernames and URIs") && q.contains("guessable offline"), "{q}");
+        assert!(q.contains("~/.cache") && q.contains("/home/u/.cache/bwss/locked-index.json"), "{q}");
+        assert!(q.ends_with("Type \"yes\" to turn it on: "), "{q}");
     }
 
     #[test]

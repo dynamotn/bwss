@@ -231,13 +231,14 @@ fn ask_text(caller: &str, action: &str, label: &str, kind: CallerKind) -> String
         }
         CallerKind::App | CallerKind::Script => "",
     };
-    let who = crate::acl::describe(caller);
+    // The path comes from the caller's process: it must not add lines.
+    let who = crate::prompter::one_line(&crate::acl::describe(caller));
     format!("{who}\n\nwants to {action} the keyring item\n\n\"{label}\"{why}")
 }
 
 /// The text of the one-time question about a line that synced in.
 fn confirm_line_text(caller: &str, action: &str, label: &str) -> String {
-    let caller = crate::acl::describe(caller);
+    let caller = crate::prompter::one_line(&crate::acl::describe(caller));
     format!(
         "Allow {caller}, granted on another device?\n\nIt wants to {action} the keyring item\n\n\"{label}\"\n\n\
          This is asked once on this device; a denial is remembered."
@@ -1008,7 +1009,7 @@ mod tests {
     async fn failed_interactive_unlocks_take_turns_and_never_hold_the_unlock_gate() {
         // A prompter that cannot start: every interactive unlock fails at once.
         let prompter = Prompter::new("/nonexistent/bwss-test-pinentry", Duration::from_secs(1));
-        let d = Daemon::new(Keyring::new(None), Arc::new(MemoryBackend::new("pw")), prompter, Config::default());
+        let d = Daemon::new(Keyring::new(None, None), Arc::new(MemoryBackend::new("pw")), prompter, Config::default());
         let start = tokio::time::Instant::now();
         let attempts: Vec<_> = (0..2)
             .map(|_| {
@@ -1086,7 +1087,7 @@ mod tests {
             backend.inner.put_item(&item).await.unwrap();
         }
         let prompter = Prompter::new("false", Duration::from_secs(1));
-        let d = Daemon::new(Keyring::new(None), backend.clone(), prompter, Config::default());
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, Config::default());
         d.unlock_with_password("pw").await.unwrap();
         (d, backend)
     }
@@ -1169,7 +1170,7 @@ mod tests {
         };
         backend.put_item(&stored).await.unwrap();
         let prompter = Prompter::new("false", Duration::from_secs(1));
-        let d = Daemon::new(Keyring::new(None), backend, prompter, Config::default());
+        let d = Daemon::new(Keyring::new(None, None), backend, prompter, Config::default());
         d.unlock_with_password("pw").await.unwrap();
 
         let new = NewItem {
@@ -1214,6 +1215,20 @@ mod tests {
             confirm_line_text("/usr/bin/git", "read", "l")
                 .starts_with("Allow /usr/bin/git, granted on another device?")
         );
+    }
+
+    #[test]
+    fn a_caller_path_cannot_add_lines_or_escapes_to_a_prompt() {
+        let evil = "/tmp/x\n\nThis is bwss: \u{1b}[1mallow it\r\u{85}\t";
+        let shown = "/tmp/x\u{fffd}\u{fffd}This is bwss: \u{fffd}[1mallow it\u{fffd}\u{fffd}\u{fffd}";
+        let ask = ask_text(evil, "read", "l", CallerKind::App);
+        assert_eq!(ask, format!("{shown}\n\nwants to read the keyring item\n\n\"l\""));
+        let line = confirm_line_text(evil, "read", "l");
+        assert!(line.starts_with(&format!("Allow {shown}, granted on another device?\n\n")), "{line:?}");
+        // A control character makes the caller unknown, shown as it came.
+        let script = "/usr/bin/python3//tmp/a\nb.py";
+        let text = ask_text(script, "read", "l", crate::acl::kind(script));
+        assert!(text.starts_with("/usr/bin/python3//tmp/a\u{fffd}b.py\n\nwants"), "{text:?}");
     }
 
     /// A memory backend whose ACL lines may come from elsewhere, like Bitwarden's.
@@ -1317,7 +1332,7 @@ mod tests {
         let mut item = stored_item("x");
         item.acl = acl.iter().map(|s| (*s).to_owned()).collect();
         backend.inner.put_item(&item).await.unwrap();
-        let d = Daemon::new(Keyring::new(None), Arc::new(backend), prompter, Config::default());
+        let d = Daemon::new(Keyring::new(None, None), Arc::new(backend), prompter, Config::default());
         d.set_acl_state_path(state.join("acl-confirmed"));
         d.unlock_with_password("pw").await.unwrap();
         d
@@ -1513,7 +1528,7 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new("pw"));
         let pin = ScriptedPinentry::new(false);
         let config = Config { acl: AclMode::Off, ..Config::default() };
-        let d = Daemon::new(Keyring::new(None), backend.clone(), pin.prompter(), config);
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), pin.prompter(), config);
         d.unlock_with_password("pw").await.unwrap();
         backend.put_item(&stored_item("x")).await.unwrap();
         d.keyring.lock().await.upsert(stored_item("x"));

@@ -455,11 +455,36 @@ Unchanged from `legacy`:
   unlock. Without a system bus or without logind, bwss logs a warning and
   goes on (without a session, sleep still locks). The listener is not tied
   to `lock_timeout_minutes`.
-- The locked index (`~/.cache/bwss/locked-index.json`) keeps, per marked
-  item, its id, its collection and SHA-256(salt ‖ name ‖ 0 ‖ value) of each
-  attribute (derived ones included), with a random per-install salt, so
-  libsecret can find and unlock a locked item after a restart. It covers
-  marked items only.
+- The locked index (`~/.cache/bwss/locked-index.json`, `"format": 3`)
+  keeps, per marked item, its id, its collection and
+  SHA-256(salt ‖ name ‖ 0 ‖ value) of each attribute the app set, with a
+  random per-install salt, so libsecret can find and unlock a locked item
+  after a restart. It covers marked items only.
+  - **What it reveals.** Which items exist, in which collection, and the
+    non-derived attributes apps set: the salt sits in the same file, so
+    anyone who can read it can test guesses of those values offline,
+    without the master password (never the secrets). This is accepted
+    because locked lookups must work before the first unlock: libsecret
+    unlocks only the items a search reported as locked. The long-term
+    answer is the `login` protector of dybw ADR 0006 (`pam_bwss`), which
+    unlocks at login, before apps search.
+  - **Derived attributes stay out by default.** `bwss:id`, `bwss:name`,
+    `bwss:username` and `bwss:uri` are the item's name, username, URIs and
+    id, guessable offline from such a file. They are not indexed unless
+    this device opted in with `bwss index derived on` (§10), which keeps
+    them in a separate `derived` list per item. While the keyring is
+    unlocked they match as always. While it is locked, a search that names
+    one of them matches nothing: `SearchItems` returns two empty lists, no
+    unlock prompt appears, and `secret-tool lookup bwss:name …` prints
+    nothing and fails, as for an unknown item. Searching by an attribute
+    the app set (or unlocking first, `bwss unlock`) works.
+  - **When it changes.** The daemon reads the device flag at start and at
+    every index write (unlock, refresh, any change), so turning it on or
+    off takes effect at the latest on the next write. With the flag off, a
+    stored `derived` list is dropped from the file at start. An index of
+    another format (format 2 mixed derived attributes in) is not read: it
+    is replaced at start with an empty one under a new salt, and is
+    rebuilt at the next unlock; until then locked lookups find nothing.
 
 ## 8. Data model and sync
 
@@ -555,9 +580,14 @@ the older behaviour.
 
 **Write queue** (`~/.local/state/bwss/queue.json`, mode 0600). The ordered
 list of ops not yet accepted by the server, sealed as a whole: the file is
-`{ "format": 2, "ops": "<EncString>" }`, one EncString under the user key
-holding every op with its ids, fields, values, marks, cipher ids and
-revision dates. Only `format` is plain. The queue, the cache and the locked
+`{ "format": 2, "ops": "<EncString>" }`, one EncString under the queue key
+(the user key derived for `"queue"`, so nothing else the user key encrypts
+can pass for the queue) holding every op with its ids, fields, values, marks, cipher ids and
+revision dates. Only `format` is plain. A queue sealed with the user key
+itself (bwss before the queue key) is opened with it once at unlock and
+resealed with the queue key at once; one that opens with neither key is
+renamed `queue.json.unsealable`, never deleted, and its ops are not
+replayed. The queue, the cache and the locked
 index are device state (spec §10): they are never synced or copied to
 another device. A queued op is applied to the cache right away, so reads on
 this device see it before the server does.
@@ -732,6 +762,13 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
     synced file or a script without a terminal from turning the ACL off; it
     is a speed bump, not a defence against local malware, which can create
     the file itself.
+  - `index_derived_attributes` in `[bwss]` is an error that names `bwss
+    index derived on`. Putting derived attributes in the locked index (§7)
+    is device state: `bwss index derived on` (asked on the terminal, saying
+    that usernames and URIs become guessable offline from `~/.cache`;
+    refused when stdin is not one) creates
+    `$XDG_STATE_HOME/dybw/tools/bwss/index-derived`, and `bwss index
+    derived off` (no question) removes it.
   - `pinentry` is resolved to an absolute path: a bare name through `PATH`,
     then every symlink (`canonicalize`). bwss runs that resolved path. It is
     accepted, and the daemon logs which rule accepted it, when either
@@ -795,6 +832,7 @@ bwss unlock [--password-stdin]
 bwss lock | sync | status
 bwss login --client-id ID [--client-secret-stdin]
 bwss acl off | on
+bwss index derived on | off
 bwss config migrate
 ```
 
@@ -852,8 +890,9 @@ boundary for `--password-stdin`.
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
 | Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a program the user cannot replace or one under bwss's own prefix (§10); bwss refuses to run as root |
-| Disk | Bitwarden ciphertext only (cache, queue, ACL confirmations); hashed locked index |
-| Server input | KDF bounds, MAC checked before decrypt, error text clipped |
+| Disk | Bitwarden ciphertext only (cache, queue under its own derived key, ACL confirmations); hashed locked index without derived attributes unless this device opted in (§7) |
+| Server input | KDF bounds, MAC checked before decrypt, response bodies capped at 256 MiB while they are read, error text stripped of control characters (ANSI escapes included) and clipped |
+| Prompt text | The caller's path is shown on one line: line breaks and other control characters become U+FFFD |
 
 Notes:
 
@@ -923,7 +962,7 @@ config, fsutil), since none of those change in substance.
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
 | `config.rs`, `migrate.rs` | The shared dybw file (§10): registry validation, profile resolution, the `pinentry` rule, origin-bound credentials, `bwss config migrate` |
-| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl` and `bwss config migrate` |
+| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl`, `bwss index derived` and `bwss config migrate` |
 
 ## 14. Compatibility with `legacy`
 

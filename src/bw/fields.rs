@@ -24,6 +24,9 @@ pub const A_ID: &str = "bwss:id";
 pub const A_NAME: &str = "bwss:name";
 pub const A_USERNAME: &str = "bwss:username";
 pub const A_URI: &str = "bwss:uri";
+/// Every derived attribute: kept out of the locked index unless this device
+/// opted in (`bwss index derived on`).
+pub const DERIVED: [&str; 4] = [A_ID, A_NAME, A_USERNAME, A_URI];
 
 fn field_array(cipher: &Value) -> &[Value] {
     cipher.get("fields").and_then(Value::as_array).map_or(&[], Vec::as_slice)

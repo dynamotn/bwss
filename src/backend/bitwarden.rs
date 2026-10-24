@@ -436,15 +436,33 @@ fn load_cache(path: &Path, email: &str) -> Result<Option<Cache>, BackendError> {
     }
 }
 
-/// Reads `queue.json`, sealed with the user key.
-fn load_queue(path: &Path, key: &SymmetricKey) -> Result<Vec<Op>, BackendError> {
+/// The key `queue.json` is sealed with: the user key derived for "queue",
+/// so nothing else the user key encrypts can pass for the queue.
+pub(super) fn queue_key(user: &SymmetricKey) -> SymmetricKey {
+    user.derive("queue")
+}
+
+/// Reads `queue.json`, sealed with `queue_key(user)`. A queue sealed with
+/// the user key itself (bwss before the queue key) is opened with it once and
+/// resealed at once; one that opens with neither key is set aside.
+fn load_queue(path: &Path, user: &SymmetricKey) -> Result<Vec<Op>, BackendError> {
     let refuse = |e: std::io::Error| {
         unavailable(format!("cannot read the write queue {}: {e}; it is left untouched", path.display()))
     };
+    let key = queue_key(user);
     match read_versioned(path, "legacy") {
-        Loaded::Ok(v) => match unseal(&v, key) {
+        Loaded::Ok(v) => match unseal(&v, &key).map_err(|e| (e, unseal(&v, user))) {
             Ok(ops) => Ok(ops),
-            Err(e) => {
+            Err((_, Ok(ops))) => {
+                // Sealed by an older bwss. The ops are in memory now; when the
+                // reseal fails, the file stays as it was and the next queue
+                // write replaces it.
+                if let Err(e) = write_json_private(path, &seal(&ops, &key)) {
+                    tracing::warn!(path = %path.display(), "could not reseal the write queue: {e}");
+                }
+                Ok(ops)
+            }
+            Err((e, Err(_))) => {
                 tracing::warn!(path = %path.display(), "the write queue cannot be opened ({e}); setting it aside");
                 match set_aside(path, "unsealable") {
                     Loaded::Unreadable(e) => Err(refuse(e)),
@@ -482,7 +500,7 @@ pub struct BitwardenBackend {
     pub(super) state: Mutex<Option<Unlocked>>,
     cache_path: PathBuf,
     queue_path: PathBuf,
-    /// Queued ops; loaded at unlock (it is sealed with the user key) and
+    /// Queued ops; loaded at unlock (it is sealed with the queue key) and
     /// dropped at lock. Lock order: `queue`, then `state`.
     pub(super) queue: Mutex<Vec<Op>>,
 }
@@ -558,8 +576,9 @@ impl BitwardenBackend {
         }
     }
 
-    pub(super) fn save_queue(&self, queue: &[Op], key: &SymmetricKey) -> std::io::Result<()> {
-        let saved = write_json_private(&self.queue_path, &seal(queue, key));
+    /// Writes the queue, sealed with the queue key of `user`.
+    pub(super) fn save_queue(&self, queue: &[Op], user: &SymmetricKey) -> std::io::Result<()> {
+        let saved = write_json_private(&self.queue_path, &seal(queue, &queue_key(user)));
         if let Err(e) = &saved {
             tracing::warn!("could not write the offline queue: {e}");
         }
@@ -999,16 +1018,63 @@ mod tests {
         assert!(path.exists());
     }
 
+    fn one_op() -> Vec<Op> {
+        vec![Op::Delete { id: "a".into(), base_revision: REV.into(), cipher_id: Some("c1".into()) }]
+    }
+
+    fn read_file(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn queue_file_is_sealed_and_set_aside_when_foreign() {
+    fn the_queue_is_sealed_with_a_key_of_its_own() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.json");
-        let key = SymmetricKey::generate();
-        std::fs::write(&path, serde_json::to_vec(&seal(&[], &key)).unwrap()).unwrap();
-        assert!(load_queue(&path, &key).unwrap().is_empty());
+        let user = SymmetricKey::generate();
+        std::fs::write(&path, serde_json::to_vec(&seal(&one_op(), &queue_key(&user))).unwrap()).unwrap();
+        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
         assert!(path.exists());
+        assert!(unseal(&read_file(&path), &user).is_err(), "the user key itself does not open it");
+    }
+
+    #[test]
+    fn a_queue_sealed_with_the_user_key_is_opened_once_and_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let user = SymmetricKey::generate();
+        // As an older bwss wrote it.
+        std::fs::write(&path, serde_json::to_vec(&seal(&one_op(), &user)).unwrap()).unwrap();
+        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
+        let resealed = read_file(&path);
+        assert!(unseal(&resealed, &user).is_err(), "no longer under the user key");
+        assert_eq!(unseal(&resealed, &queue_key(&user)).unwrap().len(), 1);
+        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
+        assert!(!dir.path().join("queue.json.unsealable").exists());
+    }
+
+    #[test]
+    fn a_queue_that_cannot_be_resealed_is_still_read_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let user = SymmetricKey::generate();
+        let old = serde_json::to_vec(&seal(&one_op(), &user)).unwrap();
+        std::fs::write(&path, &old).unwrap();
+        // The private write goes through this temporary name: a directory
+        // there makes it fail, even for root.
+        std::fs::create_dir(path.with_extension(format!("tmp{}", std::process::id()))).unwrap();
+        assert_eq!(load_queue(&path, &user).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    #[test]
+    fn a_queue_that_opens_with_neither_key_is_kept_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let foreign = serde_json::to_vec(&seal(&one_op(), &SymmetricKey::generate())).unwrap();
+        std::fs::write(&path, &foreign).unwrap();
         assert!(load_queue(&path, &SymmetricKey::generate()).unwrap().is_empty());
         assert!(!path.exists());
-        assert!(dir.path().join("queue.json.unsealable").exists());
+        let kept = dir.path().join("queue.json.unsealable");
+        assert_eq!(std::fs::read(kept).unwrap(), foreign, "set aside as it was, never lost");
     }
 }

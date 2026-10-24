@@ -60,6 +60,12 @@ struct Conversation {
     stdout: BufReader<ChildStdout>,
 }
 
+/// `s` on one line for a prompt: line breaks and every other control
+/// character become U+FFFD, so a file name cannot add text of its own.
+pub fn one_line(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { '\u{fffd}' } else { c }).collect()
+}
+
 fn escape(s: &str) -> String {
     s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
 }
@@ -255,6 +261,16 @@ mod tests {
         let allow: Guard = std::sync::Arc::new(|_: &str| Ok(()));
         let p = Prompter::guarded("/nonexistent/pinentry", Duration::from_secs(1), allow);
         assert!(matches!(p.password("x", None).await, Err(PromptError::Spawn(..))), "allowed, then started");
+    }
+
+    #[test]
+    fn one_line_replaces_line_breaks_and_controls() {
+        assert_eq!(one_line("/usr/bin/git"), "/usr/bin/git");
+        assert_eq!(
+            one_line("a\nb\rc\td\u{1b}e\u{7f}f\u{9b}g\u{2028}h\u{2029}i"),
+            "a\u{fffd}b\u{fffd}c\u{fffd}d\u{fffd}e\u{fffd}f\u{fffd}g\u{fffd}h\u{fffd}i"
+        );
+        assert_eq!(one_line("naïve ✓"), "naïve ✓");
     }
 
     #[test]

@@ -337,10 +337,10 @@ impl Vault {
         self.backend.queue.lock().await.len()
     }
 
-    /// The ops in queue.json, opened with the user key.
+    /// The ops in queue.json, opened with the queue key.
     fn queue_file(&self) -> usize {
         match read_versioned(&self.dir.join("state/queue.json"), "legacy") {
-            Loaded::Ok(v) => unseal(&v, &self.keys.user).unwrap().len(),
+            Loaded::Ok(v) => unseal(&v, &super::bitwarden::queue_key(&self.keys.user)).unwrap().len(),
             Loaded::Missing => 0,
             _ => panic!("queue.json cannot be read"),
         }

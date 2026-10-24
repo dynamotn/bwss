@@ -100,6 +100,57 @@ def test_restart_finds_locked_items_and_unlocks_on_demand(account):
         d.stop()
 
 
+def test_derived_attributes_are_found_while_locked_only_after_this_device_opts_in(account):
+    from contextlib import contextmanager
+
+    from test_config import mode, on_terminal
+
+    d = bitwarden_daemon(account)
+    index = d.home / "cache" / "bwss" / "locked-index.json"
+    indexed = lambda: [i for i in json.loads(index.read_text())["items"] if "derived" in i]
+    getpins = lambda: [p for p in d.prompts() if p.startswith("GETPIN")]
+
+    @contextmanager
+    def running():
+        d.start()
+        try:
+            yield
+        finally:
+            d.stop()
+
+    with running():
+        unlock(d, account)
+        d.tool("store", "--label=derived-e2e", "derived", "e2e", input="found")
+    with running():
+        d.pinentry(pins=[account.password])
+        # Not in the locked index: nothing is found, so nothing asks to unlock.
+        r = d.tool("lookup", "bwss:name", "derived-e2e", check=False)
+        assert r.returncode != 0 and r.stdout == ""
+        assert not getpins()
+        assert d.cli("status").stdout.startswith("locked")
+        # Unlocked, derived attributes match as always.
+        unlock(d, account)
+        assert d.tool("lookup", "bwss:name", "derived-e2e").stdout == "found"
+    assert not indexed()
+
+    code, _, shown = on_terminal(d, "index", "derived", "on", answer="yes")
+    assert code == 0 and "usernames and URIs" in shown
+    assert mode(d.state / "tools" / "bwss" / "index-derived") == 0o600
+    with running():
+        unlock(d, account)  # the next index write puts them in
+        assert indexed()
+    with running():
+        d.pinentry(pins=[account.password])
+        assert d.tool("lookup", "bwss:name", "derived-e2e").stdout == "found"
+        assert getpins()
+
+    d.cli("index", "derived", "off")
+    # Off: they leave the index when the daemon starts.
+    with running():
+        assert not indexed()
+        assert json.loads(index.read_text())["items"], "the rest of the index stays"
+
+
 class Relay:
     """A TCP relay to Vaultwarden that can be cut: the server goes offline
     while its URL, and so the origin the API key is bound to, stays the same."""

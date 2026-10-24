@@ -131,7 +131,12 @@ pub struct Api {
     device_id: String,
     token: Option<(Zeroizing<String>, Instant)>,
     user_id: Option<String>,
+    /// Largest response body read (`MAX_BODY`; tests lower it).
+    body_limit: usize,
 }
+
+/// Largest response body bwss reads, enforced while it streams in.
+pub const MAX_BODY: usize = 256 * 1024 * 1024;
 
 impl Api {
     pub fn new(urls: ServerUrls, device_id: String) -> Result<Self, ApiError> {
@@ -143,7 +148,7 @@ impl Api {
             .user_agent(concat!("bwss/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| ApiError::Network(e.to_string()))?;
-        Ok(Api { urls, http, device_id, token: None, user_id: None })
+        Ok(Api { urls, http, device_id, token: None, user_id: None, body_limit: MAX_BODY })
     }
 
     pub fn urls(&self) -> &ServerUrls {
@@ -163,7 +168,7 @@ impl Api {
             .await
             .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
         let status = res.status().as_u16();
-        let text = Zeroizing::new(res.text().await.map_err(|e| ApiError::Network(e.without_url().to_string()))?);
+        let text = read_capped(res, self.body_limit).await?;
         if !(200..300).contains(&status) {
             return Err(ApiError::Http { status, message: describe_error(&parse_body(&text)) });
         }
@@ -295,6 +300,31 @@ impl Api {
     }
 }
 
+/// The body of `res` as text, refused as soon as it is known to exceed
+/// `limit` bytes: from its announced length, or while the chunks arrive.
+async fn read_capped(mut res: reqwest::Response, limit: usize) -> Result<Zeroizing<String>, ApiError> {
+    let too_large = || ApiError::Protocol(format!("the response is larger than {limit} bytes"));
+    let announced = res.content_length().map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+    if announced.is_some_and(|n| n > limit) {
+        return Err(too_large());
+    }
+    // Reserved up front, so growing never leaves unwiped copies behind.
+    let mut body = Zeroizing::new(Vec::with_capacity(announced.unwrap_or(0)));
+    while let Some(chunk) = res.chunk().await.map_err(|e| ApiError::Network(e.without_url().to_string()))? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(match String::from_utf8(std::mem::take(&mut *body)) {
+        Ok(text) => Zeroizing::new(text),
+        Err(e) => {
+            let bytes = Zeroizing::new(e.into_bytes());
+            Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    })
+}
+
 /// Reads the token answer straight into wiped storage; returns the token
 /// and the seconds it stays usable (with a safety margin).
 fn parse_token_response(text: &str) -> Result<(Zeroizing<String>, u64), ApiError> {
@@ -315,7 +345,55 @@ fn enc(segment: &str) -> String {
     url::form_urlencoded::byte_serialize(segment.as_bytes()).collect()
 }
 
-/// Server text is untrusted: keep it short.
+/// `text` without control characters: ANSI escape sequences (CSI, OSC and
+/// the other string controls, two-byte escapes) are dropped whole, and every
+/// other C0 or C1 control becomes a space.
+fn strip_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    // Skips a control string up to BEL or ST (`ESC \`, or C1 U+009C).
+    let skip_string = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while let Some(c) = chars.next() {
+            match c {
+                '\u{7}' | '\u{9c}' => return,
+                '\u{1b}' if chars.peek() == Some(&'\\') => {
+                    chars.next();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    };
+    // Skips a CSI sequence: parameter and intermediate bytes, then the final byte.
+    let skip_csi = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        for c in chars.by_ref() {
+            if ('\u{40}'..='\u{7e}').contains(&c) {
+                return;
+            }
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => skip_csi(&mut chars),
+                Some(']' | 'P' | 'X' | '^' | '_') => skip_string(&mut chars),
+                // Intermediate bytes, then one final byte (`ESC ( B`).
+                Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+                    while chars.next_if(|c| ('\u{20}'..='\u{2f}').contains(c)).is_some() {}
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\u{9b}' => skip_csi(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Server text is untrusted: keep it short and free of control characters.
 fn describe_error(body: &Value) -> String {
     let mut parts = Vec::new();
     for p in ["/error_description", "/message", "/errorModel/message"] {
@@ -326,7 +404,7 @@ fn describe_error(body: &Value) -> String {
     if let Some(v) = body.get("validationErrors") {
         parts.push(v.to_string());
     }
-    let text = parts.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = strip_controls(&parts.join(" ")).split_whitespace().collect::<Vec<_>>().join(" ");
     if text.chars().count() > 200 { text.chars().take(200).collect::<String>() + "…" } else { text }
 }
 
@@ -415,6 +493,90 @@ mod tests {
 
         let bound = ApiKey { origin: "http://127.0.0.1:1".into(), ..key };
         assert!(matches!(api.login(&bound).await.unwrap_err(), ApiError::Network(_)), "the right origin is tried");
+    }
+
+    #[test]
+    fn server_error_text_loses_control_characters_and_escapes() {
+        let body = json!({
+            "message": "bad\u{1b}[31mred\u{1b}[0m\nnext\u{7} \u{9b}2Jx \u{1b}]0;title\u{7}end \u{1b}(Bok\u{85}\u{1b}"
+        });
+        assert_eq!(describe_error(&body), "badred next x end ok");
+        // Control strings end at ST, as `ESC \` or as C1, or at the end of the text.
+        let strings = json!({ "message": "a\u{1b}P1q\u{1b}\\b \u{9d}x\u{9c}c \u{90}dcs\u{7}d \u{1b}]never" });
+        assert_eq!(describe_error(&strings), "ab c d");
+        // Clipped after stripping: escapes never count towards the 200.
+        let long = json!({ "message": format!("{}{}", "\u{1b}[1m".repeat(300), "a".repeat(250)) });
+        assert_eq!(describe_error(&long), format!("{}…", "a".repeat(200)));
+    }
+
+    /// A one-shot HTTP server answering every request with `head` + `body`.
+    fn answer(head: String, body: Vec<u8>) -> String {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let mut out = stream;
+                let _ = out.write_all(head.as_bytes()).and_then(|()| out.write_all(&body));
+            }
+        });
+        url
+    }
+
+    fn chunked(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(format!("{:x}\r\n", c.len()).into_bytes());
+            out.extend_from_slice(c);
+            out.extend(b"\r\n");
+        }
+        out.extend(b"0\r\n\r\n");
+        out
+    }
+
+    async fn prelogin_with_limit(url: &str, limit: usize) -> Result<KdfParams, ApiError> {
+        let mut api = Api::new(resolve_server_urls(url).unwrap(), "d".into()).unwrap();
+        api.body_limit = limit;
+        api.prelogin("a@b.c").await
+    }
+
+    #[tokio::test]
+    async fn response_bodies_are_capped_while_they_are_read() {
+        assert_eq!(MAX_BODY, 256 * 1024 * 1024);
+        let kdf = br#"{"kdf":0,"kdfIterations":600000}"#.to_vec();
+        let plain =
+            |body: &[u8]| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let streamed = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_owned();
+
+        let ok = answer(plain(&kdf), kdf.clone());
+        assert!(matches!(prelogin_with_limit(&ok, 64).await, Ok(KdfParams::Pbkdf2 { iterations: 600_000 })));
+
+        // Announced as too large: refused before the body is read.
+        let announced = answer(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000000000\r\nConnection: close\r\n\r\n".to_owned(),
+            kdf.clone(),
+        );
+        let e = prelogin_with_limit(&announced, 64).await.unwrap_err();
+        assert!(matches!(&e, ApiError::Protocol(m) if m.contains("larger than 64 bytes")), "{e}");
+
+        // Streamed without a length: refused once the chunks pass the cap.
+        let big = vec![b' '; 40];
+        let streams = answer(streamed.clone(), chunked(&[&big, &big, &kdf]));
+        let e = prelogin_with_limit(&streams, 64).await.unwrap_err();
+        assert!(matches!(&e, ApiError::Protocol(m) if m.contains("larger than 64 bytes")), "{e}");
+        let (head, tail) = kdf.split_at(10);
+        let fits = answer(streamed, chunked(&[head, tail]));
+        assert!(prelogin_with_limit(&fits, 64).await.is_ok());
+
+        // An error answer is capped too.
+        let error = answer(plain(&big).replace("200 OK", "500 X"), big.clone());
+        let e = prelogin_with_limit(&error, 16).await.unwrap_err();
+        assert!(matches!(&e, ApiError::Protocol(m) if m.contains("larger than 16 bytes")), "{e}");
     }
 
     #[test]

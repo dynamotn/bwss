@@ -71,7 +71,7 @@ fn perf_budgets() {
     time("rescan-10000-unchanged", 5_000, || build(&sync, &keys, Some(&built)));
     let decoded = built.snapshot.items;
 
-    let mut k = Keyring::new(None);
+    let mut k = Keyring::new(None, None);
     time("load-10000-items", 1_000, || k.load(Snapshot { collections: vec![], items: decoded }));
     let mut q = Attributes::new();
     q.insert("service".into(), "svc-42".into());

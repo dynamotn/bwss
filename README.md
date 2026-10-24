@@ -113,7 +113,11 @@ offline writes before upgrading. See
   replayed when you are back online.
 - **Locked, but findable.** A locked keyring still answers searches from a
   salted attribute index, so apps trigger the unlock prompt instead of
-  failing silently after a reboot.
+  failing silently after a reboot. The index holds the attributes apps set,
+  not an item's name, username or URIs (`bwss:name`, `bwss:username`,
+  `bwss:uri`, `bwss:id`): a locked search by those finds nothing and asks
+  for nothing, until you unlock or opt in on the device with
+  `bwss index derived on`.
 - **Your Bitwarden data stays intact.** Editing an item keeps its username,
   URIs, custom fields, attachments and history, and a replaced login
   password goes into password history.
@@ -241,8 +245,20 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
   that forks and starts a real `bwss daemon` to pass the check, or one that
   can ptrace; use `--password-stdin` only if you accept that risk.
 - On disk there is only Bitwarden ciphertext, plus the locked index. The
-  index holds salted attribute hashes, never secrets; this is the same
-  trade-off gnome-keyring makes.
+  index holds salted SHA-256 hashes of the attributes apps set, never
+  secrets; this is the same trade-off gnome-keyring makes. The salt is in
+  the same file, so anyone who can read `~/.cache/bwss/locked-index.json`
+  can test guesses of those values offline. bwss accepts this because apps
+  must find locked items before the first unlock; unlocking at login (the
+  planned `pam_bwss` protector) is the long-term answer. Item names,
+  usernames and URIs stay out of the index unless you run
+  `bwss index derived on` (confirmed on the terminal; `bwss index derived
+  off` undoes it, from the next index write). It is device state, never a
+  config key.
+- Offline writes are queued under a key of their own, derived from your
+  vault key. Server answers are capped at 256 MiB, and server error text
+  is stripped of control characters before it is shown or logged. An
+  application's path in a pinentry prompt is shown on one line.
 - Only the `bwss` CLI itself may send the master password to the daemon
   (`Control1.UnlockWithPassword`); any other executable is refused.
 - The config file may be synced with your dotfiles, so nothing in it can

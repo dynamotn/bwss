@@ -4,8 +4,9 @@
 //! bwss reads `$XDG_CONFIG_HOME/dybw/config.toml`: the top level and the
 //! profile it serves are checked against the key registry of dybw profiles
 //! §1, `[bwss]` strictly, and every other table is ignored. Nothing in the
-//! file may weaken a check: `acl` is refused anywhere, and `pinentry` must
-//! name a program the user cannot replace.
+//! file may weaken a check: `acl` is refused anywhere,
+//! `index_derived_attributes` in `[bwss]`, and `pinentry` must name a
+//! program the user cannot replace.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -192,6 +193,16 @@ impl Paths {
     pub fn acl_off(&self) -> PathBuf {
         self.tool_state.join("acl-off")
     }
+
+    /// The locked index (design §7).
+    pub fn locked_index(&self) -> PathBuf {
+        self.cache.join("locked-index.json")
+    }
+
+    /// Present when derived attributes go in the locked index on this device.
+    pub fn index_derived(&self) -> PathBuf {
+        self.tool_state.join("index-derived")
+    }
 }
 
 /// `acl` where bwss reads keys: the top level, its profile or `[bwss]`.
@@ -295,6 +306,12 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
     if let Some(key) = bwss.keys().find(|k| !BWSS_KEYS.contains(&k.as_str())) {
         if key == "acl" {
             return Err(acl_moved("[bwss]"));
+        }
+        if key == "index_derived_attributes" {
+            bail!(
+                "`index_derived_attributes` in [bwss] is not read from the config file: a synced file must never \
+                 weaken the locked index. Put derived attributes in it on this device with `bwss index derived on`"
+            );
         }
         bail!("unknown key `{key}` in [bwss]");
     }
@@ -595,22 +612,36 @@ pub fn load(paths: &Paths, trust: &Trust) -> anyhow::Result<Config> {
     })
 }
 
-pub fn acl_mode(paths: &Paths) -> AclMode {
-    match std::fs::symlink_metadata(paths.acl_off()) {
-        Ok(_) => AclMode::Off,
-        Err(_) => AclMode::Prompt,
+/// Whether the device flag `path` is set: anything there counts, even a
+/// dangling link.
+pub fn flag_set(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Sets the device flag `path` (a private file holding `text`) or clears it.
+fn set_flag(path: &Path, on: bool, text: &[u8]) -> std::io::Result<()> {
+    if on {
+        return crate::fsutil::write_private(path, text);
     }
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+pub fn acl_mode(paths: &Paths) -> AclMode {
+    if flag_set(&paths.acl_off()) { AclMode::Off } else { AclMode::Prompt }
 }
 
 /// Turns the ACL off (or back on) on this device.
 pub fn set_acl_off(paths: &Paths, off: bool) -> std::io::Result<()> {
-    if off {
-        return crate::fsutil::write_private(&paths.acl_off(), b"off\n");
-    }
-    match std::fs::remove_file(paths.acl_off()) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    set_flag(&paths.acl_off(), off, b"off\n")
+}
+
+/// Puts derived attributes in the locked index on this device, or takes
+/// them out again; the daemon reads it at every index write.
+pub fn set_index_derived(paths: &Paths, on: bool) -> std::io::Result<()> {
+    set_flag(&paths.index_derived(), on, b"on\n")
 }
 
 /// Reads a profile's API key: a regular file owned by `user`, mode 0600,
@@ -920,6 +951,19 @@ mod tests {
     }
 
     #[test]
+    fn the_file_cannot_put_derived_attributes_in_the_locked_index() {
+        let base = format!("default = \"personal\"\n{ACCOUNT}");
+        for value in ["true", "false"] {
+            let e = err(&format!("{base}[bwss]\nindex_derived_attributes = {value}\n"));
+            assert!(
+                e.contains("`index_derived_attributes` in [bwss]") && e.contains("bwss index derived on"),
+                "{value}: {e}"
+            );
+            assert!(!e.contains("unknown key"), "{e}");
+        }
+    }
+
+    #[test]
     fn an_acl_key_in_another_tools_table_is_not_bwss_business() {
         let base = format!("default = \"personal\"\n{ACCOUNT}");
         for text in [
@@ -959,8 +1003,28 @@ mod tests {
         assert_eq!(p.credentials("work"), Path::new("/st/dybw/profiles/work/credentials"));
         assert_eq!(p.device_id("work"), Path::new("/st/dybw/profiles/work/devices/bwss"));
         assert_eq!(p.acl_off(), Path::new("/st/dybw/tools/bwss/acl-off"));
+        assert_eq!(p.index_derived(), Path::new("/st/dybw/tools/bwss/index-derived"));
+        assert_eq!(p.locked_index(), Path::new("/home/u/.cache/bwss/locked-index.json"));
         assert_eq!(p.cache, Path::new("/home/u/.cache/bwss"));
         assert_eq!(p.state, Path::new("/st/bwss"));
+    }
+
+    #[test]
+    fn derived_attributes_in_the_index_are_device_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths_in(dir.path());
+        assert!(!flag_set(&p.index_derived()));
+        set_index_derived(&p, true).unwrap();
+        assert!(flag_set(&p.index_derived()));
+        assert_eq!(std::fs::metadata(p.index_derived()).unwrap().permissions().mode() & 0o777, 0o600);
+        set_index_derived(&p, true).unwrap();
+        set_index_derived(&p, false).unwrap();
+        assert!(!flag_set(&p.index_derived()));
+        set_index_derived(&p, false).unwrap();
+        // The ACL flag is another file.
+        set_index_derived(&p, true).unwrap();
+        assert_eq!(acl_mode(&p), AclMode::Prompt);
     }
 
     #[test]
