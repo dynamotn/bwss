@@ -1152,7 +1152,7 @@ mod tests {
         std::fs::write(&q.path, &old).unwrap();
         // The private write goes through this temporary name: a directory
         // there makes it fail, even for root.
-        std::fs::create_dir(q.path.with_extension(format!("tmp{}", std::process::id()))).unwrap();
+        std::fs::create_dir(crate::fsutil::temp_path(&q.path)).unwrap();
         assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
         assert_eq!(std::fs::read(&q.path).unwrap(), old);
         assert!(!crate::config::flag_set(&q.flag), "not moved yet: the window stays for the next try");

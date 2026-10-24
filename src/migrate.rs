@@ -691,7 +691,8 @@ mod tests {
         assert!(e.contains("not renamed") && e.contains("renaming") && e.contains(&"c".repeat(250)), "{e}");
         assert!(!e.contains("csecret"), "the secret is never shown: {e}");
         assert!(e.contains("wrote [bwss]"), "what was done is reported too: {e}");
-        assert!(e.contains("renamed") && e.contains("config.toml.migrated"), "the other file was renamed: {e}");
+        let old = h.paths.legacy_config.display();
+        assert!(e.contains(&format!("renamed {old} to {old}.migrated")), "the other file was renamed: {e}");
         assert!(long.exists(), "the file that could not be renamed stays");
         assert!(!h.paths.legacy_config.exists());
     }
@@ -721,7 +722,7 @@ mod tests {
         // names the file, and no old file is renamed.
         let h = home();
         h.legacy("email = \"me@example.org\"\n");
-        std::fs::create_dir_all(h.paths.config.with_extension(format!("tmp{}", std::process::id()))).unwrap();
+        std::fs::create_dir_all(crate::fsutil::temp_path(&h.paths.config)).unwrap();
         let e = format!("{:#}", h.run(false).unwrap_err());
         assert!(e.contains(&h.paths.config.display().to_string()), "{e}");
         assert!(h.paths.legacy_config.exists());

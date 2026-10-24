@@ -8,12 +8,17 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_atomic(path, data, 0o600)
 }
 
+/// The file `write_atomic` writes before it renames over `path`.
+pub(crate) fn temp_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension(format!("tmp{}", std::process::id()))
+}
+
 /// Replaces `path` atomically with a file of permission bits `mode`.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = temp_path(path);
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -162,9 +167,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("a-file");
         std::fs::write(&blocker, b"x").unwrap();
-        assert!(write_private(&blocker.join("child/state.json"), b"{}").is_err());
+        let e = write_private(&blocker.join("child/state.json"), b"{}").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}");
         assert_eq!(std::fs::read(&blocker).unwrap(), b"x", "the blocking file is untouched");
-        assert!(ensure_private_dir(&blocker.join("sub")).is_err());
+        let e = ensure_private_dir(&blocker.join("sub")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory, "{e}");
     }
 
     #[test]
@@ -177,8 +184,11 @@ mod tests {
 
     #[test]
     fn a_path_without_a_parent_cannot_be_written() {
-        assert!(write_atomic(Path::new(""), b"x", 0o600).is_err());
-        assert!(write_atomic(Path::new("/"), b"x", 0o600).is_err());
+        let e = write_atomic(Path::new(""), b"x", 0o600).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+        let e = write_atomic(Path::new("/"), b"x", 0o600).unwrap_err();
+        // EISDIR on Linux, EEXIST on macOS.
+        assert!(matches!(e.kind(), std::io::ErrorKind::IsADirectory | std::io::ErrorKind::AlreadyExists), "{e}");
     }
 
     #[test]

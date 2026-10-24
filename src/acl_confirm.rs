@@ -245,6 +245,8 @@ mod tests {
         set.set("i", "/x", Mark::Confirmed);
         assert_eq!(set.mark("i", "/x"), Mark::Confirmed, "kept in memory");
         assert!(p.is_dir(), "the unreadable path is left alone");
+        let names: Vec<_> = std::fs::read_dir(p.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["acl-confirmed"], "no write was attempted: no temporary file, no set-aside copy");
     }
 
     #[test]

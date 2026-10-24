@@ -470,6 +470,12 @@ mod tests {
         k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
         assert_eq!(k.search(&q(&[("service", "gh")]), None).0, vec![("login".into(), "a".into())]);
         assert_eq!(std::fs::read(&blocker).unwrap(), b"x");
+        // Later changes and a reload keep working too.
+        assert!(k.upsert(item("b", "login", &[("service", "gl")])));
+        k.load(Snapshot { collections: vec![], items: vec![item("c", "login", &[("service", "gl")])] });
+        assert_eq!(k.search(&q(&[("service", "gl")]), None).0, vec![("login".into(), "c".into())]);
+        assert!(k.search(&q(&[("service", "gh")]), None).0.is_empty(), "the reload replaced the content");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "nothing else was written beside it");
     }
 
     const DERIVED: [(&str, &str); 4] =

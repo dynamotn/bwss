@@ -731,11 +731,6 @@ mod tests {
     const ACCOUNT: &str =
         "[profiles.personal]\nserver_url = \"https://vault.example.org\"\nemail = \"me@example.org\"\n";
 
-    /// Compiles only while the secret is wiped on drop.
-    fn assert_zeroizing(c: &Credentials) -> &Zeroizing<String> {
-        &c.client_secret
-    }
-
     #[test]
     fn credentials_debug_is_redacted() {
         let c = Credentials {
@@ -743,7 +738,8 @@ mod tests {
             client_id: "the-id".into(),
             client_secret: Zeroizing::new("hunter2-secret".into()),
         };
-        assert_eq!(assert_zeroizing(&c).as_str(), "hunter2-secret");
+        // Compiles only while the secret is wiped on drop.
+        let _: &Zeroizing<String> = &c.client_secret;
         let out = format!("{c:?}");
         assert!(!out.contains("hunter2-secret"));
         assert!(out.contains("<redacted>"));
