@@ -88,7 +88,7 @@ flowchart LR
 | collection "Work" | folder `secret-service/Work` |
 | item label | item name |
 | secret | login password (notes for very large secrets; base64 for binary data) |
-| attributes (`service=github`, …) | custom fields `ss:attr:service`, … |
+| attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
 
 - **Encryption**: bwss implements Bitwarden's client-side crypto itself:

@@ -43,9 +43,9 @@ def test_secret_tool_writes_land_in_bitwarden(account):
         items = account.items(FOLDER)
         it = items["GitHub token"]
         assert it["password"] == "ghp_e2e"
-        assert it["fields"]["ss:attr:service"] == "github"
-        assert it["fields"]["ss:attr:user"] == "me"
-        assert it["fields"]["ss:id"]
+        assert it["fields"]["bwss:attr:service"] == "github"
+        assert it["fields"]["bwss:attr:user"] == "me"
+        assert it["fields"]["bwss:id"]
 
         d.tool("store", "--label=GitHub token", "service", "github", "user", "me", input="ghp_rotated")
         it = account.items(FOLDER)["GitHub token"]
@@ -59,7 +59,7 @@ def test_items_from_other_clients_and_remote_edits(account):
     d = bitwarden_daemon(account).start()
     try:
         unlock(d, account)
-        c = account.add_login(FOLDER, "Bank", "hunter2", {"ss:attr:service": "bank"})
+        c = account.add_login(FOLDER, "Bank", "hunter2", {"bwss:attr:service": "bank"})
         d.cli("sync")
         assert d.tool("lookup", "service", "bank").stdout == "hunter2"
         account.set_password(c["id"], "hunter3")

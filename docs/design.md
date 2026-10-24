@@ -81,7 +81,7 @@ flowchart TB
 |---|---|
 | `bw/crypto.rs` | PBKDF2/Argon2id with bounds, HKDF-Expand stretch, `SymmetricKey` (zeroized on drop), EncString type 2 |
 | `bw/api.rs` | URL resolution (https or loopback only), prelogin, API-key login, sync, folder and item writes, `encryptedFor`, no redirects, error shaping |
-| `bw/items.rs` | Bitwarden login ↔ Secret Service item (fields `ss:*`), pass-through of unknown properties, password history, size limits |
+| `bw/items.rs` | Bitwarden login ↔ Secret Service item (fields `bwss:*`), pass-through of unknown properties, password history, size limits |
 | `model.rs` | `ItemData`, `CollectionData`, `Snapshot`, path segments |
 | `keyring.rs` | In-memory collections and items, lock state, search, diffing, persisted locked index |
 | `session.rs` | `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7` |
@@ -101,9 +101,9 @@ flowchart TB
 | Collection `session` | memory only; never stored, never locked |
 | Item | a **login** item (secure notes made by other clients are also read) |
 | Label | item name |
-| Secret | `login.password`. Base64 plus `ss:encoding=base64` when the bytes are not UTF-8. It moves to `notes` (with `ss:location=notes`) when its encrypted form exceeds the 5,000-character password limit, and is refused above the 10,000-character notes limit. |
-| Attributes | text fields `ss:attr:<name>` |
-| Bookkeeping | `ss:id` (stable id shared by all devices), `ss:content-type`, `ss:acl` (hidden field), `ss:created` |
+| Secret | `login.password`. Base64 plus `bwss:encoding=base64` when the bytes are not UTF-8. It moves to `notes` (with `bwss:location=notes`) when its encrypted form exceeds the 5,000-character password limit, and is refused above the 10,000-character notes limit. |
+| Attributes | text fields `bwss:attr:<name>` |
+| Bookkeeping | `bwss:id` (stable id shared by all devices), `bwss:content-type`, `bwss:acl` (hidden field), `bwss:created` |
 
 Notes:
 
@@ -114,10 +114,10 @@ Notes:
   unknown properties, prepend the old password to `passwordHistory`, and
   send `lastKnownRevisionDate` and `encryptedFor`.
 - **Per-item keys** (`cipher.key`) are used for reading and kept on write.
-- **Items without `ss:id`** (made by other clients) get the id `c<cipher
+- **Items without `bwss:id`** (made by other clients) get the id `c<cipher
   id>`.
 - **Duplicates**: duplicate folder names resolve to the lowest folder id,
-  and duplicate `ss:id`s keep the first item. Both rules make every device
+  and duplicate `bwss:id`s keep the first item. Both rules make every device
   agree.
 
 ## 4. Locking, unlocking and the locked index
@@ -188,7 +188,7 @@ in the config):
 - **What is checked**: reads (`GetSecret`, `GetSecrets`), changes
   (`SetSecret`, `Label`, `Attributes`, `CreateItem` with `replace`), deletes
   (`Item.Delete`, and `Collection.Delete` for every item it contains).
-- **New items** get their creator in `ss:acl`, so the creator is never
+- **New items** get their creator in `bwss:acl`, so the creator is never
   asked.
 - **"Always allow"** appends the executable to the ACL and stores it in
   Bitwarden. The decision therefore follows the item to every device,
@@ -318,7 +318,7 @@ session bus:
 - **Bitwarden backend against Vaultwarden 1.37.4**, checked by an
   independent Python Bitwarden client (`tests/e2e/bwclient.py`, sharing no
   code with bwss):
-  - `secret-tool store` lands as a login with `ss:*` fields, and a rotation
+  - `secret-tool store` lands as a login with `bwss:*` fields, and a rotation
     keeps the old value in the history;
   - items made by the other client appear after `bwss sync`, remote edits
     are picked up, and `clear` trashes the item;

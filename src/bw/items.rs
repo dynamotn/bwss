@@ -2,7 +2,7 @@
 //!
 //! An item is a Bitwarden *login*: the name is the label, the password holds
 //! the secret (masked in every Bitwarden client), and hidden bookkeeping lives
-//! in custom fields whose names start with `ss:`. Fields of other clients are
+//! in custom fields whose names start with `bwss:`. Fields of other clients are
 //! preserved on edit.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -12,13 +12,14 @@ use zeroize::Zeroizing;
 use super::crypto::{CryptoError, SymmetricKey};
 use crate::model::{Attributes, ItemData, path_segment};
 
-pub const F_ID: &str = "ss:id";
-pub const F_ATTR: &str = "ss:attr:";
-pub const F_CONTENT_TYPE: &str = "ss:content-type";
-pub const F_ENCODING: &str = "ss:encoding";
-pub const F_LOCATION: &str = "ss:location";
-pub const F_ACL: &str = "ss:acl";
-pub const F_CREATED: &str = "ss:created";
+pub const PREFIX: &str = "bwss:";
+pub const F_ID: &str = "bwss:id";
+pub const F_ATTR: &str = "bwss:attr:";
+pub const F_CONTENT_TYPE: &str = "bwss:content-type";
+pub const F_ENCODING: &str = "bwss:encoding";
+pub const F_LOCATION: &str = "bwss:location";
+pub const F_ACL: &str = "bwss:acl";
+pub const F_CREATED: &str = "bwss:created";
 
 const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
@@ -162,7 +163,7 @@ pub fn encode(
         let decrypted = fields(c, &key)?;
         let raw = c.get("fields").and_then(Value::as_array).cloned().unwrap_or_default();
         for ((name, _), f) in decrypted.iter().zip(raw) {
-            if !name.starts_with("ss:") {
+            if !name.starts_with(PREFIX) {
                 out_fields.push(f);
             }
         }
