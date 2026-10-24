@@ -225,6 +225,37 @@ fn read_marked(
     })))
 }
 
+/// Picks one item per `bwss:id`. The winner is a personal item over an
+/// organization one, then a dated one over an undated one, then the oldest,
+/// then the lowest cipher id, so every device chooses alike. Returns the
+/// winners and `(id, losing cipher ids)` sorted by id.
+pub fn resolve_duplicates(items: Vec<MarkedItem>) -> (Vec<MarkedItem>, Vec<(String, Vec<String>)>) {
+    let mut groups: std::collections::BTreeMap<String, Vec<MarkedItem>> = std::collections::BTreeMap::new();
+    for item in items {
+        groups.entry(item.item.id.clone()).or_default().push(item);
+    }
+    let mut winners = Vec::new();
+    let mut losers = Vec::new();
+    for (id, mut group) in groups {
+        group.sort_by(|a, b| {
+            (a.organization, a.creation_date.is_none(), a.creation_date, &a.cipher_id).cmp(&(
+                b.organization,
+                b.creation_date.is_none(),
+                b.creation_date,
+                &b.cipher_id,
+            ))
+        });
+        let mut rest = group.into_iter();
+        winners.extend(rest.next());
+        let mut lost: Vec<String> = rest.map(|m| m.cipher_id).collect();
+        if !lost.is_empty() {
+            lost.sort();
+            losers.push((id, lost));
+        }
+    }
+    (winners, losers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +466,97 @@ mod tests {
         let c = login(&k, &[id, f("bwss:location", "attachment")], Some("pw"), None);
         let Scan::Skipped(why) = scan(&c, &k) else { panic!() };
         assert!(!why.contains("pw") && !why.contains("GitHub"));
+    }
+
+    type Spec = (&'static str, &'static str, bool, Option<u64>);
+
+    fn m((id, cipher_id, org, created): Spec) -> MarkedItem {
+        MarkedItem {
+            cipher_id: cipher_id.to_owned(),
+            revision_date: String::new(),
+            creation_date: created,
+            organization: org,
+            source: ValueSource::LoginPassword,
+            mark: [0; 32],
+            item: ItemData {
+                id: id.to_owned(),
+                collection: "default".to_owned(),
+                label: String::new(),
+                attributes: Attributes::default(),
+                secret: Zeroizing::new(Vec::new()),
+                content_type: "text/plain".to_owned(),
+                created: 0,
+                modified: 0,
+                acl: Vec::new(),
+            },
+        }
+    }
+
+    fn permutations<T: Copy>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn duplicates_resolve_the_same_way_in_any_order() {
+        // a: org, oldest; b: personal, created 200; c: personal, created 100; d: personal, no date
+        let all = [
+            ("x", "a", true, Some(50)),
+            ("x", "b", false, Some(200)),
+            ("x", "c", false, Some(100)),
+            ("x", "d", false, None),
+        ];
+        for perm in permutations(&all) {
+            let (win, lost) = resolve_duplicates(perm.into_iter().map(m).collect());
+            assert_eq!(win.len(), 1);
+            assert_eq!(win[0].cipher_id, "c");
+            assert_eq!(lost, vec![("x".to_owned(), vec!["a".to_owned(), "b".to_owned(), "d".to_owned()])]);
+        }
+        // same date: lowest cipher id wins
+        for perm in permutations(&[("x", "q", false, Some(7)), ("x", "p", false, Some(7))]) {
+            let (win, lost) = resolve_duplicates(perm.into_iter().map(m).collect());
+            assert_eq!(win[0].cipher_id, "p");
+            assert_eq!(lost, vec![("x".to_owned(), vec!["q".to_owned()])]);
+        }
+    }
+
+    #[test]
+    fn distinct_ids_all_win_and_losers_are_sorted_by_id() {
+        let (win, lost) = resolve_duplicates(vec![m(("a", "c1", false, None)), m(("b", "c2", true, Some(1)))]);
+        assert_eq!(win.len(), 2);
+        assert!(lost.is_empty());
+
+        let all = [
+            ("z", "z2", false, Some(2)),
+            ("z", "z1", false, Some(1)),
+            ("m", "m2", false, Some(2)),
+            ("m", "m1", false, Some(1)),
+            ("solo", "s", false, None),
+            ("c", "c3", true, None),
+            ("c", "c1", false, None),
+        ];
+        let expected = vec![
+            ("c".to_owned(), vec!["c3".to_owned()]),
+            ("m".to_owned(), vec!["m2".to_owned()]),
+            ("z".to_owned(), vec!["z2".to_owned()]),
+        ];
+        for perm in permutations(&all) {
+            let (win, lost) = resolve_duplicates(perm.into_iter().map(m).collect());
+            let mut ids: Vec<_> = win.iter().map(|w| (w.item.id.as_str(), w.cipher_id.as_str())).collect();
+            ids.sort();
+            assert_eq!(ids, [("c", "c1"), ("m", "m1"), ("solo", "s"), ("z", "z1")]);
+            assert_eq!(lost, expected);
+        }
     }
 }
