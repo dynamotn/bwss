@@ -262,14 +262,10 @@ mod tests {
         }
         let back = unseal(&sealed, &key).unwrap();
         assert_eq!(back.len(), 3);
-        match &back[0] {
-            Op::Create { id, collection, item: got } => {
-                assert_eq!(id, "id-7f3a-unique");
-                assert_eq!(collection, "default");
-                assert_eq!(*got, item());
-            }
-            _ => panic!("wrong op"),
-        }
+        let Op::Create { id, collection, item: got } = &back[0] else { panic!() };
+        assert_eq!(id, "id-7f3a-unique");
+        assert_eq!(collection, "default");
+        assert_eq!(*got, item());
         assert!(
             matches!(&back[1], Op::Delete { base_revision, cipher_id, .. } if base_revision == "rev" && cipher_id.as_deref() == Some("c9"))
         );
@@ -283,10 +279,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("queue.json");
         std::fs::write(&p, r#"{"ops":[]}"#).unwrap();
-        match read_versioned(&p, "legacy") {
-            Loaded::SetAside(to) => assert_eq!(to, dir.path().join("queue.json.legacy")),
-            _ => panic!("expected SetAside"),
-        }
+        let Loaded::SetAside(to) = read_versioned(&p, "legacy") else { panic!() };
+        assert_eq!(to, dir.path().join("queue.json.legacy"));
         assert!(!p.exists());
         assert!(dir.path().join("queue.json.legacy").exists());
     }
@@ -300,10 +294,8 @@ mod tests {
         assert!(dir.path().join("queue.json.corrupt").exists());
         // A second corrupt file does not overwrite the first.
         std::fs::write(&p, "nope").unwrap();
-        match read_versioned(&p, "legacy") {
-            Loaded::SetAside(to) => assert_eq!(to, dir.path().join("queue.json.corrupt.1")),
-            _ => panic!("expected SetAside"),
-        }
+        let Loaded::SetAside(to) = read_versioned(&p, "legacy") else { panic!() };
+        assert_eq!(to, dir.path().join("queue.json.corrupt.1"));
     }
 
     #[test]
@@ -324,21 +316,14 @@ mod tests {
         assert!(p.exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn failed_set_aside_is_reported_not_missing() {
-        use std::os::unix::fs::PermissionsExt;
+        // The rename fails whoever runs the test: there is nothing to move.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("queue.json");
-        std::fs::write(&p, "nope").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let got = read_versioned(&p, "legacy");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        if std::fs::File::create(dir.path().join("probe")).is_ok() {
-            return; // permissions not enforced (running as root)
-        }
-        assert!(matches!(got, Loaded::Unreadable(_)));
-        assert!(p.exists());
+        let Loaded::Unreadable(e) = set_aside(&p, "legacy") else { panic!() };
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert!(!dir.path().join("queue.json.legacy").exists());
     }
 
     #[test]
@@ -361,18 +346,14 @@ mod tests {
             cipher_id: Some("c1".into()),
         };
         let back = unseal(&seal(&[Op::Patch(patch)], &key), &key).unwrap();
-        match &back[0] {
-            Op::Patch(p) => {
-                assert_eq!((p.id.as_str(), p.base_revision.as_str()), ("pid", "r1"));
-                assert_eq!(p.cipher_id.as_deref(), Some("c1"));
-                assert_eq!(p.set, vec![("bwss:label".to_string(), "l".to_string(), false)]);
-                assert_eq!(p.acl_add, vec!["/bin/a".to_string()]);
-                assert!(
-                    matches!(&p.value, ValueChange::Set { secret, base_mark, .. } if secret == b"pw" && *base_mark == [7; 32])
-                );
-            }
-            _ => panic!("wrong op"),
-        }
+        let Op::Patch(p) = &back[0] else { panic!() };
+        assert_eq!((p.id.as_str(), p.base_revision.as_str()), ("pid", "r1"));
+        assert_eq!(p.cipher_id.as_deref(), Some("c1"));
+        assert_eq!(p.set, vec![("bwss:label".to_string(), "l".to_string(), false)]);
+        assert_eq!(p.acl_add, vec!["/bin/a".to_string()]);
+        assert!(
+            matches!(&p.value, ValueChange::Set { secret, base_mark, .. } if secret == b"pw" && *base_mark == [7; 32])
+        );
     }
 
     #[test]

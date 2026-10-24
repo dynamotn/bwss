@@ -130,16 +130,19 @@ impl<'k> Fields<'k> {
     /// Sets the first field called `name` to an already encrypted value,
     /// keeping its kind; appends a field when there is none.
     fn set_enc(&mut self, name: &str, enc: String, hidden: bool) {
-        let replacement = self.new_field(name, enc.clone(), hidden);
-        match self.entries.iter_mut().find(|(_, n)| n.as_deref() == Some(name)) {
-            Some((raw, _)) => {
-                if let Some(f) = raw.as_object_mut() {
-                    f.insert("value".into(), Value::String(enc));
-                } else {
-                    *raw = replacement;
-                }
+        // Only an object can carry a name, so the first named entry is one.
+        let existing = self
+            .entries
+            .iter_mut()
+            .find_map(|(raw, n)| if n.as_deref() == Some(name) { raw.as_object_mut() } else { None });
+        match existing {
+            Some(f) => {
+                f.insert("value".into(), Value::String(enc));
             }
-            None => self.entries.push((replacement, Some(name.to_owned()))),
+            None => {
+                let field = self.new_field(name, enc, hidden);
+                self.entries.push((field, Some(name.to_owned())));
+            }
         }
     }
 
@@ -571,10 +574,8 @@ mod tests {
     }
 
     fn marked(c: &Value, k: &Keys) -> Box<MarkedItem> {
-        match scan(c, k) {
-            Scan::Marked(m) => m,
-            other => panic!("expected Marked, got {other:?}"),
-        }
+        let Scan::Marked(m) = scan(c, k) else { panic!() };
+        m
     }
 
     fn keep(c: &Value, k: &Keys) -> Patch {
@@ -1085,6 +1086,14 @@ mod tests {
         p.acl_add = vec!["b".into()];
         assert_eq!(apply(&c, &p, &k).unwrap()["fields"], c["fields"]);
 
+        // an ACL field holding null counts as empty and keeps its kind
+        let mut null_acl = login(&k, &[("bwss:id", "x", false), ("bwss:acl", "", true)], Some("pw"), None);
+        null_acl["fields"][1]["value"] = Value::Null;
+        p.acl_add = vec!["/bin/y".into()];
+        let body = apply(&null_acl, &p, &k).unwrap();
+        assert_eq!(field(&body, &k.user, "bwss:acl"), Some(("/bin/y".into(), 1)));
+        assert_eq!(body["fields"].as_array().unwrap().len(), 2);
+
         // no ACL yet: a hidden field is added
         let c = login(&k, &[("bwss:id", "x", false)], Some("pw"), None);
         p.acl_add = vec!["/bin/x".into()];
@@ -1404,6 +1413,12 @@ mod tests {
         assert!(matches!(
             strip(&with_key(&c, "deletedDate", json!("2026-05-05T00:00:00Z")), &k),
             Err(WriteError::Gone)
+        ));
+        let mut undated = c.clone();
+        undated.as_object_mut().unwrap().remove("revisionDate");
+        assert!(matches!(
+            strip(&undated, &k),
+            Err(WriteError::Uninspectable(why)) if why == "the item has no revisionDate"
         ));
         let other = keys();
         assert!(matches!(strip(&c, &other), Err(WriteError::Crypto(_))));

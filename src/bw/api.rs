@@ -125,6 +125,10 @@ impl std::fmt::Debug for ApiKey {
 const DEVICE_TYPE: &str = "8";
 const CLIENT_NAME: &str = "bwss";
 
+fn build_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, ApiError> {
+    builder.build().map_err(|e| ApiError::Network(e.to_string()))
+}
+
 pub struct Api {
     urls: ServerUrls,
     http: reqwest::Client,
@@ -140,14 +144,13 @@ pub const MAX_BODY: usize = 256 * 1024 * 1024;
 
 impl Api {
     pub fn new(urls: ServerUrls, device_id: String) -> Result<Self, ApiError> {
-        let http = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             // A redirect could carry the API key to another host.
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("bwss/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .user_agent(concat!("bwss/", env!("CARGO_PKG_VERSION")));
+        let http = build_client(builder)?;
         Ok(Api { urls, http, device_id, token: None, user_id: None, body_limit: MAX_BODY })
     }
 
@@ -487,6 +490,8 @@ mod tests {
         );
         assert_eq!(resolve_server_urls("http://127.0.0.1:8080").unwrap().identity, "http://127.0.0.1:8080/identity");
         assert!(resolve_server_urls("http://bw.example.org").is_err());
+        let e = resolve_server_urls("not a url").unwrap_err();
+        assert!(e.starts_with("invalid server URL \"not a url\": "), "{e}");
         assert!(resolve_server_urls("https://u:p@bw.example.org").is_err());
     }
 
@@ -635,6 +640,78 @@ mod tests {
         let error = answer(plain(&big).replace("200 OK", "500 X"), big.clone());
         let e = prelogin_with_limit(&error, 16).await.unwrap_err();
         assert!(matches!(&e, ApiError::Protocol(m) if m.contains("larger than 16 bytes")), "{e}");
+    }
+
+    #[tokio::test]
+    async fn prelogin_reads_both_kdf_kinds_and_refuses_others() {
+        let reply = |json: &str| {
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", json.len());
+            answer(head, json.as_bytes().to_vec())
+        };
+        let argon = reply(r#"{"kdf":1,"kdfIterations":3,"kdfMemory":64,"kdfParallelism":4}"#);
+        assert_eq!(
+            prelogin_with_limit(&argon, 1024).await.unwrap(),
+            KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 }
+        );
+        // A missing parameter reads as 0, which validation rejects later.
+        let bare = reply(r#"{"kdf":1}"#);
+        assert_eq!(
+            prelogin_with_limit(&bare, 1024).await.unwrap(),
+            KdfParams::Argon2id { iterations: 0, memory_mib: 0, parallelism: 0 }
+        );
+        let other = reply(r#"{"kdf":7}"#);
+        let e = prelogin_with_limit(&other, 1024).await.unwrap_err();
+        assert!(matches!(&e, ApiError::Protocol(m) if m == "unsupported KDF type Some(7)"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_utf8_is_read_lossily() {
+        let body = b"{\"message\":\"bad \xff byte\"}".to_vec();
+        let head = format!("HTTP/1.1 400 Bad\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let url = answer(head, body);
+        let e = prelogin_with_limit(&url, 1024).await.unwrap_err();
+        assert!(matches!(&e, ApiError::Http { status: 400, message } if message == "bad \u{fffd} byte"), "{e}");
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_built_is_a_network_error() {
+        let e = build_client(reqwest::Client::builder().user_agent("bad\nagent")).unwrap_err();
+        assert!(matches!(&e, ApiError::Network(m) if !m.is_empty()), "{e}");
+        assert!(e.is_transient());
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_is_a_network_error() {
+        // The server announces 1000 bytes, sends 5 and hangs up.
+        let url = answer(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n".to_owned(),
+            b"short".to_vec(),
+        );
+        let e = prelogin_with_limit(&url, 4096).await.unwrap_err();
+        assert!(matches!(e, ApiError::Network(_)), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_sync_without_a_profile_is_refused() {
+        let body = br#"{"ciphers":[]}"#.to_vec();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let url = answer(head, body);
+        let mut api = Api::new(resolve_server_urls(&url).unwrap(), "d".into()).unwrap();
+        api.token = Some((Zeroizing::new("tok".into()), Instant::now() + Duration::from_secs(60)));
+        let e = api.sync().await.unwrap_err();
+        assert!(matches!(&e, ApiError::Protocol(m) if m == "sync response has no profile"), "{e}");
+        assert!(api.user_id.is_none());
+    }
+
+    #[test]
+    fn validation_errors_are_part_of_the_server_text() {
+        let body = json!({ "message": "invalid", "validationErrors": { "Name": ["too long"] } });
+        assert_eq!(describe_error(&body), r#"invalid {"Name":["too long"]}"#);
+    }
+
+    #[test]
+    fn normalizes_empty_keys_unchanged() {
+        assert_eq!(normalize_keys(json!({ "": 1, "AbC": 2 })), json!({ "": 1, "abC": 2 }));
     }
 
     #[test]

@@ -308,10 +308,8 @@ mod tests {
     }
 
     fn marked(s: Scan) -> Box<MarkedItem> {
-        match s {
-            Scan::Marked(m) => m,
-            other => panic!("expected Marked, got {other:?}"),
-        }
+        let Scan::Marked(m) = s else { panic!() };
+        m
     }
 
     #[test]
@@ -483,6 +481,21 @@ mod tests {
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
         c["fields"][0]["name"] = json!("2.bad|bad|bad");
         assert!(matches!(scan(&c, &k), Scan::Uninspectable(_)));
+        // a marker value that does not decrypt -> Uninspectable, named by cipher id
+        let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
+        c["fields"][0]["value"] = json!("2.bad|bad|bad");
+        assert!(matches!(scan(&c, &k), Scan::Uninspectable(why) if why == "c1: marker cannot be decrypted"));
+        // a later value that does not decrypt -> Uninspectable, never a partial item
+        let mut c = login(&k, &[id.clone(), f("bwss:password", "pw")], None, None);
+        c["fields"][1]["value"] = json!("2.bad|bad|bad");
+        assert!(matches!(scan(&c, &k), Scan::Uninspectable(why) if why == "c1: a value cannot be decrypted"));
+        // base64 that does not decode -> Skipped
+        let c =
+            login(&k, &[id.clone(), f("bwss:encoding", "base64"), f("bwss:password", "!!not base64!!")], None, None);
+        assert!(matches!(scan(&c, &k), Scan::Skipped(why) if why == "c1: value is not valid base64"));
+        // the memory-only session collection falls back to login
+        let c = login(&k, &[id.clone(), f("bwss:collection", " Session ")], Some("pw"), None);
+        assert_eq!(marked(scan(&c, &k)).item.collection, "login");
         // unparseable creationDate -> no date, so it sorts last
         let mut c = login(&k, std::slice::from_ref(&id), Some("pw"), None);
         c["creationDate"] = json!("not a date");

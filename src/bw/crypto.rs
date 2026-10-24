@@ -75,15 +75,28 @@ pub fn derive_master_key(password: &str, email: &str, kdf: KdfParams) -> Result<
             pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.as_bytes(), iterations, out.as_mut());
         }
         KdfParams::Argon2id { iterations, memory_mib, parallelism } => {
-            let params = argon2::Params::new(memory_mib * 1024, iterations, parallelism, Some(32))
-                .map_err(|e| CryptoError::Kdf(e.to_string()))?;
             let salt = Sha256::digest(salt.as_bytes());
-            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-                .hash_password_into(password.as_bytes(), &salt, out.as_mut())
-                .map_err(|e| CryptoError::Kdf(e.to_string()))?;
+            argon2id(password.as_bytes(), &salt, memory_mib * 1024, iterations, parallelism, out.as_mut())?;
         }
     }
     Ok(out)
+}
+
+/// Argon2id over `password` and `salt`. `derive_master_key` validates the
+/// parameters first; this refuses a set (or a salt) the algorithm rejects.
+fn argon2id(
+    password: &[u8],
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+    out: &mut [u8],
+) -> Result<(), CryptoError> {
+    let params = argon2::Params::new(memory_kib, iterations, parallelism, Some(32))
+        .map_err(|e| CryptoError::Kdf(e.to_string()))?;
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(password, salt, out)
+        .map_err(|e| CryptoError::Kdf(e.to_string()))
 }
 
 /// The hash a server stores for password logins.
@@ -350,9 +363,51 @@ mod tests {
 
     #[test]
     fn kdf_bounds() {
-        assert!(KdfParams::Pbkdf2 { iterations: 1 }.validate().is_err());
-        assert!(KdfParams::Argon2id { iterations: 3, memory_mib: 4096, parallelism: 4 }.validate().is_err());
-        assert!(KdfParams::Pbkdf2 { iterations: 600_000 }.validate().is_ok());
+        let kdf = |msg: &str| Err(CryptoError::Kdf(msg.to_owned()));
+        assert_eq!(KdfParams::Pbkdf2 { iterations: 1 }.validate(), kdf("PBKDF2 iterations 1"));
+        assert_eq!(
+            KdfParams::Argon2id { iterations: 1, memory_mib: 64, parallelism: 4 }.validate(),
+            kdf("Argon2 iterations 1")
+        );
+        assert_eq!(
+            KdfParams::Argon2id { iterations: 3, memory_mib: 4096, parallelism: 4 }.validate(),
+            kdf("Argon2 memory 4096 MiB")
+        );
+        assert_eq!(
+            KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 17 }.validate(),
+            kdf("Argon2 parallelism 17")
+        );
+        assert_eq!(KdfParams::Pbkdf2 { iterations: 600_000 }.validate(), Ok(()));
+        assert_eq!(KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 }.validate(), Ok(()));
+    }
+
+    #[test]
+    fn argon2id_refuses_what_the_algorithm_rejects() {
+        let mut out = [0u8; 32];
+        // Memory below 8 KiB per lane.
+        let e = argon2id(b"pw", &[0; 32], 0, 3, 4, &mut out).unwrap_err();
+        assert!(matches!(&e, CryptoError::Kdf(m) if !m.is_empty()), "{e}");
+        // A salt shorter than 8 bytes.
+        let e = argon2id(b"pw", &[1, 2], 64 * 1024, 3, 4, &mut out).unwrap_err();
+        assert!(matches!(&e, CryptoError::Kdf(m) if !m.is_empty()), "{e}");
+        assert_eq!(out, [0u8; 32], "nothing is written on failure");
+        argon2id(b"pw", &[0; 32], 64, 3, 4, &mut out).unwrap();
+        assert_ne!(out, [0u8; 32]);
+    }
+
+    #[test]
+    fn keys_of_the_wrong_length_are_refused() {
+        for len in [0, 32, 63, 65] {
+            assert_eq!(SymmetricKey::from_bytes(&vec![7; len]).unwrap_err(), CryptoError::KeyLength(len));
+        }
+        let key = SymmetricKey::from_bytes(&[7; 64]).unwrap();
+        assert_eq!(key.to_bytes().as_slice(), [7u8; 64].as_slice());
+    }
+
+    #[test]
+    fn symmetric_key_debug_hides_the_key_bytes() {
+        let key = SymmetricKey::generate();
+        assert_eq!(format!("{key:?}"), "SymmetricKey(..)");
     }
 
     #[test]
