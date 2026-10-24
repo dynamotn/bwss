@@ -22,6 +22,7 @@ use crate::model::{ItemData, LOGIN_COLLECTION};
 
 /// Bitwarden's limit on the encrypted size of a custom field value.
 const MAX_FIELD_ENC: usize = 5_000;
+const TYPE_LOGIN: u64 = 1;
 const TYPE_SECURE_NOTE: u64 = 2;
 const FIELD_TEXT: u64 = 0;
 const FIELD_HIDDEN: u64 = 1;
@@ -365,6 +366,10 @@ pub fn strip(cipher: &Value, keys: &Keys) -> Result<Map<String, Value>, WriteErr
 /// what the answer needs is decrypted. An item that cannot be read is an
 /// error, never `false`: it must not be trashed.
 pub fn has_foreign_content(cipher: &Value, keys: &Keys) -> Result<bool, WriteError> {
+    // Card, identity and SSH key data is never inspected: not bare.
+    if !matches!(cipher.get("type").and_then(Value::as_u64), Some(TYPE_LOGIN | TYPE_SECURE_NOTE)) {
+        return Ok(true);
+    }
     let non_empty_array = |v: Option<&Value>| v.and_then(Value::as_array).is_some_and(|a| !a.is_empty());
     if non_empty_array(cipher.get("attachments"))
         || non_empty_array(cipher.get("passwordHistory"))
@@ -639,7 +644,7 @@ mod tests {
         let body = apply(&c, &set_secret(&c, &k, b"new"), &k).unwrap();
         assert_eq!(dec_with(&k.user, &body["notes"]), "new");
         assert_eq!(body["fields"], c["fields"]);
-        assert_rest_unchanged(&c, &body, &["fields", "notes", "passwordHistory"]);
+        assert_rest_unchanged(&c, &body, &["notes", "passwordHistory"]);
         assert_eq!(body["passwordHistory"], json!([]));
 
         // BwssNotes source: notes change, fields unchanged
@@ -1044,6 +1049,12 @@ mod tests {
             assert!(has_foreign_content(&c, &k).unwrap(), "{what}");
         }
 
+        // types other than login and secure note are never bare
+        for t in [0, 3, 4, 5, 6] {
+            assert!(has_foreign_content(&with_key(&b, "type", json!(t)), &k).unwrap(), "type {t}");
+        }
+        assert!(has_foreign_content(&with_key(&b, "type", Value::Null), &k).unwrap(), "no type");
+
         // a null field name has no namespace
         let mut nameless = b.clone();
         nameless["fields"] = json!([{ "type": 0, "name": null, "value": null }]);
@@ -1129,9 +1140,16 @@ mod tests {
         assert_eq!(body["fields"][0], c["fields"][1], "kept fields are byte for byte");
         assert_eq!(body["fields"][1], c["fields"][3]);
         assert_eq!(body["lastKnownRevisionDate"], c["revisionDate"]);
+        assert_eq!(body["login"]["password"], c["login"]["password"], "login password untouched");
         assert_rest_unchanged(&c, &body, &["fields"]);
         assert_eq!(body["notes"], c["notes"]);
         assert!(has_foreign_content(&as_server(&body), &k).unwrap(), "the user's login stays");
+
+        // a field with a null name is kept
+        let mut c = note(&k, &[("bwss:id", "x", false)], None);
+        let nameless = json!({ "type": 0, "name": null, "value": null });
+        c["fields"].as_array_mut().unwrap().push(nameless.clone());
+        assert_eq!(strip(&c, &k).unwrap()["fields"], json!([nameless]));
 
         // bwss:location=notes: the notes held bwss's secret
         let c = note(
