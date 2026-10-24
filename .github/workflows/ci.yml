@@ -130,15 +130,30 @@ jobs:
           for _ in $(seq 60); do curl -fsS http://127.0.0.1:8080/alive && exit 0; sleep 2; done
           exit 1
       - name: Measure coverage
-        # Task 12 raises COVERAGE_MIN to 100.
+        # The gate: scripts/coverage.sh fails below COVERAGE_MIN (default 100).
         run: |
-          docker run --rm --network host -e BW_E2E_URL=http://127.0.0.1:8080 -e COVERAGE_MIN=0 \
+          docker run --rm --network host -e BW_E2E_URL=http://127.0.0.1:8080 \
             -v "$PWD":/src -v bwss-e2e-target:/target bwss-e2e scripts/coverage.sh
         timeout-minutes: 45
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
         with:
           name: lcov
           path: target/lcov.info
+          if-no-files-found: warn
+
+  msrv:
+    name: MSRV (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - run: cargo check --locked --all-targets
 
   build:
     name: static binary (${{ matrix.arch }})

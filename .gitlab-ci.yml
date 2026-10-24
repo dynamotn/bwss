@@ -95,6 +95,46 @@ e2e:
       dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
   timeout: 20 minutes
 
+# Line coverage of src/ (unit + end-to-end), gated at 100% by
+# scripts/coverage.sh. Same setup as e2e, plus cargo-llvm-cov.
+coverage:
+  stage: test
+  extends: .cargo-cache
+  services:
+    - name: $VAULTWARDEN_IMAGE
+      alias: vaultwarden
+      variables:
+        SIGNUPS_ALLOWED: "true"
+        SIGNUPS_VERIFY: "false"
+        DISABLE_ICON_DOWNLOAD: "true"
+        I_REALLY_WANT_VOLATILE_STORAGE: "true"
+        LOGIN_RATELIMIT_MAX_BURST: "1000"
+        LOGIN_RATELIMIT_SECONDS: "1"
+  variables:
+    BW_E2E_URL: http://127.0.0.1:8080
+    PYTHONDONTWRITEBYTECODE: "1"
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install -y --no-install-recommends dbus dbus-daemon libsecret-tools socat curl
+      python3 python3-pytest python3-secretstorage python3-cryptography python3-jeepney
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-llvm-cov --locked --version '^0.9'
+  script:
+    - socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:vaultwarden:80 &
+    - for _ in $(seq 60); do curl -fsS "$BW_E2E_URL/alive" && break; sleep 2; done
+    - install -o root -g root -m 755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
+    - useradd --create-home tester
+    # The script keeps lcov.info in the llvm-cov target directory.
+    - scripts/coverage.sh
+  after_script:
+    - mkdir -p coverage && cp target/llvm-cov-target/lcov.info coverage/lcov.info
+  artifacts:
+    when: always
+    paths: [coverage/lcov.info]
+    expire_in: 30 days
+  timeout: 45 minutes
+
 # Fully static musl binaries, built without any cache.
 .static-binary:
   stage: build
