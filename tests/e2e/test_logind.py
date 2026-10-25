@@ -16,6 +16,7 @@ import pytest
 from conftest import HERE, Daemon
 
 FAKE_LOGIND = str(HERE / "fake_logind.py")
+SPOOF_LOCK = str(HERE / "spoof_lock.py")
 SESSION = "/org/freedesktop/login1/session/_32"
 PASSWORD = "open sesame"
 
@@ -259,6 +260,59 @@ def test_without_a_session_of_its_own_the_lock_of_another_users_session_does_not
         assert log.count("session lock requested") == 1, "only our user's session locks: " + log
     finally:
         d.stop()
+
+
+def spoof_lock(address):
+    """A client that is not logind sends Session.Lock to every connection."""
+    subprocess.run([sys.executable, SPOOF_LOCK, address, SESSION], check=True, timeout=30)
+
+
+def assert_only_the_genuine_lock_locked(d):
+    """After a spoofed and then a genuine Lock: locked, by the genuine one only."""
+    assert wait_locked(d)
+    assert wait_log(d, "not sent by logind"), (d.home / "daemon.log").read_text()
+    log = (d.home / "daemon.log").read_text()
+    assert log.count("session lock requested") == 1, "only logind's Lock locks: " + log
+
+
+def test_a_lock_signal_not_sent_by_logind_does_not_lock_a_known_session(started, logind, system_bus):
+    unlocked(started)
+    spoof_lock(system_bus)
+    logind.emit("lock")
+    assert_only_the_genuine_lock_locked(started)
+
+
+def test_a_lock_signal_not_sent_by_logind_does_not_lock_without_a_session_of_our_own(
+    system_bus, logind_without_pid_lookup
+):
+    d = daemon_on(system_bus)
+    d.env.pop("XDG_SESSION_ID", None)
+    d.start()
+    try:
+        assert wait_log(d, "(of any session of this user)"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        spoof_lock(system_bus)
+        logind_without_pid_lookup.emit("lock")
+        assert_only_the_genuine_lock_locked(d)
+    finally:
+        d.stop()
+
+
+def test_a_session_whose_user_cannot_be_read_still_locks_when_logind_says_so(system_bus):
+    f = FakeLogind(system_bus, "unknown-pid", "no-user")
+    d = daemon_on(system_bus)
+    d.env.pop("XDG_SESSION_ID", None)
+    d.start()
+    try:
+        assert wait_log(d, "(of any session of this user)"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        f.emit("lock")
+        assert wait_locked(d)
+        assert wait_log(d, "cannot read the user of session"), (d.home / "daemon.log").read_text()
+        assert SESSION in (d.home / "daemon.log").read_text()
+    finally:
+        d.stop()
+        f.stop()
 
 
 def test_a_bus_that_refuses_the_subscription_is_logged_and_the_daemon_keeps_serving(limited_bus):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in for systemd-logind on a private bus.
 
-    fake_logind.py ADDRESS SESSION_PATH [unknown-pid]
+    fake_logind.py ADDRESS SESSION_PATH [unknown-pid] [no-user]
 
 Owns org.freedesktop.login1 on ADDRESS and answers Manager.GetSessionByPID and
 Manager.GetSession with SESSION_PATH. With "unknown-pid", GetSessionByPID
@@ -9,7 +9,8 @@ fails instead, as for a process that belongs to no session; GetSession still
 answers. Both SESSION_PATH and a second session, OTHER_SESSION, answer
 Properties.Get("User") with a (uid, user path) struct: SESSION_PATH for the
 uid this script runs as, OTHER_SESSION for the next one. Prints "ready" once
-it owns the name; then reads commands from stdin, one per line:
+it owns the name. With "no-user", Properties.Get fails instead, as for a
+session that is gone. Then reads commands from stdin, one per line:
 
     sleep   emit Manager.PrepareForSleep(true)
     resume  emit Manager.PrepareForSleep(false)
@@ -31,7 +32,8 @@ NAME = "org.freedesktop.login1"
 MANAGER = DBusAddress("/org/freedesktop/login1", bus_name=NAME, interface="org.freedesktop.login1.Manager")
 
 address, session_path = sys.argv[1], sys.argv[2]
-unknown_pid = sys.argv[3:] == ["unknown-pid"]
+unknown_pid = "unknown-pid" in sys.argv[3:]
+no_user = "no-user" in sys.argv[3:]
 OTHER_SESSION = "/org/freedesktop/login1/session/_99"
 USERS = {session_path: os.getuid(), OTHER_SESSION: os.getuid() + 1}
 session = DBusAddress(session_path, bus_name=NAME, interface="org.freedesktop.login1.Session")
@@ -62,6 +64,8 @@ while True:
         member = msg.header.fields.get(HeaderFields.member)
         if member == "GetSessionByPID" and unknown_pid:
             conn.send(new_error(msg, "org.freedesktop.login1.NoSessionForPID", "s", ("no session for the pid",)))
+        elif member == "Get" and no_user:
+            conn.send(new_error(msg, "org.freedesktop.DBus.Error.UnknownObject", "s", ("no such session",)))
         elif member == "Get" and msg.header.fields.get(HeaderFields.path) in USERS:
             uid = USERS[msg.header.fields[HeaderFields.path]]
             conn.send(new_method_return(msg, "v", ((("(uo)"), (uid, "/org/freedesktop/login1/user/_%d" % uid)),)))

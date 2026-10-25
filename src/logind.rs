@@ -70,9 +70,21 @@ where
     };
     let locks = Signals(zbus::MessageStream::for_match_rule(session_lock_rule(scope)?, conn, None).await?);
     let ours = |msg: zbus::Message| async move {
-        match only_uid {
-            None => true,
-            Some(uid) => session_user(conn, &msg).await.is_ok_and(|session_uid| session_uid == uid),
+        if !sent_by_logind(conn, &msg).await {
+            tracing::warn!("ignoring a Lock signal not sent by logind");
+            return false;
+        }
+        let Some(uid) = only_uid else { return true };
+        match session_user(conn, &msg).await {
+            Ok(session_uid) => session_uid == uid,
+            // The signal is logind's, so a session we cannot read the user of locks (fail closed).
+            Err(e) => {
+                tracing::warn!(
+                    "cannot read the user of session {:?}, so its lock locks the keyring: {e}",
+                    msg.header().path()
+                );
+                true
+            }
         }
     };
     tracing::info!(
@@ -118,6 +130,20 @@ impl Stream for Signals {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
         Pin::new(&mut self.0).poll_next(cx).map(|item| item.and_then(Result::ok))
     }
+}
+
+/// Whether logind itself sent `msg`. A unicast signal reaches us whatever
+/// match rule we added, so the sender is compared with logind's current
+/// unique name, looked up per message: a restarted logind has a new one.
+async fn sent_by_logind(conn: &zbus::Connection, msg: &zbus::Message) -> bool {
+    let owner = logind_owner(conn).await;
+    let header = msg.header();
+    owner.is_ok_and(|owner| header.sender().is_some_and(|sender| sender.as_str() == owner.as_str()))
+}
+
+async fn logind_owner(conn: &zbus::Connection) -> zbus::Result<zbus::names::OwnedUniqueName> {
+    let bus = zbus::fdo::DBusProxy::new(conn).await?;
+    Ok(bus.get_name_owner(zbus::names::BusName::try_from(SERVICE)?).await?)
 }
 
 /// The uid of the user a session belongs to: the first field of its `User`
@@ -228,16 +254,16 @@ mod tests {
         }
     }
 
-    /// A stream of ready `items`, which then ends. With `after_yield`, the
-    /// first poll is pending once, so another stream is polled before it.
+    /// A stream of ready `items`, which then ends. Its
+    /// first `pending` polls are pending, so another stream is polled meanwhile.
     struct Items {
         items: std::collections::VecDeque<zbus::Message>,
-        pending_once: bool,
+        pending: usize,
     }
 
     impl Items {
-        fn new(items: impl IntoIterator<Item = zbus::Message>, after_yield: bool) -> Self {
-            Items { items: items.into_iter().collect(), pending_once: after_yield }
+        fn new(items: impl IntoIterator<Item = zbus::Message>, pending: usize) -> Self {
+            Items { items: items.into_iter().collect(), pending }
         }
     }
 
@@ -245,7 +271,8 @@ mod tests {
         type Item = zbus::Message;
 
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-            if std::mem::take(&mut self.pending_once) {
+            if self.pending > 0 {
+                self.pending -= 1;
                 cx.waker().wake_by_ref();
                 return std::task::Poll::Pending;
             }
@@ -253,16 +280,24 @@ mod tests {
         }
     }
 
-    fn any_session(_: zbus::Message) -> std::future::Ready<bool> {
-        std::future::ready(true)
+    /// The judge of every `serve` test: only the lock of session `_32` is ours.
+    /// One judge for all, so one `serve` instantiation sees every outcome.
+    fn our_session(msg: zbus::Message) -> std::future::Ready<bool> {
+        std::future::ready(msg.header().path().is_some_and(|path| path.as_str().ends_with("/_32")))
     }
 
     fn sleep_signal(starting: bool) -> zbus::Message {
         zbus::Message::signal(MANAGER_PATH, MANAGER_IFACE, "PrepareForSleep").build(&starting).unwrap()
     }
 
+    fn lock_signal_of(session: &str) -> zbus::Message {
+        zbus::Message::signal(format!("/org/freedesktop/login1/session/{session}"), SESSION_IFACE, "Lock")
+            .build(&())
+            .unwrap()
+    }
+
     fn session_lock_signal() -> zbus::Message {
-        zbus::Message::signal("/org/freedesktop/login1/session/_32", SESSION_IFACE, "Lock").build(&()).unwrap()
+        lock_signal_of("_32")
     }
 
     #[tokio::test]
@@ -276,8 +311,8 @@ mod tests {
     #[tokio::test]
     async fn going_to_sleep_locks_and_waking_up_does_not() {
         let locked = AtomicUsize::new(0);
-        let sleeps = Items::new([sleep_signal(false), sleep_signal(true)], false);
-        serve(sleeps, None::<Items>, &any_session, &counting(&locked)).await;
+        let sleeps = Items::new([sleep_signal(false), sleep_signal(true)], 0);
+        serve(sleeps, None::<Items>, &our_session, &counting(&locked)).await;
         assert_eq!(locked.load(Ordering::SeqCst), 1, "PrepareForSleep(true) locks once, (false) never");
     }
 
@@ -286,26 +321,20 @@ mod tests {
         let locked = AtomicUsize::new(0);
         // The connection closes (the sleep stream ends) only after a yield,
         // so the lock signal is certainly handled first, on every run.
-        let sleeps = Items::new([], true);
-        serve(sleeps, Some(Items::new([session_lock_signal()], false)), &any_session, &counting(&locked)).await;
+        let sleeps = Items::new([], 1);
+        serve(sleeps, Some(Items::new([session_lock_signal()], 0)), &our_session, &counting(&locked)).await;
         assert_eq!(locked.load(Ordering::SeqCst), 1, "Session.Lock locks once");
     }
 
     #[tokio::test]
     async fn a_session_lock_signal_that_is_not_ours_does_not_lock() {
         let locked = AtomicUsize::new(0);
-        let judged = AtomicUsize::new(0);
-        // The sleep stream ends only after a yield, so the lock signal is
-        // certainly judged first, on every run.
-        let sleeps = Items::new([], true);
-        let locks = Items::new([session_lock_signal()], false);
-        let not_ours = |_: zbus::Message| {
-            judged.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(false)
-        };
-        serve(sleeps, Some(locks), &not_ours, &counting(&locked)).await;
-        assert_eq!(judged.load(Ordering::SeqCst), 1, "the signal is judged");
-        assert_eq!(locked.load(Ordering::SeqCst), 0, "a lock of a session that is not ours does not lock");
+        // Each loop turn handles one lock signal, and the sleep stream ends
+        // only after two pending polls, so both are certainly judged first.
+        let sleeps = Items::new([], 2);
+        let locks = Items::new([lock_signal_of("_99"), session_lock_signal()], 0);
+        serve(sleeps, Some(locks), &our_session, &counting(&locked)).await;
+        assert_eq!(locked.load(Ordering::SeqCst), 1, "only the lock of our own session locks, not the other one");
     }
 
     #[tokio::test]
@@ -313,8 +342,8 @@ mod tests {
         let locked = AtomicUsize::new(0);
         // The sleep signal arrives only after a yield, so the (already ended)
         // session stream is certainly seen first, on every run.
-        let sleeps = Items::new([sleep_signal(true)], true);
-        serve(sleeps, Some(Items::new([], false)), &any_session, &counting(&locked)).await;
+        let sleeps = Items::new([sleep_signal(true)], 1);
+        serve(sleeps, Some(Items::new([], 0)), &our_session, &counting(&locked)).await;
         assert_eq!(locked.load(Ordering::SeqCst), 1, "sleep locks although screen lock no longer can");
     }
 }

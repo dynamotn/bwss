@@ -471,8 +471,11 @@ Unchanged from `legacy`:
   to no session (a systemd user unit, the usual install) has no session of
   its own, so it listens to the `Lock` signal of every session and locks
   only when that session's `User` property names its own real uid; the lock
-  of another user's session is ignored. Waking up does not unlock. Without
-  a system bus or without logind, bwss logs a warning and goes on. The
+  of another user's session is ignored, but a session whose user cannot be
+  read locks (fail closed). A `Lock` is accepted only from logind's
+  unique name, looked up for each signal, because a unicast signal from any
+  local client reaches bwss whatever match rule it added. Waking up does
+  not unlock. Without a system bus or without logind, bwss logs a warning and goes on. The
   listener is not tied to `lock_timeout_minutes`.
 - The locked index (`~/.cache/bwss/locked-index.json`, `"format": 3`)
   keeps, per marked item, its id, its collection and
