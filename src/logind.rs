@@ -56,6 +56,14 @@ async fn watch(conn: &zbus::Connection, lock: Lock) {
     }
 }
 
+/// Subscribes to logind's signals, then hands them to `serve`.
+///
+/// Setting up waits for the bus, one reply at a time. zbus reads every reply
+/// and every stream from one socket and stops at a full stream, so no reply
+/// is awaited while a stream that any client can feed sits unread: the owner
+/// changes come from the bus itself only, the lookups run before logind's
+/// signals are subscribed to, and the sleep stream is read while the `Lock`
+/// subscription waits for its reply.
 async fn listen(conn: &zbus::Connection, lock: Lock) -> zbus::Result<()> {
     let bus = zbus::fdo::DBusProxy::new(conn).await?;
     // Subscribe before the lookup, so no change of owner falls in between.
@@ -81,8 +89,11 @@ async fn listen(conn: &zbus::Connection, lock: Lock) -> zbus::Result<()> {
             (None, Some(real_uid()))
         }
     };
-    let sleeps = manager.receive_signal("PrepareForSleep").await?;
-    let locks = Signals(zbus::MessageStream::for_match_rule(session_lock_rule(scope)?, conn, None).await?);
+    let mut sleeps: Messages = Box::pin(manager.receive_signal("PrepareForSleep").await?);
+    let subscribe = zbus::MessageStream::for_match_rule(session_lock_rule(scope)?, conn, None);
+    // A sleep stream that ended was logged, and nothing is left to listen to.
+    let Some(locks) = while_draining(subscribe, &mut sleeps, &lock).await else { return Ok(()) };
+    let locks = Signals(locks?);
     let session_conn = conn.clone();
     let user_of: UserOf = Arc::new(move |msg| {
         let conn = session_conn.clone();
@@ -95,7 +106,7 @@ async fn listen(conn: &zbus::Connection, lock: Lock) -> zbus::Result<()> {
     let listener = Listener {
         owner,
         owners: Box::pin(Owners(changes)),
-        sleeps: Box::pin(sleeps),
+        sleeps,
         locks: Box::pin(locks),
         only: only_uid.map(|uid| (uid, user_of)),
         lock,
@@ -105,6 +116,42 @@ async fn listen(conn: &zbus::Connection, lock: Lock) -> zbus::Result<()> {
     // A lookup still running locks on its own if it has to.
     lookups.detach_all();
     Ok(())
+}
+
+/// Waits for `subscription` while reading `sleeps`, and locks on every sleep
+/// meanwhile; `None` if the sleep stream ended first.
+///
+/// zbus reads every reply and every stream from one socket and stops at a
+/// full stream, so a flood of forged sleep signals left unread would keep the
+/// reply from ever arriving.
+async fn while_draining<T>(subscription: impl Future<Output = T>, sleeps: &mut Messages, lock: &Lock) -> Option<T> {
+    let mut subscription = std::pin::pin!(subscription);
+    loop {
+        tokio::select! {
+            // The subscription first, so a steady flood cannot starve it.
+            biased;
+            done = &mut subscription => return Some(done),
+            msg = next(sleeps) => {
+                if !on_sleep(msg, lock).await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Locks on `PrepareForSleep(true)`; `false` once the sleep stream ended
+/// (`msg` is `None`).
+async fn on_sleep(msg: Option<zbus::Message>, lock: &Lock) -> bool {
+    let Some(msg) = msg else {
+        tracing::warn!("the logind connection closed, so sleep and screen lock no longer lock the keyring");
+        return false;
+    };
+    if msg.body().deserialize::<bool>().is_ok_and(locks_on_sleep) {
+        tracing::info!("system is going to sleep");
+        lock().await;
+    }
+    true
 }
 
 /// The real uid of this process. logind exists on Linux only, so elsewhere no
@@ -185,10 +232,11 @@ struct Listener {
 /// Calls `lock` on every sleep and on every session lock logind sent for us,
 /// until the sleep stream ends (the connection to logind closed).
 ///
-/// Nothing here waits for the bus: zbus reads every stream and every reply
-/// from one socket, and a stream left unread stops it. The sender is compared
-/// with logind's name as tracked from the bus, and the user of a session is
-/// read in a task in `lookups`, which locks on its own.
+/// Nothing in this loop waits for the bus: zbus reads every stream and every
+/// reply from one socket, and a stream left unread stops it (`listen` says
+/// how setting up avoids that). The sender is compared with logind's name as
+/// tracked from the bus, and the user of a session is read in a task in
+/// `lookups`, which locks on its own.
 async fn serve(listener: Listener, lookups: &mut JoinSet<()>) {
     let Listener { mut owner, owners, mut sleeps, locks, only, lock } = listener;
     let (mut owners, mut locks) = (Some(owners), Some(locks));
@@ -213,13 +261,8 @@ async fn serve(listener: Listener, lookups: &mut JoinSet<()>) {
                 None => owners = None,
             },
             msg = next(&mut sleeps) => {
-                let Some(msg) = msg else {
-                    tracing::warn!("the logind connection closed, so sleep and screen lock no longer lock the keyring");
+                if !on_sleep(msg, &lock).await {
                     break;
-                };
-                if msg.body().deserialize::<bool>().is_ok_and(locks_on_sleep) {
-                    tracing::info!("system is going to sleep");
-                    lock().await;
                 }
             }
             msg = next_of(&mut locks) => {
@@ -516,6 +559,87 @@ mod tests {
 
     fn logind_lock(session: &str) -> zbus::Message {
         lock_signal(session, Some(LOGIND))
+    }
+
+    /// What a `Flood` and the subscription it holds back share: how many
+    /// signals were read, and the subscription's waker.
+    #[derive(Default)]
+    struct Drained {
+        read: AtomicUsize,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    /// A sleep stream that yields `items`, then ends.
+    struct Flood {
+        items: VecDeque<zbus::Message>,
+        drained: Arc<Drained>,
+    }
+
+    impl Stream for Flood {
+        type Item = zbus::Message;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.items.pop_front() {
+                Some(msg) => {
+                    self.drained.read.fetch_add(1, Ordering::SeqCst);
+                    if let Some(waker) = self.drained.waker.lock().unwrap().take() {
+                        waker.wake();
+                    }
+                    std::task::Poll::Ready(Some(msg))
+                }
+                None => std::task::Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A subscription whose reply comes only once `signals` sleep signals were
+    /// read, as zbus reads the reply only after it queued what came before.
+    fn held_back(drained: Arc<Drained>, signals: usize) -> impl Future<Output = &'static str> {
+        poll_fn(move |cx| {
+            if drained.read.load(Ordering::SeqCst) >= signals {
+                return std::task::Poll::Ready("subscribed");
+            }
+            *drained.waker.lock().unwrap() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+    }
+
+    /// Subscribes with `while_draining` while `flood` comes in; returns the
+    /// result, how many signals were read and how often it locked. The flood
+    /// ends after its last signal. With the clock paused, a subscription that
+    /// never resolves times out at once.
+    async fn subscribe_through(flood: Vec<bool>, held_for: usize) -> (Option<Option<&'static str>>, usize, usize) {
+        let drained = Arc::new(Drained::default());
+        let items = flood.into_iter().map(sleep_signal).collect();
+        let mut sleeps: Messages = Box::pin(Flood { items, drained: drained.clone() });
+        let (count, lock) = counting();
+        let subscription = held_back(drained.clone(), held_for);
+        let result =
+            tokio::time::timeout(Duration::from_secs(60), while_draining(subscription, &mut sleeps, &lock)).await;
+        (result.ok(), drained.read.load(Ordering::SeqCst), count.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_signals_are_drained_while_the_lock_subscription_waits() {
+        // More than the 64 messages zbus queues for one stream.
+        const SIGNALS: usize = 100;
+        let flood = (0..SIGNALS).map(|i| i % 2 == 0).collect();
+        let (result, read, locked) = subscribe_through(flood, SIGNALS).await;
+        // The reply comes with the last signal, and is taken before the end of
+        // the stream is seen.
+        assert_eq!(result, Some(Some("subscribed")), "the subscription resolves once the flood was read");
+        assert_eq!(read, SIGNALS, "every sleep signal was read");
+        assert_eq!(locked, SIGNALS / 2, "PrepareForSleep(true) locks, (false) does not");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_stream_that_ends_during_the_subscription_ends_listening() {
+        let (result, read, locked) = subscribe_through(vec![true], usize::MAX).await;
+        assert_eq!(result, Some(None), "no subscription result once the sleep stream ended");
+        assert_eq!((read, locked), (1, 1), "the sleep before the end still locked");
     }
 
     #[tokio::test]

@@ -478,11 +478,16 @@ Unchanged from `legacy`:
   listening and then followed through the bus's `NameOwnerChanged`, so a
   restarted logind is recognised; while logind has no name, session locks
   are ignored, which is logged once. Signals from anyone else are dropped
-  with one warning, then at most one count per minute. The listener never
-  waits for the bus: zbus reads every stream and every reply from one socket
-  and stops at a full stream, so a flood of spoofed signals would otherwise
-  stall it for good. The `User` of a session is read in a task of its own,
-  which locks by itself. Waking up does not unlock. Without a system bus or
+  with one warning, then at most one count per minute. zbus reads every
+  stream and every reply from one socket and stops at a full stream, so a
+  flood of spoofed signals left unread would stall it for good. Once
+  listening, the listener never waits for the bus: the `User` of a session
+  is read in a task of its own, which locks by itself. Setting up does wait
+  for replies, one at a time, but never while a stream any client can feed
+  sits unread: the lookups of logind's name and of the session come before
+  bwss subscribes to logind's signals (the owner changes come from the bus
+  itself only), and the sleep signals are read, and lock, while the `Lock`
+  subscription waits for its reply. Waking up does not unlock. Without a system bus or
   without logind, bwss logs a warning and goes on. The listener is not tied
   to `lock_timeout_minutes`.
 - The locked index (`~/.cache/bwss/locked-index.json`, `"format": 3`)
