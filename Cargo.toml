@@ -21,6 +21,10 @@ overflow-checks = true
 lto = "thin"
 strip = true
 
+[features]
+# The dybw conformance vectors (src/vectors.rs): cargo test --features vectors vectors::
+vectors = []
+
 [dependencies]
 aes = { version = "0.9.3", features = ["zeroize"] }
 anyhow = "1.0.104"

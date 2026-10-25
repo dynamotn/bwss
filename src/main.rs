@@ -18,6 +18,8 @@ mod perf;
 mod prompter;
 mod session;
 mod sync;
+#[cfg(all(test, feature = "vectors"))]
+mod vectors;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::Arc;

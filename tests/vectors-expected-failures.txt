@@ -1,0 +1,4 @@
+# dybw conformance vectors that bwss deliberately fails: `<vector id> <reason>`.
+# A listed vector that passes fails the run (src/vectors.rs).
+read/duplicates/personal-wins bwss does not read organization items (data model §9: "Reading organization items is opt-in per tool"), so the organization cipher c1 is uninspectable and there is no duplicate to resolve
+read/view-password-hidden bwss does not read organization items (data model §9: "Reading organization items is opt-in per tool"), so both organization ciphers are uninspectable instead of c1 skipped as view-password-hidden and c2 read
