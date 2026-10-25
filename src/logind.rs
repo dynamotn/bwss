@@ -125,13 +125,8 @@ impl Stream for Signals {
 async fn session_user(conn: &zbus::Connection, msg: &zbus::Message) -> zbus::Result<u32> {
     let path = msg.header().path().map(ToOwned::to_owned).ok_or(zbus::Error::MissingField)?;
     // One property is read once: no cache, so no GetAll and no subscription.
-    let session: zbus::Proxy<'_> = zbus::proxy::Builder::new(conn)
-        .destination(SERVICE)
-        .path(path)
-        .interface(SESSION_IFACE)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await?;
+    let builder = zbus::proxy::Builder::new(conn).destination(SERVICE).path(path).interface(SESSION_IFACE);
+    let session: zbus::Proxy<'_> = builder.cache_properties(zbus::proxy::CacheProperties::No).build().await?;
     let (uid, _user): (u32, zbus::OwnedObjectPath) = session.get_property("User").await?;
     Ok(uid)
 }
@@ -299,14 +294,18 @@ mod tests {
     #[tokio::test]
     async fn a_session_lock_signal_that_is_not_ours_does_not_lock() {
         let locked = AtomicUsize::new(0);
+        let judged = AtomicUsize::new(0);
+        // The sleep stream ends only after a yield, so the lock signal is
+        // certainly judged first, on every run.
         let sleeps = Items::new([], true);
-        let locks = Items::new([session_lock_signal(), session_lock_signal()], false);
-        let seen = AtomicUsize::new(0);
-        // Rejects the first signal and accepts the second.
-        let ours = |_: zbus::Message| std::future::ready(seen.fetch_add(1, Ordering::SeqCst) == 1);
-        serve(sleeps, Some(locks), &ours, &counting(&locked)).await;
-        assert_eq!(seen.load(Ordering::SeqCst), 2, "both signals are judged");
-        assert_eq!(locked.load(Ordering::SeqCst), 1, "only the accepted one locks");
+        let locks = Items::new([session_lock_signal()], false);
+        let not_ours = |_: zbus::Message| {
+            judged.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(false)
+        };
+        serve(sleeps, Some(locks), &not_ours, &counting(&locked)).await;
+        assert_eq!(judged.load(Ordering::SeqCst), 1, "the signal is judged");
+        assert_eq!(locked.load(Ordering::SeqCst), 0, "a lock of a session that is not ours does not lock");
     }
 
     #[tokio::test]
