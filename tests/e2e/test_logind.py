@@ -262,9 +262,9 @@ def test_without_a_session_of_its_own_the_lock_of_another_users_session_does_not
         d.stop()
 
 
-def spoof_lock(address):
+def spoof_lock(address, *options):
     """A client that is not logind sends Session.Lock to every connection."""
-    subprocess.run([sys.executable, SPOOF_LOCK, address, SESSION], check=True, timeout=30)
+    subprocess.run([sys.executable, SPOOF_LOCK, address, SESSION, *options], check=True, timeout=60)
 
 
 def assert_only_the_genuine_lock_locked(d):
@@ -296,6 +296,80 @@ def test_a_lock_signal_not_sent_by_logind_does_not_lock_without_a_session_of_our
         assert_only_the_genuine_lock_locked(d)
     finally:
         d.stop()
+
+
+def assert_a_flood_leaves_logind_working(d, logind, address):
+    """A flood of spoofed Locks, then a genuine sleep and a genuine Lock: both
+    lock, and the whole flood costs one warning."""
+    unlocked(d)
+    spoof_lock(address, "--count", "1000")
+    logind.emit("sleep")
+    assert wait_locked(d), (d.home / "daemon.log").read_text()
+    unlocked(d)
+    # The genuine Lock comes after the whole flood on the same stream, so
+    # once it locked, every spoofed one was judged.
+    logind.emit("lock")
+    assert wait_locked(d), (d.home / "daemon.log").read_text()
+    log = (d.home / "daemon.log").read_text()
+    assert log.count("system is going to sleep") == 1, log
+    assert log.count("session lock requested") == 1, "only logind's Lock locks: " + log
+    assert log.count("not sent by logind") == 1, "one warning for 1000 spoofed Locks: " + log
+
+
+def test_a_flood_of_spoofed_locks_does_not_stall_the_listener(started, logind, system_bus):
+    assert_a_flood_leaves_logind_working(started, logind, system_bus)
+
+
+def test_a_flood_of_spoofed_locks_does_not_stall_the_listener_without_a_session_of_our_own(
+    system_bus, logind_without_pid_lookup
+):
+    d = daemon_on(system_bus)
+    d.env.pop("XDG_SESSION_ID", None)
+    d.start()
+    try:
+        assert wait_log(d, "(of any session of this user)"), (d.home / "daemon.log").read_text()
+        assert_a_flood_leaves_logind_working(d, logind_without_pid_lookup, system_bus)
+    finally:
+        d.stop()
+
+
+def test_a_forged_owner_change_neither_hides_logind_nor_lets_the_forger_lock(started, logind, system_bus):
+    unlocked(started)
+    # NameOwnerChanged claiming logind's name, then a Lock, from the forger.
+    spoof_lock(system_bus, "--claim-owner")
+    logind.emit("sleep")
+    assert wait_locked(started), (started.home / "daemon.log").read_text()
+    unlocked(started)
+    logind.emit("lock")
+    assert wait_locked(started), (started.home / "daemon.log").read_text()
+    log = (started.home / "daemon.log").read_text()
+    assert log.count("system is going to sleep") == 1, log
+    assert log.count("session lock requested") == 1, "only logind's Lock locks: " + log
+    assert "logind has a new name on the bus" not in log, "only the bus tells who owns logind's name: " + log
+
+
+def test_after_logind_restarts_only_its_new_name_locks(system_bus):
+    old = FakeLogind(system_bus, "replaceable")
+    d = daemon_on(system_bus).start()
+    new = None
+    try:
+        assert wait_log(d, "locking on sleep and screen lock"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        new = FakeLogind(system_bus, "replace")
+        assert wait_log(d, "logind has a new name on the bus"), (d.home / "daemon.log").read_text()
+        # Unicast, as the bus no longer routes the old name's broadcasts as logind's.
+        old.emit("lock-direct")
+        assert wait_log(d, "not sent by logind"), (d.home / "daemon.log").read_text()
+        assert d.cli("status").stdout.startswith("unlocked"), "the old name no longer speaks for logind"
+        new.emit("lock")
+        assert wait_locked(d), (d.home / "daemon.log").read_text()
+        log = (d.home / "daemon.log").read_text()
+        assert log.count("session lock requested") == 1, log
+    finally:
+        d.stop()
+        old.stop()
+        if new:
+            new.stop()
 
 
 def test_a_session_whose_user_cannot_be_read_still_locks_when_logind_says_so(system_bus):

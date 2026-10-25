@@ -473,10 +473,18 @@ Unchanged from `legacy`:
   only when that session's `User` property names its own real uid; the lock
   of another user's session is ignored, but a session whose user cannot be
   read locks (fail closed). A `Lock` is accepted only from logind's
-  unique name, looked up for each signal, because a unicast signal from any
-  local client reaches bwss whatever match rule it added. Waking up does
-  not unlock. Without a system bus or without logind, bwss logs a warning and goes on. The
-  listener is not tied to `lock_timeout_minutes`.
+  unique name, because a unicast signal from any local client reaches bwss
+  whatever match rule it added. That name is looked up once when bwss starts
+  listening and then followed through the bus's `NameOwnerChanged`, so a
+  restarted logind is recognised; while logind has no name, session locks
+  are ignored, which is logged once. Signals from anyone else are dropped
+  with one warning, then at most one count per minute. The listener never
+  waits for the bus: zbus reads every stream and every reply from one socket
+  and stops at a full stream, so a flood of spoofed signals would otherwise
+  stall it for good. The `User` of a session is read in a task of its own,
+  which locks by itself. Waking up does not unlock. Without a system bus or
+  without logind, bwss logs a warning and goes on. The listener is not tied
+  to `lock_timeout_minutes`.
 - The locked index (`~/.cache/bwss/locked-index.json`, `"format": 3`)
   keeps, per marked item, its id, its collection and
   SHA-256(salt ‖ name ‖ 0 ‖ value) of each attribute the app set, with a
