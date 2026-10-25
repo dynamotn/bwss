@@ -207,6 +207,9 @@ else passes through unchanged.
 - `replace=true` looks for an item in the same collection with exactly the
   same `bwss:attr:*` attributes (derived attributes do not count) and
   updates it instead.
+- A `CreateItem` that answered `IsLocked` because the keyring locked in the
+  middle of the write has still stored the item; a client that retries with
+  `replace=false` after unlocking creates a duplicate.
 - The keyring folder is created on first need, matched by exact name; with
   duplicate folder names the lowest id wins.
 
@@ -384,8 +387,8 @@ changing are never clobbered. Then:
   (`PYTHONPATH` or a `sitecustomize`, `PERL5OPT`, `RUBYOPT`,
   `NODE_OPTIONS`, `BASH_ENV`). A process that rewrites its title, or
   `chdir`s after starting a script given by a relative path, no longer
-  resolves to a script file and falls back to the bare interpreter, asked
-  every time (Allow / Deny only).
+  resolves to a script file: if that happens after its name was pinned, it
+  becomes "(unknown application)", asked every time (Allow / Deny only).
 - An identity holding a control character (a newline in a path could
   plant a second `bwss:acl` line) is an unknown application.
 - **Unknown applications and interpreters without a script file** (any
@@ -402,7 +405,8 @@ changing are never clobbered. Then:
   (`$XDG_STATE_HOME/dybw/tools/bwss/acl-confirmed`, mode 0600, never
   synced): tags `HMAC(K, bwss:id ‖ 0x00 ‖ exe)` with
   `K = user_key.derive("acl-confirm")` (MAC half), sealed as a whole under
-  `K` as `{ "format": 2, "set": "<EncString>" }`, like the write queue.
+  `K` as `{ "format": 2, "set": "<EncString>" }`; sealed like the write queue,
+  as format 2.
   - A grant made on this device (an "Always allow", or the creator's line)
     is recorded when it is made.
   - A line found in the item but not in the set triggers a one-time
@@ -463,10 +467,13 @@ Unchanged from `legacy`:
 - Lock when the machine sleeps or the screen locks (TM-013). bwss listens on
   the system bus to systemd-logind for `Manager.PrepareForSleep(true)` and
   for the `Lock` signal of its own session (found by process id, then by
-  `XDG_SESSION_ID`); either one locks the keyring. Waking up does not
-  unlock. Without a system bus or without logind, bwss logs a warning and
-  goes on (without a session, sleep still locks). The listener is not tied
-  to `lock_timeout_minutes`.
+  `XDG_SESSION_ID`); either one locks the keyring. A daemon that belongs
+  to no session (a systemd user unit, the usual install) has no session of
+  its own, so it listens to the `Lock` signal of every session and locks
+  only when that session's `User` property names its own real uid; the lock
+  of another user's session is ignored. Waking up does not unlock. Without
+  a system bus or without logind, bwss logs a warning and goes on. The
+  listener is not tied to `lock_timeout_minutes`.
 - The locked index (`~/.cache/bwss/locked-index.json`, `"format": 3`)
   keeps, per marked item, its id, its collection and
   SHA-256(salt ‖ name ‖ 0 ‖ value) of each attribute the app set, with a
@@ -737,7 +744,7 @@ whoever holds it would receive `bwss unlock --password-stdin`.
 
 Control methods: `UnlockInteractive() -> b` (the daemon prompts through its
 own pinentry, so no password crosses the bus; throttled like a failed
-password), `UnlockWithPassword(s)`, `Lock()`, `Sync()` and
+password, which Secret Service prompts (`Service.Unlock` then `Prompt`) are not), `UnlockWithPassword(s)`, `Lock()`, `Sync()` and
 `Status() -> (b, u, s)`.
 
 `UnlockWithPassword` is refused, before the password is tried, unless the
@@ -895,7 +902,7 @@ blocking `bwss unlock` in the parent. Without `/proc` (non-Linux),
 `--password-stdin` is refused. The CLI and the daemon must be the same
 installed file. A relative `argv[0]` containing a slash is resolved against
 the CLI's cwd, because the daemon's cwd is unreadable, so `./bwss daemon` is
-refused. Failing closed is intended.
+refused unless the CLI runs from the same directory. Failing closed is intended.
 
 What the owner check stops: a squatter that is not running bwss, and the
 fork form that execs `bwss unlock`. What it cannot stop: a process of the

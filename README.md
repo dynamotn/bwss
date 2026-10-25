@@ -220,7 +220,9 @@ bwss sync        # pull changes now (otherwise every 5 minutes)
 - The keyring locks on `bwss lock`, after `lock_timeout_minutes` of idleness
   (default 60; 0 turns the idle lock off), when the machine goes to sleep
   and when the session locks (systemd-logind on the system bus; without it
-  bwss logs a warning and goes on).
+  bwss logs a warning and goes on). Run from a login session, it follows that
+  session's lock; run as a systemd user unit, which belongs to no session, it
+  follows the lock of any session of your own user, and no other user's.
 - On Linux the daemon disables core dumps and ptrace-style attach. It does
   not `mlock` memory. Because the daemon is not dumpable, other programs
   cannot read its `/proc/<pid>/exe`: `--password-stdin` checks its owner by
@@ -326,7 +328,7 @@ docker run --rm -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/c
 # …and against a throwaway Vaultwarden (the test container joins its network)
 docker run -d --rm --name bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false \
   -e LOGIN_RATELIMIT_MAX_BURST=1000 -e LOGIN_RATELIMIT_SECONDS=1 \
-  -e I_REALLY_WANT_VOLATILE_STORAGE=true vaultwarden/server:latest
+  -e I_REALLY_WANT_VOLATILE_STORAGE=true vaultwarden/server:1.37.4
 docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
 

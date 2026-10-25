@@ -489,7 +489,8 @@ impl Daemon {
 
     /// `unlock_interactive` for remote callers (`bwss unlock`): requests take
     /// the same turns as password attempts, and one that ends locked makes the
-    /// next wait, so a client cannot keep a pinentry dialog in the user's face.
+    /// next wait, so a control client cannot keep a pinentry dialog in the
+    /// user's face. Secret Service prompts (`Service.Unlock`) are not throttled.
     pub async fn unlock_interactive_throttled(self: &Arc<Self>) -> bool {
         let _turn = self.failure_gate.lock().await;
         let unlocked = self.unlock_interactive().await;
