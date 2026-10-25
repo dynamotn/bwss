@@ -228,21 +228,35 @@ def test_the_session_of_the_environment_is_used_when_logind_does_not_know_the_pr
         d.stop()
 
 
-def test_without_any_session_only_sleep_locks(system_bus, logind_without_pid_lookup):
+def test_without_a_session_of_its_own_the_lock_of_a_session_of_our_user_locks(system_bus, logind_without_pid_lookup):
     d = daemon_on(system_bus)
     d.env.pop("XDG_SESSION_ID", None)
     d.start()
     try:
-        assert wait_log(d, "no logind session"), (d.home / "daemon.log").read_text()
-        assert wait_log(d, "locking on sleep"), (d.home / "daemon.log").read_text()
+        assert wait_log(d, "no logind session of our own"), (d.home / "daemon.log").read_text()
+        assert wait_log(d, "(of any session of this user)"), (d.home / "daemon.log").read_text()
         unlocked(d)
         logind_without_pid_lookup.emit("lock")
-        logind_without_pid_lookup.emit("sleep")
+        assert wait_locked(d)
+    finally:
+        d.stop()
+
+
+def test_without_a_session_of_its_own_the_lock_of_another_users_session_does_not_lock(
+    system_bus, logind_without_pid_lookup
+):
+    d = daemon_on(system_bus)
+    d.env.pop("XDG_SESSION_ID", None)
+    d.start()
+    try:
+        assert wait_log(d, "(of any session of this user)"), (d.home / "daemon.log").read_text()
+        unlocked(d)
+        logind_without_pid_lookup.emit("lock-other")
+        # A lock of our own session after it, so the other one was certainly judged first.
+        logind_without_pid_lookup.emit("lock")
         assert wait_locked(d)
         log = (d.home / "daemon.log").read_text()
-        assert "locking on sleep and screen lock" not in log, log
-        assert "session lock requested" not in log, log
-        assert "system is going to sleep" in log, log
+        assert log.count("session lock requested") == 1, "only our user's session locks: " + log
     finally:
         d.stop()
 

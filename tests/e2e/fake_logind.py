@@ -6,13 +6,16 @@
 Owns org.freedesktop.login1 on ADDRESS and answers Manager.GetSessionByPID and
 Manager.GetSession with SESSION_PATH. With "unknown-pid", GetSessionByPID
 fails instead, as for a process that belongs to no session; GetSession still
-answers. Prints "ready" once it owns the name;
-then reads commands from stdin, one per line:
+answers. Both SESSION_PATH and a second session, OTHER_SESSION, answer
+Properties.Get("User") with a (uid, user path) struct: SESSION_PATH for the
+uid this script runs as, OTHER_SESSION for the next one. Prints "ready" once
+it owns the name; then reads commands from stdin, one per line:
 
     sleep   emit Manager.PrepareForSleep(true)
     resume  emit Manager.PrepareForSleep(false)
     lock    emit Session.Lock on SESSION_PATH
     unlock  emit Session.Unlock on SESSION_PATH
+    lock-other  emit Session.Lock on OTHER_SESSION
 """
 
 import os
@@ -29,12 +32,15 @@ MANAGER = DBusAddress("/org/freedesktop/login1", bus_name=NAME, interface="org.f
 
 address, session_path = sys.argv[1], sys.argv[2]
 unknown_pid = sys.argv[3:] == ["unknown-pid"]
+OTHER_SESSION = "/org/freedesktop/login1/session/_99"
+USERS = {session_path: os.getuid(), OTHER_SESSION: os.getuid() + 1}
 session = DBusAddress(session_path, bus_name=NAME, interface="org.freedesktop.login1.Session")
 SIGNALS = {
     "sleep": lambda: new_signal(MANAGER, "PrepareForSleep", "b", (True,)),
     "resume": lambda: new_signal(MANAGER, "PrepareForSleep", "b", (False,)),
     "lock": lambda: new_signal(session, "Lock"),
     "unlock": lambda: new_signal(session, "Unlock"),
+    "lock-other": lambda: new_signal(DBusAddress(OTHER_SESSION, bus_name=NAME, interface=session.interface), "Lock"),
 }
 
 conn = open_dbus_connection(bus=address)
@@ -56,5 +62,8 @@ while True:
         member = msg.header.fields.get(HeaderFields.member)
         if member == "GetSessionByPID" and unknown_pid:
             conn.send(new_error(msg, "org.freedesktop.login1.NoSessionForPID", "s", ("no session for the pid",)))
+        elif member == "Get" and msg.header.fields.get(HeaderFields.path) in USERS:
+            uid = USERS[msg.header.fields[HeaderFields.path]]
+            conn.send(new_method_return(msg, "v", ((("(uo)"), (uid, "/org/freedesktop/login1/user/_%d" % uid)),)))
         elif member in ("GetSessionByPID", "GetSession"):
             conn.send(new_method_return(msg, "o", (session_path,)))
