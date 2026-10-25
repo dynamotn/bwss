@@ -272,7 +272,8 @@ fn canonical(
                 Some(Value::Array(a)) => {
                     Value::Array(a.iter().map(|u| decrypt(&key, u.get("uri"), "uri")).collect::<Result<_, _>>()?)
                 }
-                None | Some(Value::Null) => Value::Null,
+                // Absent and null read as [], like the plugin's adapter.
+                None | Some(Value::Null) => Value::Array(Vec::new()),
                 Some(other) => return Err(format!("request uris: {other}")),
             };
             let history = body
