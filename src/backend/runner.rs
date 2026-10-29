@@ -233,6 +233,10 @@ pub(super) fn status_lines(built: &Built) -> Vec<String> {
     for (_, why) in &built.skipped {
         lines.push(format!("skipped: {why}"));
     }
+    let blobs = built.snapshot.blobs.len();
+    if blobs > 0 {
+        lines.push(format!("{blobs} item(s) use Bitwarden's newer encryption format and are not shown"));
+    }
     if built.registry_unreadable {
         lines.push(REGISTRY_UNREADABLE.to_owned());
     }
@@ -1282,7 +1286,7 @@ mod tests {
     #[test]
     fn status_lists_what_the_user_may_want_to_fix() {
         let built = Built {
-            snapshot: Snapshot { collections: vec![], items: vec![] },
+            snapshot: Snapshot { collections: vec![], items: vec![], ..Default::default() },
             marked: HashMap::new(),
             registry: Registry::default(),
             registry_ciphers: vec![],

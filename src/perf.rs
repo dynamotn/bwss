@@ -72,7 +72,7 @@ fn perf_budgets() {
     let decoded = built.snapshot.items;
 
     let mut k = Keyring::new(None, None);
-    time("load-10000-items", 1_000, || k.load(Snapshot { collections: vec![], items: decoded }));
+    time("load-10000-items", 1_000, || k.load(Snapshot { collections: vec![], items: decoded, ..Default::default() }));
     let mut q = Attributes::new();
     q.insert("service".into(), "svc-42".into());
     let (hits, _) = time("search-10000-items", 50, || k.search(&q, None));

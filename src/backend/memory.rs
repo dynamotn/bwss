@@ -20,7 +20,7 @@ impl MemoryBackend {
             CollectionData { id: LOGIN_COLLECTION.into(), label: "Login".into(), created: now(), modified: now() };
         MemoryBackend {
             password: password.into(),
-            data: Mutex::new(Snapshot { collections: vec![login], items: vec![] }),
+            data: Mutex::new(Snapshot { collections: vec![login], items: vec![], ..Default::default() }),
             unlocked: Mutex::new(false),
         }
     }

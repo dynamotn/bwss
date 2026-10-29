@@ -92,7 +92,7 @@ fn stored_value(cipher: &Value, index: usize) -> &str {
 /// bitwarden-vault/src/cipher/blob/sealed.rs:84-95, used by
 /// blob/encryption.rs:65-68). Whatever else it holds, the SDK cannot read it
 /// either, so it is held.
-fn is_blob(cipher: &Value) -> bool {
+pub(crate) fn is_blob(cipher: &Value) -> bool {
     str_at(cipher, "/data")
         .and_then(|d| serde_json::from_str::<Value>(d).ok())
         .is_some_and(|v| v.as_object().is_some_and(|o| o.contains_key("format_version")))

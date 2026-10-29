@@ -1323,6 +1323,26 @@ async fn a_cipher_that_turns_blob_encrypted_is_held_not_deleted_or_recreated() {
 }
 
 #[tokio::test]
+async fn blob_ciphers_are_listed_after_an_unlock_and_counted_in_the_status() {
+    let v = github().await;
+    assert_eq!(v.snapshot().await.ciphers.get("gh").map(String::as_str), Some("c1"));
+    v.edit_elsewhere("c1", |c| {
+        c["data"] = json!(r#"{"format_version":1}"#);
+        for f in ["name", "notes", "login", "fields"] {
+            c[f] = Value::Null;
+        }
+    });
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    let snap = v.snapshot().await;
+    assert!(snap.items.is_empty());
+    assert_eq!(snap.blobs.into_iter().collect::<Vec<_>>(), ["c1"]);
+    let status = v.backend.describe().await;
+    assert!(status.contains("1 item(s) use Bitwarden's newer encryption format"), "{status}");
+    assert!(!status.contains("c1"), "the count only");
+}
+
+#[tokio::test]
 async fn writes_to_an_item_that_cannot_be_read_wait() {
     let v = github().await;
     v.edit_elsewhere("c1", |c| c["key"] = json!("2.AAAA|AAAA|AAAA"));

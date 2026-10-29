@@ -28,7 +28,7 @@ use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::{F_KIND, field_names, field_value, first_index};
 use crate::bw::items::item_key;
-use crate::bw::scan::{Keys, MarkedItem, Scan, normalize_collection, resolve_duplicates, scan};
+use crate::bw::scan::{Keys, MarkedItem, Scan, is_blob, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
 use crate::config::{Config, Credentials, Paths};
 use crate::fsutil::{write_json_private, write_private};
@@ -167,6 +167,7 @@ fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built
     let mut found = Vec::new();
     let mut unmarked = HashSet::new();
     let mut skipped = Vec::new();
+    let mut blobs = std::collections::BTreeSet::new();
     let mut registry = Registry::default();
     let mut registry_ciphers = Vec::new();
     let mut registry_unreadable = false;
@@ -208,6 +209,9 @@ fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built
                 if cid.is_empty() {
                     continue;
                 }
+                if is_blob(cipher) && cipher.get("organizationId").is_none_or(Value::is_null) {
+                    blobs.insert(cid.to_owned());
+                }
                 if let Some(m) = held.get(cid) {
                     found.push((*m).clone());
                 }
@@ -232,8 +236,9 @@ fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built
     let mut items: Vec<ItemData> = winners.iter().map(|m| m.item.clone()).collect();
     items.sort_by(|a, b| a.id.cmp(&b.id));
 
+    let ciphers = winners.iter().map(|m| (m.item.id.clone(), m.cipher_id.clone())).collect();
     Built {
-        snapshot: Snapshot { collections: collection_list(&registry, &items), items },
+        snapshot: Snapshot { collections: collection_list(&registry, &items), items, ciphers, blobs },
         marked: winners.into_iter().map(|m| (m.item.id.clone(), m)).collect(),
         registry,
         registry_ciphers,
@@ -703,6 +708,12 @@ impl Backend for BitwardenBackend {
         *queue = load_queue(&self.queue_path, &keys.user, &self.queue_migrated)?;
         let folder = keyring_folder(&sync, &keys.user, &self.root);
         let built = build_fresh(&sync, &queue, &keys, folder.as_deref());
+        if !built.snapshot.blobs.is_empty() {
+            tracing::warn!(
+                "{} item(s) use Bitwarden's newer encryption format and are not shown",
+                built.snapshot.blobs.len()
+            );
+        }
         let state = Unlocked { keys, kdf, sync, revision, built, keyring_folder: folder };
         if !from_cache {
             self.save_cache(&state);

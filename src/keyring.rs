@@ -46,6 +46,9 @@ struct IndexedItem {
     /// Hashes of the derived attributes, only when this device opted in.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     derived: BTreeSet<String>,
+    /// The cipher it was read from, to hold it while that cipher is a blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cipher: Option<String>,
 }
 
 /// What changed when a new snapshot replaced the old one.
@@ -73,6 +76,11 @@ pub struct Keyring {
     derived_flag: Option<PathBuf>,
     /// Whether the flag was set at start or at the last index write.
     index_derived: bool,
+    /// Index entries of items whose cipher is now blob-encrypted (cannot be
+    /// inspected): kept, locked, until the cipher is gone or trashed.
+    held: Vec<IndexedItem>,
+    /// Item id to cipher id, from the last snapshot.
+    cipher_of: BTreeMap<String, String>,
 }
 
 fn builtin_collections() -> BTreeMap<String, CollectionData> {
@@ -137,6 +145,8 @@ impl Keyring {
             index_path,
             derived_flag,
             index_derived,
+            held: Vec::new(),
+            cipher_of: BTreeMap::new(),
         }
     }
 
@@ -161,9 +171,8 @@ impl Keyring {
     pub fn item_refs(&self) -> Vec<(String, String)> {
         let mut out: BTreeSet<(String, String)> =
             self.items.values().map(|i| (i.collection.clone(), i.id.clone())).collect();
-        if !self.unlocked {
-            out.extend(self.index.items.iter().map(|i| (i.collection.clone(), i.id.clone())));
-        }
+        let indexed = if self.unlocked { &self.held } else { &self.index.items };
+        out.extend(indexed.iter().map(|i| (i.collection.clone(), i.id.clone())));
         out.into_iter().collect()
     }
 
@@ -201,12 +210,12 @@ impl Keyring {
             let r = (item.collection.clone(), item.id.clone());
             if self.collection_locked(&item.collection) { locked.push(r) } else { unlocked.push(r) }
         }
-        if !self.unlocked {
+        {
             let wanted: BTreeSet<String> = query.iter().map(|(k, v)| self.hash_attr(k, v)).collect();
             let indexed =
                 |e: &IndexedItem, h: &String| e.attrs.contains(h) || (self.index_derived && e.derived.contains(h));
-            for e in self.index.items.iter().filter(|e| in_scope(&e.collection) && wanted.iter().all(|h| indexed(e, h)))
-            {
+            let entries = if self.unlocked { &self.held } else { &self.index.items };
+            for e in entries.iter().filter(|e| in_scope(&e.collection) && wanted.iter().all(|h| indexed(e, h))) {
                 locked.push((e.collection.clone(), e.id.clone()));
             }
         }
@@ -239,6 +248,14 @@ impl Keyring {
             items.insert(item.id.clone(), item);
         }
         self.items = items;
+        // Items whose cipher is a blob now cannot be read, but are not gone.
+        let candidates = if was_unlocked { std::mem::take(&mut self.held) } else { self.index.items.clone() };
+        self.held = candidates
+            .into_iter()
+            .filter(|e| !self.items.contains_key(&e.id) && self.collections.contains_key(&e.collection))
+            .filter(|e| e.cipher.as_ref().is_some_and(|c| snap.blobs.contains(c)))
+            .collect();
+        self.cipher_of = snap.ciphers;
         self.unlocked = true;
         let new_refs: BTreeSet<(String, String)> = self.item_refs().into_iter().collect();
 
@@ -325,6 +342,7 @@ impl Keyring {
                     id: i.id.clone(),
                     collection: i.collection.clone(),
                     attrs: own.into_iter().map(|(k, v)| self.hash_attr(k, v)).collect(),
+                    cipher: self.cipher_of.get(&i.id).cloned(),
                     derived: if self.index_derived {
                         derived.into_iter().map(|(k, v)| self.hash_attr(k, v)).collect()
                     } else {
@@ -332,6 +350,7 @@ impl Keyring {
                     },
                 }
             })
+            .chain(self.held.iter().cloned())
             .collect();
         let collections = self
             .collections
@@ -388,6 +407,7 @@ mod tests {
                 item("a", "login", &[("service", "gh"), ("user", "me")]),
                 item("b", "login", &[("service", "x")]),
             ],
+            ..Default::default()
         });
         assert_eq!(k.search(&q(&[("service", "gh")]), None).0, vec![("login".into(), "a".into())]);
         k.lock();
@@ -404,6 +424,39 @@ mod tests {
         assert!(!text.contains("\"gh\"") && !text.contains("\"me\""));
     }
 
+    #[test]
+    fn blob_ciphers_stay_in_the_index_across_an_unlock_until_they_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let r = |c: &str, i: &str| (c.to_owned(), i.to_owned());
+        let mut k = Keyring::new(Some(path.clone()), None);
+        let ciphers = [("a".to_owned(), "c1".to_owned()), ("b".to_owned(), "c2".to_owned())].into();
+        k.load(Snapshot {
+            items: vec![item("a", "login", &[("service", "gh")]), item("b", "login", &[("service", "x")])],
+            ciphers,
+            ..Default::default()
+        });
+        k.lock();
+
+        // Another client turned c1 into a blob: it cannot be read, not gone.
+        let mut k = Keyring::new(Some(path.clone()), None);
+        let blobs = ["c1".to_owned()].into();
+        let diff = k.load(Snapshot { items: vec![], blobs, ..Default::default() });
+        assert_eq!(diff.deleted, [r("login", "b")]);
+        assert_eq!(k.item_refs(), [r("login", "a")]);
+        assert_eq!(k.search(&q(&[("service", "gh")]), None).1, [r("login", "a")], "found as locked");
+        k.lock();
+        let mut k = Keyring::new(Some(path.clone()), None);
+        assert_eq!(k.item_refs(), [r("login", "a")], "and still in the index on disk");
+
+        // A refresh that still sees the blob keeps it; once the cipher is gone, it is deleted.
+        let blobs = ["c1".to_owned()].into();
+        assert!(k.load(Snapshot { blobs, ..Default::default() }).deleted.is_empty());
+        let diff = k.load(Snapshot::default());
+        assert_eq!(diff.deleted, [r("login", "a")]);
+        assert!(k.item_refs().is_empty());
+    }
+
     fn read_json(path: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
@@ -413,7 +466,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
         let mut k = Keyring::new(Some(path.clone()), None);
-        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
+        k.load(Snapshot {
+            collections: vec![],
+            items: vec![item("a", "login", &[("service", "gh")])],
+            ..Default::default()
+        });
         let mut saved = read_json(&path);
         assert_eq!(saved["format"], 3);
         assert_eq!(Keyring::new(Some(path.clone()), None).search(&q(&[("service", "gh")]), None).1.len(), 1);
@@ -445,7 +502,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
         let mut k = Keyring::new(Some(path.clone()), None);
-        k.load(Snapshot { collections: vec![collection("work", "Work")], items: vec![] });
+        k.load(Snapshot { collections: vec![collection("work", "Work")], items: vec![], ..Default::default() });
         assert_eq!(read_json(&path)["collections"][0]["label"], "Work");
 
         k.set_collection_label("work", "Office");
@@ -467,12 +524,20 @@ mod tests {
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
         let mut k = Keyring::new(Some(blocker.join("index.json")), None);
-        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[("service", "gh")])] });
+        k.load(Snapshot {
+            collections: vec![],
+            items: vec![item("a", "login", &[("service", "gh")])],
+            ..Default::default()
+        });
         assert_eq!(k.search(&q(&[("service", "gh")]), None).0, vec![("login".into(), "a".into())]);
         assert_eq!(std::fs::read(&blocker).unwrap(), b"x");
         // Later changes and a reload keep working too.
         assert!(k.upsert(item("b", "login", &[("service", "gl")])));
-        k.load(Snapshot { collections: vec![], items: vec![item("c", "login", &[("service", "gl")])] });
+        k.load(Snapshot {
+            collections: vec![],
+            items: vec![item("c", "login", &[("service", "gl")])],
+            ..Default::default()
+        });
         assert_eq!(k.search(&q(&[("service", "gl")]), None).0, vec![("login".into(), "c".into())]);
         assert!(k.search(&q(&[("service", "gh")]), None).0.is_empty(), "the reload replaced the content");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "nothing else was written beside it");
@@ -500,7 +565,7 @@ mod tests {
         let path = dir.path().join("index.json");
         let flag = dir.path().join("index-derived");
         let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
-        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
         // Unlocked, the item is still found by its derived attributes.
         assert_eq!(k.search(&q(&[("bwss:name", "GitHub")]), None).0.len(), 1);
         k.lock();
@@ -521,7 +586,7 @@ mod tests {
         let flag = dir.path().join("index-derived");
         std::fs::write(&flag, "on\n").unwrap();
         let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
-        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
         assert_eq!(hashes_on_disk(&path), 5);
         k.lock();
         let on = Keyring::new(Some(path.clone()), Some(flag.clone()));
@@ -531,14 +596,14 @@ mod tests {
 
         // Turned off while the daemon runs: the next index write drops them.
         std::fs::remove_file(&flag).unwrap();
-        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
         assert_eq!(hashes_on_disk(&path), 1);
         k.lock();
         assert!(k.search(&q(&[("bwss:name", "GitHub")]), None).1.is_empty());
 
         // Turned off while it was stopped: they leave the disk at start.
         std::fs::write(&flag, "on\n").unwrap();
-        k.load(Snapshot { collections: vec![], items: vec![derived_item()] });
+        k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
         assert_eq!(hashes_on_disk(&path), 5);
         std::fs::remove_file(&flag).unwrap();
         let off = Keyring::new(Some(path.clone()), Some(flag));
@@ -550,10 +615,18 @@ mod tests {
     #[test]
     fn diff_after_refresh() {
         let mut k = Keyring::new(None, None);
-        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[]), item("b", "login", &[])] });
+        k.load(Snapshot {
+            collections: vec![],
+            items: vec![item("a", "login", &[]), item("b", "login", &[])],
+            ..Default::default()
+        });
         let mut changed = item("a", "login", &[]);
         changed.label = "renamed".into();
-        let d = k.load(Snapshot { collections: vec![], items: vec![changed, item("c", "login", &[])] });
+        let d = k.load(Snapshot {
+            collections: vec![],
+            items: vec![changed, item("c", "login", &[])],
+            ..Default::default()
+        });
         assert_eq!(d.changed, vec![("login".into(), "a".into())]);
         assert_eq!(d.created, vec![("login".into(), "c".into())]);
         assert_eq!(d.deleted, vec![("login".into(), "b".into())]);
@@ -573,7 +646,7 @@ mod tests {
     #[test]
     fn upsert_after_lock_keeps_nothing() {
         let mut k = Keyring::new(None, None);
-        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[])] });
+        k.load(Snapshot { collections: vec![], items: vec![item("a", "login", &[])], ..Default::default() });
         k.lock();
         assert!(!k.upsert(item("late", "login", &[("k", "v")])));
         assert!(k.item("late").is_none());
