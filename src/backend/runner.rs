@@ -235,7 +235,7 @@ pub(super) fn status_lines(built: &Built) -> Vec<String> {
     }
     let blobs = built.snapshot.blobs.len();
     if blobs > 0 {
-        lines.push(format!("{blobs} item(s) use Bitwarden's newer encryption format and are not shown"));
+        lines.push(format!("{blobs} Bitwarden item(s) use the newer encryption format and cannot be read"));
     }
     if built.registry_unreadable {
         lines.push(REGISTRY_UNREADABLE.to_owned());

@@ -457,6 +457,24 @@ mod tests {
         assert!(k.item_refs().is_empty());
     }
 
+    #[test]
+    fn a_held_blob_is_not_deleted_on_unlock_and_a_trashed_one_is() {
+        let item_a = item("a", "login", &[("service", "gh")]);
+        for blob_still_there in [true, false] {
+            let mut k = Keyring::new(None, None);
+            k.load(Snapshot {
+                items: vec![item_a.clone()],
+                ciphers: [("a".to_owned(), "c1".to_owned())].into(),
+                ..Default::default()
+            });
+            k.lock();
+            // `new(None)` has no disk index: the locked refs come from memory.
+            let blobs = if blob_still_there { ["c1".to_owned()].into() } else { Default::default() };
+            let diff = k.load(Snapshot { blobs, ..Default::default() });
+            assert_eq!(diff.deleted.is_empty(), blob_still_there);
+        }
+    }
+
     fn read_json(path: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }

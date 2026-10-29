@@ -1338,7 +1338,7 @@ async fn blob_ciphers_are_listed_after_an_unlock_and_counted_in_the_status() {
     assert!(snap.items.is_empty());
     assert_eq!(snap.blobs.into_iter().collect::<Vec<_>>(), ["c1"]);
     let status = v.backend.describe().await;
-    assert!(status.contains("1 item(s) use Bitwarden's newer encryption format"), "{status}");
+    assert!(status.contains("1 Bitwarden item(s) use the newer encryption format"), "{status}");
     assert!(!status.contains("c1"), "the count only");
 }
 

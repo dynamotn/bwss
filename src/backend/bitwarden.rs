@@ -200,8 +200,9 @@ fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built
             },
             Scan::Marked(m) => found.push(*m),
             Scan::Uninspectable(why) => {
-                // Organization items are never read: not worth a warning.
-                if cipher.get("organizationId").is_some_and(|o| !o.is_null()) {
+                // Organization and blob items are never read: not worth a warning
+                // each (blobs are counted once per unlock).
+                if cipher.get("organizationId").is_some_and(|o| !o.is_null()) || is_blob(cipher) {
                     tracing::debug!("{why}");
                 } else if first_report(("uninspectable", &key)) {
                     tracing::warn!("{why}");
@@ -710,7 +711,7 @@ impl Backend for BitwardenBackend {
         let built = build_fresh(&sync, &queue, &keys, folder.as_deref());
         if !built.snapshot.blobs.is_empty() {
             tracing::warn!(
-                "{} item(s) use Bitwarden's newer encryption format and are not shown",
+                "{} Bitwarden item(s) use the newer encryption format and cannot be read",
                 built.snapshot.blobs.len()
             );
         }

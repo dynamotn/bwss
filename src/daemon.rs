@@ -825,8 +825,13 @@ impl Daemon {
             if replace {
                 // Same app attributes; derived ones (`bwss:*`) do not count (§5.1).
                 let wanted = own_attributes(&attributes);
-                k.search(&wanted, Some(collection))
-                    .0
+                let (unlocked, held) = k.search(&wanted, Some(collection));
+                // A match that exists but cannot be read (a blob cipher) would
+                // be stored again as a duplicate.
+                if !held.is_empty() {
+                    return Err(SecretError::Failed("the item cannot be read now; try again later".into()));
+                }
+                unlocked
                     .into_iter()
                     .map(|(_, id)| id)
                     .find(|id| k.item(id).is_some_and(|i| own_attributes(&i.attributes) == wanted))
@@ -1307,6 +1312,46 @@ mod tests {
         let item = k.item("x").unwrap();
         assert_eq!(&*item.secret, b"new");
         assert_eq!(own_attributes(&item.attributes), Attributes::from([("service".to_owned(), "git".to_owned())]));
+    }
+
+    #[tokio::test]
+    async fn replace_never_stores_beside_an_item_held_as_a_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keyring = Keyring::new(Some(dir.path().join("index.json")), None);
+        let item = ItemData {
+            id: "x".into(),
+            collection: LOGIN_COLLECTION.into(),
+            label: "GitHub".into(),
+            attributes: Attributes::from([("service".to_owned(), "git".to_owned())]),
+            secret: Zeroizing::new(b"old".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 1,
+            acl: vec![],
+        };
+        keyring.load(Snapshot {
+            items: vec![item],
+            ciphers: [("x".to_owned(), "c1".to_owned())].into(),
+            ..Default::default()
+        });
+        keyring.lock();
+        keyring.load(Snapshot { blobs: ["c1".to_owned()].into(), ..Default::default() });
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        backend.unlock("pw").await.unwrap();
+        let d =
+            Daemon::new(keyring, backend.clone(), Prompter::new("false", Duration::from_secs(1)), Config::default());
+
+        let new = |replace| NewItem {
+            label: "GitHub token".into(),
+            attributes: Attributes::from([("service".to_owned(), "git".to_owned())]),
+            secret: Zeroizing::new(b"new".to_vec()),
+            content_type: "text/plain".into(),
+            replace,
+        };
+        let e = d.create_item(LOGIN_COLLECTION, new(true), "/usr/bin/git").await.unwrap_err();
+        assert!(matches!(&e, SecretError::Failed(m) if m.contains("cannot be read now")), "{e:?}");
+        assert!(backend.refresh().await.unwrap().is_none_or(|s| s.items.is_empty()), "nothing was stored");
+        assert_eq!(d.keyring.lock().await.item_refs().len(), 1);
     }
 
     #[test]
