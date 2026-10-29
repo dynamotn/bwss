@@ -87,6 +87,17 @@ fn stored_value(cipher: &Value, index: usize) -> &str {
     cipher.pointer(&format!("/fields/{index}/value")).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// Bitwarden's blob form, with the SDK's own gate: `data` parses as a JSON
+/// object holding a `format_version` key (sdk-internal 3d16437,
+/// bitwarden-vault/src/cipher/blob/sealed.rs:84-95, used by
+/// blob/encryption.rs:65-68). Whatever else it holds, the SDK cannot read it
+/// either, so it is held.
+fn is_blob(cipher: &Value) -> bool {
+    str_at(cipher, "/data")
+        .and_then(|d| serde_json::from_str::<Value>(d).ok())
+        .is_some_and(|v| v.as_object().is_some_and(|o| o.contains_key("format_version")))
+}
+
 pub fn scan(cipher: &Value, keys: &Keys) -> Scan {
     let cipher_id = cipher.get("id").and_then(Value::as_str).unwrap_or_default();
     if cipher.get("deletedDate").is_some_and(|d| !d.is_null()) {
@@ -94,6 +105,9 @@ pub fn scan(cipher: &Value, keys: &Keys) -> Scan {
     }
     if cipher.get("organizationId").is_some_and(|o| !o.is_null()) {
         return Scan::Uninspectable(format!("{cipher_id}: organization items are not read"));
+    }
+    if is_blob(cipher) {
+        return Scan::Uninspectable(format!("{cipher_id}: blob-encrypted item (newer encryption format)"));
     }
     let Ok(key) = item_key(cipher, &keys.user) else {
         return Scan::Uninspectable(format!("{cipher_id}: item key cannot be unwrapped"));
@@ -407,6 +421,40 @@ mod tests {
         c["notes"] = json!("2.bad|bad|bad");
         c["login"]["password"] = json!("2.bad|bad|bad");
         assert!(matches!(scan(&c, &k), Scan::Unmarked));
+    }
+
+    #[test]
+    fn blob_encrypted_ciphers_are_uninspectable_not_unmarked() {
+        let k = keys();
+        let blob = r#"{"format_version":1,"wrapped_cek":"2.x|y|z","envelope":"AAAA"}"#;
+        let mut c = login(&k, &[f("bwss:id", "x")], Some("pw"), None);
+        c["data"] = json!(blob);
+        for field in ["name", "notes", "login", "fields"] {
+            c[field] = Value::Null;
+        }
+        assert!(matches!(scan(&c, &k), Scan::Uninspectable(w) if w.contains("newer encryption format")));
+        // in the trash it is still just the trash
+        c["deletedDate"] = json!("2026-01-01T00:00:00Z");
+        assert!(matches!(scan(&c, &k), Scan::Unmarked));
+        // the gate is the key alone: a bare or odd `format_version` is held too
+        for data in [r#"{"format_version":1}"#, r#"{"format_version":2,"x":1}"#, r#"{"format_version":null}"#] {
+            let mut c = login(&k, &[f("bwss:id", "x")], Some("pw"), None);
+            c["data"] = json!(data);
+            assert!(matches!(scan(&c, &k), Scan::Uninspectable(_)), "{data}");
+        }
+        // an object without `format_version` is legacy
+        let mut c = login(&k, &[f("bwss:id", "x")], Some("pw"), None);
+        c["data"] = json!(r#"{"uri":"x","fields":[],"formatVersion":1}"#);
+        assert!(matches!(scan(&c, &k), Scan::Marked(_)));
+        // other `data` is no blob: the scan reads the cipher as before
+        for data in [json!("not json"), json!(r#"{"uri":"x"}"#), json!("[1]"), json!("null"), json!(7), Value::Null] {
+            let mut c = login(&k, &[f("bwss:id", "x")], Some("pw"), None);
+            c["data"] = data;
+            assert!(matches!(scan(&c, &k), Scan::Marked(_)));
+            let mut c = login(&k, &[f("other", "x")], Some("pw"), None);
+            c["data"] = json!("not json");
+            assert!(matches!(scan(&c, &k), Scan::Unmarked));
+        }
     }
 
     #[test]

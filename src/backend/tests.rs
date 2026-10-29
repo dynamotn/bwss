@@ -1300,6 +1300,29 @@ async fn a_queued_delete_waits_for_an_item_that_cannot_be_read() {
 }
 
 #[tokio::test]
+async fn a_cipher_that_turns_blob_encrypted_is_held_not_deleted_or_recreated() {
+    let v = github().await;
+    let posts = v.fake.count("POST", "/api/ciphers");
+    let blob = r#"{"format_version":1,"wrapped_cek":"2.x|y|z","envelope":"AAAA"}"#;
+    v.edit_elsewhere("c1", |c| {
+        c["data"] = json!(blob);
+        for f in ["name", "notes", "login", "fields"] {
+            c[f] = Value::Null;
+        }
+    });
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    let ids: Vec<_> = v.snapshot().await.items.into_iter().map(|i| i.id).collect();
+    assert_eq!(ids, ["gh"], "still present as last read");
+
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be read now")), "{err}");
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), posts, "never recreated");
+    assert_eq!(v.queued().await, 0);
+}
+
+#[tokio::test]
 async fn writes_to_an_item_that_cannot_be_read_wait() {
     let v = github().await;
     v.edit_elsewhere("c1", |c| c["key"] = json!("2.AAAA|AAAA|AAAA"));
