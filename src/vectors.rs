@@ -115,12 +115,13 @@ fn expected_failures() -> BTreeMap<String, String> {
 
 /// The keys bwss holds once unlocked: the account's user key, and the mark
 /// key derived from it as `BitwardenBackend::unlock` does.
-fn account_keys(dir: &Path, name: &str) -> Keys {
+/// `Err` for a user key bwss cannot hold (a COSE key): the vectors of that account fail, they do not abort the run.
+fn account_keys(dir: &Path, name: &str) -> Result<Keys, String> {
     let account = read_json(&dir.join("accounts").join(format!("{name}.json")));
     let raw = account.get("userKey").and_then(Value::as_str).unwrap_or_else(|| panic!("{name}: no userKey"));
     let bytes = Zeroizing::new(B64.decode(raw).unwrap_or_else(|e| panic!("{name}: userKey: {e}")));
-    let user = SymmetricKey::from_bytes(&bytes).unwrap_or_else(|e| panic!("{name}: userKey: {e}"));
-    Keys { mark: user.derive("value-mark"), user }
+    let user = SymmetricKey::from_bytes(&bytes).map_err(|e| format!("{name}: userKey: {e}"))?;
+    Ok(Keys { mark: user.derive("value-mark"), user })
 }
 
 /// The ciphers as bwss's API layer hands them on (`api::parse_body`).
@@ -491,7 +492,10 @@ fn mismatch(what: &str, actual: &Value, expected: &Value) -> String {
 /// Runs one vector; `Err` says how bwss differs from the expectation.
 fn run(dir: &Path, v: &Value, accounts: &mut HashMap<String, Keys>) -> Result<(), String> {
     let account = v.get("account").and_then(Value::as_str).ok_or("no account")?;
-    let keys = accounts.entry(account.to_owned()).or_insert_with(|| account_keys(dir, account));
+    if !accounts.contains_key(account) {
+        accounts.insert(account.to_owned(), account_keys(dir, account)?);
+    }
+    let keys = accounts.get(account).ok_or("no account")?;
     let ciphers = server_ciphers(v);
     let expect = v.get("expect").ok_or("no expect")?;
     if expect.get("plan").is_some() {
