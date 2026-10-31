@@ -572,15 +572,16 @@ fn write_scenarios() {
     run_kind("write");
 }
 
-/// The generator emits no sync scenarios for bwss, which has no planner;
-/// any that appear would otherwise go unrun.
+/// bwss has no planner, so a sync scenario never runs: each one must be
+/// listed as an expected failure, or it would otherwise go unrun.
 #[test]
 fn only_read_and_write_scenarios() {
     let dir = vectors_dir();
+    let listed = expected_failures();
     let others: Vec<String> = scenarios(&dir)
         .into_iter()
         .map(|(id, _)| id)
-        .filter(|id| !id.starts_with("read/") && !id.starts_with("write/"))
+        .filter(|id| !id.starts_with("read/") && !id.starts_with("write/") && !listed.contains_key(id))
         .collect();
     assert!(others.is_empty(), "bwss vectors of an unrun kind: {others:?}");
 }
