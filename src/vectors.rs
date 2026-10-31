@@ -42,6 +42,7 @@ const REASONS: &[(&str, &str)] = &[
     ("unknown bwss:encoding", "unknown-encoding"),
     ("bwss:encoding=base64 on a value bwss does not own", "encoding-on-user-source"),
     ("is reserved", "reserved-id"),
+    ("value is not valid base64", "invalid-base64"),
 ];
 
 fn reason_code(why: &str) -> String {
@@ -594,7 +595,7 @@ fn reasons_map_to_shared_codes() {
         ("c1: unknown bwss:encoding", "unknown-encoding"),
         ("c1: bwss:encoding=base64 on a value bwss does not own", "encoding-on-user-source"),
         ("c1: _collections is reserved", "reserved-id"),
-        ("c1: value is not valid base64", "c1: value is not valid base64"),
+        ("c1: value is not valid base64", "invalid-base64"),
     ] {
         assert_eq!(reason_code(why), code, "{why}");
     }
