@@ -2825,9 +2825,23 @@ async fn derived_attributes_are_off_by_default() {
 }
 
 #[tokio::test]
-async fn derive_on_shows_them_after_confirmation() {
-    // The terminal confirmation is `main::derive` (see `turning_derived_attributes_on_says_what_becomes_visible`);
-    // what it sets is the device flag the vault reads.
+async fn status_announces_a_carried_over_derive_flag() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    assert!(!v.backend.describe().await.contains("carried over"));
+    let paths = paths_in(&v.dir);
+    std::fs::create_dir_all(&paths.tool_state).unwrap();
+    std::fs::write(paths.derive_carried(), "on\n").unwrap();
+    let status = v.backend.describe().await;
+    assert!(status.contains("visible on the session bus") && status.contains("`bwss derive off`"), "{status}");
+    crate::config::set_derive(&paths, false).unwrap();
+    assert!(!v.backend.describe().await.contains("carried over"), "an explicit choice ends it");
+}
+
+#[tokio::test]
+async fn derive_on_shows_them_and_off_hides_them_at_once() {
+    // The terminal confirmation is `main::derive` (see `turning_derived_attributes_on_says_what_becomes_visible`
+    // and the e2e tests); this is what the device flag does.
     let k = SymmetricKey::generate();
     let v = vault_with(vec![hand_marked(&k, "c1", "gh")], k, true).await;
     let item = v.item("gh").await;
@@ -2836,9 +2850,10 @@ async fn derive_on_shows_them_after_confirmation() {
     assert_eq!(item.attributes["bwss:uri"], "https://github.com");
     assert_eq!(item.label, "GitHub", "ADR 0015: the item name is the label while derived attributes are on");
 
-    // Turned off again: the next build drops them.
+    // Turned off again: the next refresh drops them, though the server did not change.
     std::fs::remove_file(v.dir.join("tool-state").join("derive-on")).unwrap();
-    v.fake.with(|s| s.rev += 1);
+    let snap = v.backend.refresh().await.unwrap().expect("the snapshot changed");
+    assert!(!snap.items[0].attributes.contains_key("bwss:name"));
     assert!(!v.item("gh").await.attributes.contains_key("bwss:name"));
 }
 

@@ -906,6 +906,8 @@ pub(super) struct Unlocked {
     revision: Option<String>,
     /// The keyring: `sync` with the queue applied.
     pub(super) built: Built,
+    /// Whether `built` was made with derived attributes on (ADR 0015).
+    derive: bool,
     /// The core's scan cache: the unmarked ciphers of the last build.
     cache: UnmarkedCache,
     pub(super) keyring_folder: Option<String>,
@@ -959,6 +961,8 @@ pub(crate) struct Bitwarden {
     acl_confirmed: PathBuf,
     /// The device flag `bwss derive on` (ADR 0015), read at every build.
     derive_on: PathBuf,
+    /// Present while `derive_on` was carried over from `bwss index derived`.
+    derive_carried: PathBuf,
 }
 
 /// The online half of an unlock.
@@ -1056,6 +1060,7 @@ impl Bitwarden {
             spent_accept: std::sync::Mutex::new(None),
             acl_confirmed: paths.acl_confirmed(),
             derive_on: paths.derive_on(),
+            derive_carried: paths.derive_carried(),
         })
     }
 
@@ -1254,6 +1259,7 @@ impl Bitwarden {
 
     /// Rebuilds the keyring after the cache or the queue changed.
     pub(super) fn rebuild(&self, state: &mut Unlocked, queue: &Queue) {
+        let derive = crate::config::flag_set(&self.derive_on);
         let built = build_view(
             &state.sync,
             queue,
@@ -1261,12 +1267,13 @@ impl Bitwarden {
             state.keyring_folder.as_deref(),
             &state.built,
             &mut state.cache,
-            crate::config::flag_set(&self.derive_on),
+            derive,
         );
         if built.bound != state.built.bound {
             self.save_bindings(&state.core_keys.user, &built.bound);
         }
         state.built = built;
+        state.derive = derive;
     }
 
     /// The key the bindings are sealed with: a purpose of their own, so the
@@ -1456,15 +1463,8 @@ impl Bitwarden {
         notices.extend(file.notices);
         let folder = keyring_folder(&sync, &core_keys.user, &self.root);
         let mut cache = UnmarkedCache::default();
-        let built = build_fresh(
-            &sync,
-            &queue,
-            &core_keys,
-            folder.as_deref(),
-            &mut cache,
-            &bound,
-            crate::config::flag_set(&self.derive_on),
-        );
+        let derive = crate::config::flag_set(&self.derive_on);
+        let built = build_fresh(&sync, &queue, &core_keys, folder.as_deref(), &mut cache, &bound, derive);
         if built.bound != bound {
             self.save_bindings(&core_keys.user, &built.bound);
         }
@@ -1474,6 +1474,7 @@ impl Bitwarden {
             sync,
             revision,
             built,
+            derive,
             cache,
             keyring_folder: folder,
             notices,
@@ -1525,6 +1526,15 @@ impl Bitwarden {
             let guard = self.state.lock().await;
             guard.as_ref().ok_or(BackendError::Locked)?.built.snapshot.clone()
         };
+        // `bwss derive on|off` shows at once, not at the next change on the server.
+        {
+            let queue = self.queue.lock().await;
+            if let Some(state) = self.state.lock().await.as_mut()
+                && state.derive != crate::config::flag_set(&self.derive_on)
+            {
+                self.rebuild(state, &queue);
+            }
+        }
         // Before the first `/sync` of this session (offline unlock, or an
         // ended session), writes cannot name their owner: sync first, flush after.
         let synced = self.can_write().await;
@@ -1652,7 +1662,8 @@ impl Bitwarden {
                 .chain(rollbacks)
                 .chain(queue_lines(state, &queue))
                 .chain(state.notices.iter().cloned());
-            for line in lines {
+            let carried = crate::config::flag_set(&self.derive_carried).then(|| CARRIED_NOTICE.to_owned());
+            for line in lines.chain(carried) {
                 out.push('\n');
                 out.push_str(&line);
             }
@@ -1660,6 +1671,10 @@ impl Bitwarden {
         out
     }
 }
+
+/// `bwss status` until the user runs `bwss derive on` or `off` themselves.
+const CARRIED_NOTICE: &str = "derived attributes (name, username, URI) are now visible on the session bus because the \
+     old `bwss index derived` setting was carried over; `bwss derive off` hides them";
 
 /// What `bwss status` says about items the server sent older (ADR 0019).
 fn rollback_text(held: &[Rollback]) -> String {

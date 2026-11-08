@@ -175,6 +175,38 @@ def test_derived_attributes_are_found_while_locked_only_after_this_device_opts_i
         assert json.loads(index.read_text())["items"], "the rest of the index stays"
 
 
+def test_derive_off_hides_them_on_the_bus_at_once_and_a_carried_flag_is_announced():
+    from test_config import on_terminal
+
+    # An account of its own: an attribute-less item would make `store bwss:id` ambiguous in the others.
+    account = Account(URL)
+    d = bitwarden_daemon(account)
+    tools = d.state / "tools" / "bwss"
+    tools.mkdir(parents=True, exist_ok=True)
+    (tools / "index-derived").write_text("on\n")  # the old `bwss index derived on`
+    d.start()
+    try:
+        unlock(d, account)
+        account.add_login(None, "Carried", "c-pw", {"bwss:id": "carried"}, username="carrieduser")
+        d.cli("sync")
+        assert d.tool("lookup", "bwss:name", "Carried").stdout == "c-pw"
+        status = d.cli("status").stdout
+        assert "visible on the session bus" in status and "`bwss derive off`" in status, status
+
+        # Off takes effect without a sync.
+        out = d.cli("derive", "off").stdout
+        assert "derived attributes are off" in out and "next sync" not in out, out
+        assert d.tool("lookup", "bwss:name", "Carried", check=False).stdout == ""
+        assert d.tool("lookup", "bwss:id", "carried").stdout == "c-pw"
+        assert "visible on the session bus" not in d.cli("status").stdout
+
+        code, _, _ = on_terminal(d, "derive", "on", answer="yes")
+        assert code == 0
+        assert d.tool("lookup", "bwss:name", "Carried").stdout == "c-pw"
+    finally:
+        d.stop()
+
+
 class Relay:
     """A TCP relay to Vaultwarden that can be cut: the server goes offline
     while its URL, and so the origin the API key is bound to, stays the same."""

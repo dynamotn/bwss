@@ -215,6 +215,11 @@ impl Paths {
         self.tool_state.join("derive-on")
     }
 
+    /// Present while `derive-on` was carried over from the old index flag.
+    pub fn derive_carried(&self) -> PathBuf {
+        self.tool_state.join("derive-carried-over")
+    }
+
     /// The flag of `bwss index derived on`, before it merged into `derive-on`.
     fn index_derived(&self) -> PathBuf {
         self.tool_state.join("index-derived")
@@ -656,7 +661,9 @@ pub fn set_acl_off(paths: &Paths, off: bool) -> std::io::Result<()> {
 /// Turns derived attributes on (or off) for this device; the daemon reads
 /// it at every build of the keyring and every index write.
 pub fn set_derive(paths: &Paths, on: bool) -> std::io::Result<()> {
-    migrate_index_derived(paths)?;
+    // An explicit choice settles what the old flag left open.
+    set_flag(&paths.index_derived(), false, b"")?;
+    set_flag(&paths.derive_carried(), false, b"")?;
     set_flag(&paths.derive_on(), on, b"on\n")
 }
 
@@ -668,6 +675,11 @@ pub fn migrate_index_derived(paths: &Paths) -> std::io::Result<()> {
     }
     if !flag_set(&paths.derive_on()) {
         crate::fsutil::write_private(&paths.derive_on(), b"on\n")?;
+        crate::fsutil::write_private(&paths.derive_carried(), b"on\n")?;
+        tracing::warn!(
+            "`bwss index derived` was on: derived attributes (name, username, URI) are now visible on the session \
+             bus; `bwss derive off` hides them"
+        );
     }
     set_flag(&old, false, b"")
 }
@@ -1067,8 +1079,10 @@ mod tests {
         crate::fsutil::write_private(&p.index_derived(), b"on\n").unwrap();
         migrate_index_derived(&p).unwrap();
         assert!(flag_set(&p.derive_on()) && !flag_set(&p.index_derived()));
-        // Turning it off stays off: the old flag is gone.
+        assert!(flag_set(&p.derive_carried()), "status announces it");
+        // An explicit choice ends the notice; off stays off.
         set_derive(&p, false).unwrap();
+        assert!(!flag_set(&p.derive_carried()));
         migrate_index_derived(&p).unwrap();
         assert!(!flag_set(&p.derive_on()));
         // An old flag next to the new one is dropped, not merged back.

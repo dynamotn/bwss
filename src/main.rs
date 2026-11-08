@@ -539,16 +539,22 @@ fn status_lines(unlocked: bool, items: u32, backend: &str) -> Vec<String> {
     lines
 }
 
-fn derive(mode: Switch) -> anyhow::Result<()> {
+async fn derive(mode: Switch) -> anyhow::Result<()> {
     let paths = Paths::from_env();
     let on = matches!(mode, Switch::On);
     if on && !confirm_on_terminal(&derive_question(&paths.locked_index()))? {
         bail!("not confirmed; derived attributes stay off");
     }
     config::set_derive(&paths, on).with_context(|| format!("{}", paths.derive_on().display()))?;
+    // A running daemon rebuilds now, for off and on alike; none running has nothing to rebuild.
+    let applied = match control().await {
+        Ok(control) => control.call::<_, _, ()>("Sync", &()).await.is_ok(),
+        Err(_) => false,
+    };
     println!(
-        "derived attributes are {} on this device from the next sync, unlock or change of the keyring",
-        if on { "on" } else { "off" }
+        "derived attributes are {} on this device{}",
+        if on { "on" } else { "off" },
+        if applied { "" } else { "; a running daemon applies it at its next sync" }
     );
     Ok(())
 }
@@ -641,13 +647,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Derive { mode } => derive(mode),
+        Command::Derive { mode } => derive(mode).await,
         Command::Index { command: IndexCommand::Derived { mode } } => {
             eprintln!(
                 "`bwss index derived` is deprecated: use `bwss derive {}`",
                 if matches!(mode, Switch::On) { "on" } else { "off" }
             );
-            derive(mode)
+            derive(mode).await
         }
         Command::Kdf { command: KdfCommand::Accept } => {
             let (storage, origin, prompter) = answering()?;
