@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 use super::Backend;
 use super::BackendError;
-use super::bitwarden::BitwardenBackend;
+use super::bitwarden::{Bitwarden, BitwardenBackend};
 use super::ops::{Loaded, Op, QUEUE_FORMAT, read_formats, unseal};
 use super::registry::Registry;
 use super::runner::Effect;
@@ -284,7 +284,7 @@ impl Fake {
 struct Vault {
     keys: Keys,
     fake: Fake,
-    backend: Arc<BitwardenBackend>,
+    backend: Arc<Bitwarden>,
     _dir: tempfile::TempDir,
     dir: std::path::PathBuf,
 }
@@ -321,7 +321,8 @@ fn registry_note(k: &SymmetricKey, cid: &str, notes: &str) -> Value {
     })
 }
 
-async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
+/// A fake server holding `ciphers` for `user`, and what a backend needs to reach it.
+fn server(ciphers: Vec<Value>, user: &SymmetricKey) -> (Fake, Config, Credentials, Paths, tempfile::TempDir) {
     let master = derive_master_key(PASSWORD, EMAIL, KdfParams::Pbkdf2 { iterations: ITERATIONS }).unwrap();
     let protected = SymmetricKey::stretch(&master).encrypt(&user.to_bytes());
     let sync = json!({ "profile": { "id": "user1", "key": protected }, "folders": [], "ciphers": ciphers });
@@ -331,7 +332,12 @@ async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
     let config = Config { server_url: url, email: EMAIL.into(), profile: Some("p".into()), ..Config::default() };
     let paths = paths_in(dir.path());
     let creds = Credentials { identity_origin, client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
-    let backend = Arc::new(BitwardenBackend::new(&config, creds, &paths).unwrap());
+    (fake, config, creds, paths, dir)
+}
+
+async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
+    let (fake, config, creds, paths, dir) = server(ciphers, &user);
+    let backend = Arc::new(Bitwarden::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
     let keys = Keys { mark: user.derive("value-mark"), user };
     Vault { keys, fake, backend, dir: dir.path().to_owned(), _dir: dir }
@@ -1835,4 +1841,99 @@ async fn a_registry_that_cannot_be_inspected_keeps_its_collections_while_changes
     assert_eq!(ids, ["home", "login", "work"], "the registry as last read, with the queued collection");
     assert_eq!(v.queue_sizes().await, (1, 1), "and the change waits");
     assert!(v.backend.describe().await.contains("collection registry cannot be read"));
+}
+
+/// The handle the daemon sees, unlocked, on its worker thread.
+async fn handle(ciphers: Vec<Value>) -> (Fake, BitwardenBackend, tempfile::TempDir) {
+    let (fake, config, creds, paths, dir) = server(ciphers, &SymmetricKey::generate());
+    let backend = BitwardenBackend::new(&config, creds, &paths).unwrap();
+    backend.unlock(PASSWORD).await.unwrap();
+    (fake, backend, dir)
+}
+
+const STOPPED: &str = "bwss's vault worker stopped; it was restarted locked";
+
+#[tokio::test]
+async fn commands_round_trip() {
+    let (_fake, b, _dir) = handle(vec![]).await;
+    assert!(matches!(b.unlock("wrong").await, Err(BackendError::WrongPassword)));
+    b.put_item(&new_item("n1", "login")).await.unwrap();
+    let work = b.create_collection("Work").await.unwrap();
+    assert_eq!(work.id, "work");
+    // The writes are already shown: nothing new on the server.
+    assert!(b.refresh().await.unwrap().is_none());
+    assert!(matches!(b.acl_trust().await, Ok(super::AclTrust::PerDevice(_))));
+    assert!(b.describe().await.contains("0 queued change(s)"));
+    b.delete_item(&new_item("n1", "login")).await.unwrap();
+    b.delete_collection("work", &[]).await.unwrap();
+    b.lock().await;
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+    assert!(matches!(b.refresh().await, Err(BackendError::Locked)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_during_a_flush_wins() {
+    let (fake, b, _dir) = handle(vec![]).await;
+    fake.with(|s| s.down = true);
+    b.put_item(&new_item("n1", "login")).await.unwrap();
+    assert!(b.describe().await.contains("1 queued change(s)"));
+    fake.with(|s| s.down = false);
+
+    let b = Arc::new(b);
+    let mut gate = Gate::hold(&fake, "POST", "/api/ciphers");
+    let flushing = tokio::spawn({
+        let b = b.clone();
+        async move { b.refresh().await }
+    });
+    gate.arrived().await;
+    // Handled between two awaits of the flush: the keys go at once.
+    let locking = tokio::spawn({
+        let b = b.clone();
+        async move { b.lock().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !matches!(b.acl_trust().await, Err(BackendError::Locked)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lock drops the keys while the flush waits on the server");
+    gate.open();
+    assert!(matches!(flushing.await.unwrap(), Err(BackendError::Locked)));
+    locking.await.unwrap();
+    assert!(b.describe().await.contains("0 queued change(s)"));
+}
+
+#[tokio::test]
+async fn a_panicking_worker_fails_calls_instead_of_hanging() {
+    let (_fake, b, _dir) = handle(vec![]).await;
+    let panicked = tokio::time::timeout(std::time::Duration::from_secs(10), b.panic_for_test()).await;
+    assert!(matches!(panicked, Ok(Err(BackendError::Unavailable(m))) if m == STOPPED));
+    // The worker is still there for the next call.
+    assert!(b.describe().await.starts_with("Bitwarden "));
+
+    // A worker that is gone fails every call at once.
+    let gone = BitwardenBackend::stopped_for_test();
+    assert!(matches!(gone.unlock(PASSWORD).await, Err(BackendError::Unavailable(m)) if m == STOPPED));
+    assert!(matches!(gone.refresh().await, Err(BackendError::Unavailable(_))));
+    assert!(matches!(gone.create_collection("Work").await, Err(BackendError::Unavailable(_))));
+    assert!(matches!(gone.delete_collection("work", &[]).await, Err(BackendError::Unavailable(_))));
+    assert!(matches!(gone.put_item(&new_item("n1", "login")).await, Err(BackendError::Unavailable(_))));
+    assert!(matches!(gone.delete_item(&new_item("n1", "login")).await, Err(BackendError::Unavailable(_))));
+    assert!(matches!(gone.acl_trust().await, Err(BackendError::Unavailable(_))));
+    gone.lock().await;
+    assert_eq!(gone.describe().await, STOPPED);
+    // A vault that panics while it is built never starts.
+    assert!(super::worker::Worker::spawn(|| panic!("a test made the vault panic while it is built")).is_err());
+}
+
+#[tokio::test]
+async fn calls_after_a_restart_see_a_locked_vault() {
+    let (_fake, b, _dir) = handle(vec![]).await;
+    assert!(b.acl_trust().await.is_ok());
+    assert!(b.panic_for_test().await.is_err());
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+    assert!(matches!(b.refresh().await, Err(BackendError::Locked)));
+    b.unlock(PASSWORD).await.unwrap();
+    assert!(b.acl_trust().await.is_ok());
 }

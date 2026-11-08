@@ -132,6 +132,7 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+#[derive(Clone)]
 pub struct Paths {
     /// The shared dybw file.
     pub config: PathBuf,

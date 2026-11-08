@@ -7,6 +7,7 @@ pub mod registry;
 mod runner;
 #[cfg(test)]
 mod tests;
+mod worker;
 
 use async_trait::async_trait;
 

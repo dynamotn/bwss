@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 
 use super::BackendError;
 use super::bitwarden::{
-    BitwardenBackend, Built, KIND_COLLECTIONS, QUEUED, Unlocked, cache_key, ciphers, find_marked, read_registry,
+    Bitwarden, Built, KIND_COLLECTIONS, QUEUED, Unlocked, cache_key, ciphers, find_marked, read_registry,
     registry_with_queue, with_queue,
 };
 use super::ops::Op;
@@ -368,7 +368,7 @@ enum RegistryPlan {
     Update(String, Map<String, Value>),
 }
 
-impl BitwardenBackend {
+impl Bitwarden {
     async fn with_state<T>(&self, f: impl FnOnce(&Unlocked) -> Result<T, Failure>) -> Result<T, Failure> {
         let guard = self.state.lock().await;
         f(guard.as_ref().ok_or(Failure::Locked)?)

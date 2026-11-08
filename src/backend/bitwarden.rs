@@ -17,12 +17,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use super::ops::{
     FORMAT as LEGACY_QUEUE_FORMAT, Loaded, Op, QUEUE_FORMAT, read_formats, read_versioned, seal, set_aside, unseal,
 };
 use super::registry::{REGISTRY_ID, Registry};
 use super::runner::{Effect, status_lines};
+use super::worker::{Command, Worker, WorkerHandle};
 use super::{AclTrust, Backend, BackendError};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
@@ -531,7 +533,7 @@ pub(super) struct Unlocked {
     pub(super) keyring_folder: Option<String>,
 }
 
-pub struct BitwardenBackend {
+pub(crate) struct Bitwarden {
     email: String,
     /// Name of the keyring folder.
     pub(super) root: String,
@@ -556,7 +558,7 @@ fn map_api(e: ApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
 }
 
-impl BitwardenBackend {
+impl Bitwarden {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
         let urls = resolve_server_urls(&config.server_url).map_err(anyhow::Error::msg)?;
         let profile = config.profile.as_deref().ok_or_else(|| anyhow::anyhow!("no profile to serve"))?;
@@ -574,7 +576,7 @@ impl BitwardenBackend {
         if std::fs::symlink_metadata(&queue_path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
             end_migration(&paths.queue_key_migrated());
         }
-        Ok(BitwardenBackend {
+        Ok(Bitwarden {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
             api: Mutex::new(Api::new(urls, device_id)?),
@@ -672,7 +674,7 @@ impl BitwardenBackend {
 }
 
 #[async_trait]
-impl Backend for BitwardenBackend {
+impl Backend for Bitwarden {
     async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
         let online: Result<(KdfParams, Option<String>, Value), ApiError> = async {
             let kdf = self.api.lock().await.prelogin(&self.email).await?;
@@ -825,6 +827,66 @@ impl Backend for BitwardenBackend {
             }
         }
         out
+    }
+}
+
+/// What the daemon sees: a handle on the worker thread that owns the vault.
+pub struct BitwardenBackend(WorkerHandle);
+
+impl BitwardenBackend {
+    pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
+        let (config, paths) = (config.clone(), paths.clone());
+        Worker::spawn(move || Bitwarden::new(&config, creds, &paths)).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn panic_for_test(&self) -> Result<(), BackendError> {
+        self.0.call(Command::Panic).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn stopped_for_test() -> Self {
+        Self(WorkerHandle::stopped())
+    }
+}
+
+#[async_trait]
+impl Backend for BitwardenBackend {
+    async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+        self.0.call(|r| Command::Unlock(Zeroizing::new(password.to_owned()), r)).await?
+    }
+
+    async fn lock(&self) {
+        // A worker that is gone holds no keys.
+        let _ = self.0.call(Command::Lock).await;
+    }
+
+    async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
+        self.0.call(Command::Refresh).await?
+    }
+
+    async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+        self.0.call(|r| Command::CreateCollection(label.to_owned(), r)).await?
+    }
+
+    async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
+        self.0.call(|r| Command::DeleteCollection(id.to_owned(), items.to_vec(), r)).await?
+    }
+
+    async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        self.0.call(|r| Command::PutItem(item.clone(), r)).await?
+    }
+
+    async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        self.0.call(|r| Command::DeleteItem(item.clone(), r)).await?
+    }
+
+    async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+        self.0.call(Command::AclTrust).await?
+    }
+
+    async fn describe(&self) -> String {
+        self.0.call(Command::Describe).await.unwrap_or_else(|e| e.to_string())
     }
 }
 
