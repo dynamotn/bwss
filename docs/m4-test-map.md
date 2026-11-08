@@ -109,6 +109,7 @@ The 68 tests of `src/bw/` went with the code: the core's own tests were ported f
 | `src/backend/bitwarden.rs` | `the_queue_is_sealed_with_a_key_of_its_own_as_format_3` | renamed `the_queue_is_sealed_with_a_key_of_its_own_as_format_4` (queue format 4, B6) | fcdc258 |
 | `src/backend/runner.rs` | `value_sources_map_to_the_cores` (added in Part B) | removed with the mapping it tested: bwss now keeps the core's `ValueSource` itself; `backend/ops.rs` `value_sources_keep_their_old_names_in_the_file` still checks the queue's old names map to the core's | B9 |
 | `src/backend/tests.rs` | `a_write_racing_a_cose_unlock_is_refused` (added in B3) | renamed `a_write_racing_a_cose_unlock_waits_for_it_and_is_sent`: the COSE write guard went away in B5 | facb226 |
+| `src/backend/tests.rs` | `a_panic_while_locking_after_a_panic_keeps_the_worker` (added in B10) | renamed `a_panic_while_locking_after_a_panic_stops_the_worker`: a lock that fails after a panic now stops the worker (fail closed) | B10 fix round 1 |
 | `src/backend/tests.rs` | `collection_changes_queue_behind_item_changes` (added in B5) | renamed `collection_changes_queue_only_behind_collection_changes` (the per-item queueing ruling) | e37e0c3 |
 | `src/backend/tests.rs` | `records_and_questions_that_cannot_be_kept_ask_again` (added in B5) | renamed `write_records_that_cannot_be_kept_ask_again` (the questions file is gone) | e37e0c3 |
 | `src/config.rs` | `derived_attributes_in_the_index_are_device_state` | renamed `derived_attributes_are_device_state` (`bwss derive`, B7) | 3dcb554 |

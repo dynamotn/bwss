@@ -1139,7 +1139,8 @@ queue and hub task. The D-Bus side reaches it through `WorkerHandle`, which
 is `Send + Sync` and sends one command per `Backend` method; only `Send`
 reply data comes back. Each command runs as a task of its own, so a `lock`
 is handled between two awaits of a running unlock or flush. A command that
-panics fails its call, the vault is locked, and the worker goes on.
+panics fails its call, the vault is locked, and the worker goes on; if that
+lock fails, the worker stops, and every later call fails.
 
 | Module | Change from `legacy` |
 |---|---|

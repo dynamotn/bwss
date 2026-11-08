@@ -3313,13 +3313,19 @@ async fn a_hub_whose_unlock_is_over_ends_by_itself() {
 }
 
 #[tokio::test]
-async fn a_panic_while_locking_after_a_panic_keeps_the_worker() {
+async fn a_panic_while_locking_after_a_panic_stops_the_worker() {
     let (_fake, b, _dir) = handle(vec![]).await;
+    assert!(b.acl_trust().await.is_ok(), "unlocked");
     assert!(matches!(b.panic_for_test(true).await, Err(BackendError::Unavailable(m)) if m == STOPPED));
-    // That lock never ran; the worker serves the next call, and a lock still works.
-    assert!(b.acl_trust().await.is_ok());
-    b.lock().await;
-    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+    // The keys may still be held: the worker stops instead of serving them.
+    let stopped = async {
+        while b.describe().await != STOPPED {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), stopped).await.expect("the worker stops");
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Unavailable(m)) if m == STOPPED));
+    assert!(matches!(b.unlock(PASSWORD).await, Err(BackendError::Unavailable(m)) if m == STOPPED));
 }
 
 /// The record is turned into a directory while the sync that uses it runs:

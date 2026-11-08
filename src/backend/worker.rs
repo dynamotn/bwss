@@ -91,12 +91,19 @@ impl Worker {
     /// Serves commands until every handle is dropped. Each command runs as a
     /// task of its own, so a `lock` is handled between two awaits of a running
     /// unlock or flush, and a panic stays inside its task: the vault is then
-    /// locked and the worker goes on.
+    /// locked and the worker goes on. If that lock panics too, the worker
+    /// stops: its tasks and the vault are dropped, and every call fails.
     fn run(self, runtime: &tokio::runtime::Runtime, mut inbox: mpsc::Receiver<Command>) {
         let local = tokio::task::LocalSet::new();
+        let stop = Rc::new(tokio::sync::Notify::new());
         local.block_on(runtime, async move {
-            while let Some(command) = inbox.recv().await {
-                let vault = self.vault.clone();
+            loop {
+                let next = tokio::select! {
+                    command = inbox.recv() => command,
+                    () = stop.notified() => None,
+                };
+                let Some(command) = next else { break };
+                let (vault, stop) = (self.vault.clone(), stop.clone());
                 tokio::task::spawn_local(async move {
                     let task = tokio::task::spawn_local(serve(vault.clone(), command));
                     if task.await.is_err_and(|e| e.is_panic()) {
@@ -109,7 +116,9 @@ impl Worker {
                             vault.lock().await;
                         };
                         if tokio::task::spawn_local(locking).await.is_err() {
-                            tracing::error!("locking the keyring after a panic panicked too");
+                            // Fail closed: the keys may still be held, so nothing is served again.
+                            tracing::error!("locking the keyring after a panic panicked too; the vault worker stops");
+                            stop.notify_one();
                         }
                     }
                 });
