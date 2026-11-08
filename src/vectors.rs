@@ -732,6 +732,26 @@ fn mismatch(what: &str, actual: &Value, expected: &Value) -> String {
     format!("{what} differs\n  bwss:     {}\n  expected: {}", pretty(actual), pretty(expected))
 }
 
+/// §4.1: a `device.base` binding whose cipher is present but skipped as
+/// needing a newer format stays bound and is not served, so its base is
+/// neither cleared nor written over.
+fn held_bindings_kept(built: &Built, v: &Value) -> Result<(), String> {
+    let newer: BTreeSet<&str> =
+        built.skipped.iter().filter(|(_, r, _)| *r == SkipReason::NewerFormat).map(|(c, _, _)| c.as_str()).collect();
+    for (id, cid) in &bindings(v) {
+        if !newer.contains(cid.as_str()) {
+            continue;
+        }
+        if built.bound.get(id) != Some(cid) {
+            return Err(format!("binding {id} -> {cid} was dropped although {cid} is held as newer format"));
+        }
+        if built.marked.contains_key(id) {
+            return Err(format!("{id} is served although its cipher {cid} needs a newer format"));
+        }
+    }
+    Ok(())
+}
+
 /// Runs one vector; `Err` says how bwss differs from the expectation.
 fn run(dir: &Path, v: &Value) -> Result<(), String> {
     let account = v.get("account").and_then(Value::as_str).ok_or("no account")?;
@@ -744,6 +764,8 @@ fn run(dir: &Path, v: &Value) -> Result<(), String> {
         if &actual != expected {
             return Err(mismatch("plan", &actual, expected));
         }
+        let keys = core_account_keys(dir, account)?;
+        held_bindings_kept(&build(&json!({ "ciphers": ciphers }), &keys, &bindings(v)), v)?;
     }
     if let Some(expected) = expect.get("read") {
         let keys = core_account_keys(dir, account)?;
