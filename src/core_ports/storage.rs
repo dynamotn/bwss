@@ -19,9 +19,7 @@ impl FileStorage {
         if key == "device" {
             return Ok(self.device.clone());
         }
-        let ok = !key.is_empty()
-            && !key.starts_with('.')
-            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        let ok = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b));
         if ok { Ok(self.dir.join(key)) } else { Err(PortError("invalid storage key".into())) }
     }
 }
@@ -86,7 +84,7 @@ mod tests {
     async fn storage_rejects_path_keys() {
         let dir = tempfile::tempdir().unwrap();
         let s = FileStorage::new(&paths(dir.path()), "default");
-        for k in ["", "../x", "a/b", ".hidden"] {
+        for k in ["", "../x", "a/b", ".hidden", "a.b"] {
             assert!(s.save(k, b"x").await.is_err(), "{k}");
         }
     }

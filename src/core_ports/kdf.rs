@@ -8,20 +8,11 @@ pub struct BlockingArgon2;
 
 impl KdfRunner for BlockingArgon2 {
     async fn argon2id(&self, input: Argon2Input) -> Result<Zeroizing<[u8; 32]>, PortError> {
-        // NativeArgon2's future is ready on first poll (no awaits inside), so the thread can drive it directly.
-        tokio::task::spawn_blocking(move || poll_ready(NativeArgon2.argon2id(input)))
+        // block_on is allowed on a blocking-pool thread, and drives the core's future whatever it awaits.
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(NativeArgon2.argon2id(input)))
             .await
             .map_err(|_| PortError("the key derivation task failed".into()))?
-    }
-}
-
-/// Polls a future that never pends.
-fn poll_ready<T>(fut: impl Future<Output = T>) -> T {
-    let mut fut = std::pin::pin!(fut);
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(v) => v,
-        std::task::Poll::Pending => unreachable!("NativeArgon2 does not await"),
     }
 }
 

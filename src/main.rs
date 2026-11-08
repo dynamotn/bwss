@@ -5,7 +5,7 @@ mod acl_confirm;
 mod backend;
 mod bw;
 mod config;
-#[allow(dead_code, reason = "the host ports are wired in by later tasks")]
+#[expect(dead_code, reason = "the host ports are wired in B2-B3")]
 mod core_ports;
 mod daemon;
 mod dbus;
