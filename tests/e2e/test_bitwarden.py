@@ -410,15 +410,22 @@ def test_unmarking_removes_from_keyring(account):
         d.stop()
 
 
-def test_sync_can_accept_a_rollback_once(account):
+def test_accept_rollback_is_refused_while_locked_or_with_nothing_held(account):
+    # Vaultwarden cannot be made to send an older revision of a cipher, so a
+    # real rollback is covered by the unit tests against a fake server; this
+    # checks the command's refusals end to end.
     d = bitwarden_daemon(account).start()
     try:
+        accept = d.state / "tools" / "bwss" / "core" / "accept-rollback"
+        r = d.cli("sync", "--accept-rollback", check=False)
+        assert r.returncode != 0 and "the keyring is locked" in r.stderr, r.stderr
+        assert not accept.exists()
         unlock(d, account)
         account.add_login(None, "Rolled", "rb-pw", {"bwss:id": "rb"})
-        flag = d.state / "tools" / "bwss" / "core" / "accept-rollback"
-        d.cli("sync", "--accept-rollback")
-        assert not flag.exists(), "taken by that one sync"
-        assert d.tool("lookup", "bwss:id", "rb").stdout == "rb-pw"
+        r = d.cli("sync", "--accept-rollback", check=False)
+        assert r.returncode != 0 and "nothing to accept" in r.stderr, r.stderr
+        assert not accept.exists()
+        assert sync_lookup(d, "bwss:id", "rb").stdout == "rb-pw"
         assert "older on the server" not in d.cli("status").stdout
     finally:
         d.stop()

@@ -2418,22 +2418,36 @@ async fn a_rolled_back_item_keeps_its_cached_value() {
     assert!(v.backend.describe().await.contains("which is kept: gh"));
 }
 
+impl Vault {
+    /// What `bwss sync --accept-rollback` does with the keyring unlocked.
+    async fn accept_rollbacks(&self) -> Vec<String> {
+        crate::accept_rollbacks(true, &FileStorage::new(&paths_in(&self.dir), "p")).await.unwrap()
+    }
+
+    /// `gh`'s server copy taken back to `old` after a newer one was synced.
+    async fn rolled_back(&self, cid: &str, password: &str) {
+        let old = self.fake.cipher(cid);
+        let k = self.keys.user.clone();
+        self.edit_elsewhere(cid, |c| c["login"]["password"] = json!(k.encrypt_str(password)));
+        self.snapshot().await;
+        roll_back(self, cid, old);
+        self.snapshot().await;
+    }
+}
+
 #[tokio::test]
 async fn accept_rollback_takes_the_server_version() {
     let v = github().await;
-    let old = v.fake.cipher("c1");
-    let k = v.keys.user.clone();
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
-    v.snapshot().await;
-    roll_back(&v, "c1", old);
-    assert_eq!(&*v.item("gh").await.secret, b"new");
-
+    v.rolled_back("c1", "new").await;
+    assert_eq!(&*v.item_offline("gh").await.secret, b"new");
     let accepted = v.dir.join("tool-state/core/accept-rollback");
-    std::fs::write(&accepted, "").unwrap();
+    let shown = v.accept_rollbacks().await;
+    assert!(shown.len() == 1 && shown[0].starts_with("accepting the server's version of gh (cipher c1, "), "{shown:?}");
     // Taken even when the account did not change since: it always pulls.
     assert_eq!(&*v.item("gh").await.secret, b"pw");
     assert!(!accepted.exists(), "for one sync only");
     assert!(!v.backend.describe().await.contains("which is kept"));
+    assert!(!v.dir.join("tool-state/core/rollbacks-held").exists(), "nothing is held back now");
 
     // The server's version is the base now: nothing to report next time.
     assert_eq!(&*v.item("gh").await.secret, b"pw");
@@ -2441,16 +2455,46 @@ async fn accept_rollback_takes_the_server_version() {
     v.backend.unlock(PASSWORD).await.unwrap();
     assert!(!v.backend.describe().await.contains("which is kept"));
 
-    // Accepted at an unlock too.
-    let k = v.keys.user.clone();
-    let base = v.fake.cipher("c1");
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("newer")));
-    v.snapshot().await;
+    // An accept the keyring locked before using is dropped, never applied later.
+    v.rolled_back("c1", "newer").await;
+    v.accept_rollbacks().await;
     v.backend.lock().await;
-    roll_back(&v, "c1", base);
-    std::fs::write(&accepted, "").unwrap();
-    assert_eq!(&*v.backend.unlock(PASSWORD).await.unwrap().items[0].secret, b"pw");
+    assert!(!accepted.exists(), "dropped at lock");
+    assert_eq!(&*v.backend.unlock(PASSWORD).await.unwrap().items[0].secret, b"newer");
+    // And one left behind (a crash) is never applied by an unlock.
+    v.accept_rollbacks().await;
+    v.backend.lock().await;
+    std::fs::write(&accepted, std::fs::read(v.dir.join("tool-state/core/rollbacks-held")).unwrap()).unwrap();
+    assert_eq!(&*v.backend.unlock(PASSWORD).await.unwrap().items[0].secret, b"newer");
     assert!(!accepted.exists());
+}
+
+#[tokio::test]
+async fn accept_rollback_takes_only_the_listed_versions() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "tw")], k.clone()).await;
+    let (gh_old, tw_old) = (v.fake.cipher("c1"), v.fake.cipher("c2"));
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("gh-new")));
+    v.edit_elsewhere("c2", |c| c["login"]["password"] = json!(k.encrypt_str("tw-new")));
+    v.snapshot().await;
+    roll_back(&v, "c1", gh_old.clone());
+    v.snapshot().await;
+    assert!(v.backend.describe().await.contains("which is kept: gh;"));
+    assert_eq!(v.accept_rollbacks().await.len(), 1);
+
+    // After the accept, before its sync: tw goes back too, and gh further back
+    // than the version the user saw.
+    roll_back(&v, "c2", tw_old);
+    let mut gh_older = gh_old;
+    gh_older["revisionDate"] = json!("2025-06-01T00:00:00Z");
+    roll_back(&v, "c1", gh_older);
+    let snap = v.snapshot().await;
+    let secret = |id: &str| snap.items.iter().find(|i| i.id == id).unwrap().secret.clone();
+    assert_eq!(&*secret("gh"), b"gh-new", "a version other than the listed one stays held");
+    assert_eq!(&*secret("tw"), b"tw-new", "a rollback the user did not see stays held");
+    let status = v.backend.describe().await;
+    assert!(status.contains("which is kept: gh, tw"), "{status}");
+    assert!(!v.dir.join("tool-state/core/accept-rollback").exists(), "used by that one sync");
 }
 
 #[tokio::test]
@@ -2461,7 +2505,8 @@ async fn a_bound_winner_stays_after_a_restart() {
     b.unlock(PASSWORD).await.unwrap();
     let bindings = dir.path().join("tool-state/core/bindings");
     let sealed = std::fs::read_to_string(&bindings).unwrap();
-    assert!(!sealed.contains("c1") && !sealed.contains("gh"), "sealed, never plain");
+    // An EncString holds no quote; the JSON map inside would.
+    assert!(sealed.starts_with("2.") && !sealed.contains('"'), "sealed, never plain: {sealed}");
     b.lock().await;
     drop(b);
 
@@ -2478,25 +2523,58 @@ async fn a_bound_winner_stays_after_a_restart() {
     assert!(b.describe().await.contains("duplicate id gh: 1 items ignored"));
     b.lock().await;
 
-    // Without the bindings (a new device), §7 decides.
+    // Without the bindings, they are read again from the offline copy, which
+    // already holds both: §7 decides, and the status says protection is reduced.
     std::fs::remove_file(&bindings).unwrap();
     let b = Bitwarden::new(&config, creds, &paths).unwrap();
     assert_eq!(&*b.unlock(PASSWORD).await.unwrap().items[0].secret, b"clone");
-    // Bindings that do not open are ignored the same way.
+    let status = b.describe().await;
+    assert!(status.contains("the saved item bindings are missing: duplicate and rollback protection"), "{status}");
+    // Bindings that do not open are read again the same way.
     b.lock().await;
     std::fs::write(&bindings, "2.garbage").unwrap();
     assert_eq!(&*b.unlock(PASSWORD).await.unwrap().items[0].secret, b"clone");
+    assert!(b.describe().await.contains("the saved item bindings cannot be read ("));
+    // A new device (no offline copy either) has nothing to report.
+    b.lock().await;
+    std::fs::remove_file(&bindings).unwrap();
+    std::fs::remove_file(dir.path().join("cache/sync.json")).unwrap();
+    b.unlock(PASSWORD).await.unwrap();
+    assert!(!b.describe().await.contains("bindings"));
+}
+
+#[tokio::test]
+async fn lost_bindings_do_not_switch_rollback_detection_off() {
+    let v = github().await;
+    let old = v.fake.cipher("c1");
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    v.snapshot().await;
+    v.backend.lock().await;
+    std::fs::remove_file(v.dir.join("tool-state/core/bindings")).unwrap();
+    roll_back(&v, "c1", old);
+    let snap = v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!(&*snap.items[0].secret, b"new", "the offline copy still says what gh was");
+    let status = v.backend.describe().await;
+    assert!(status.contains("which is kept: gh") && status.contains("bindings are missing"), "{status}");
 }
 
 #[tokio::test]
 async fn bindings_that_cannot_be_read_or_kept_do_not_stop_the_unlock() {
     let k = SymmetricKey::generate();
-    let (_fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
+    let (fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
     // A directory where the file should be: reading and replacing it fail.
     let bindings = dir.path().join("tool-state/core/bindings");
     std::fs::create_dir_all(&bindings).unwrap();
     let b = Bitwarden::new(&config, creds, &paths).unwrap();
     assert_eq!(b.unlock(PASSWORD).await.unwrap().items.len(), 1);
+    assert!(b.describe().await.contains("the saved item bindings cannot be read ("));
+    // A new item changes the bindings: they cannot be written, and the sync goes on.
+    fake.with(|s| {
+        s.rev += 1;
+        s.sync["ciphers"].as_array_mut().unwrap().push(hand_marked(&k, "c2", "tw"));
+    });
+    assert_eq!(b.refresh().await.unwrap().unwrap().items.len(), 2);
     assert!(bindings.is_dir(), "left as it was");
 }
 
@@ -2509,11 +2587,21 @@ async fn an_accepted_rollback_that_cannot_be_cleared_is_still_taken() {
     v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
     v.snapshot().await;
     roll_back(&v, "c1", old);
+    v.snapshot().await;
+    v.accept_rollbacks().await;
     let core = v.dir.join("tool-state/core");
-    std::fs::write(core.join("accept-rollback"), "").unwrap();
-    // The flag cannot be removed (for a user other than root).
+    // The record cannot be removed (for a user other than root).
     std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o500)).unwrap();
     let secret = v.item("gh").await.secret;
+    let status = v.backend.describe().await;
+    let stuck = core.join("accept-rollback").exists();
+    // Never applied twice, even to the same versions coming back.
+    v.rolled_back("c1", "later").await;
+    let later = v.item("gh").await.secret;
     std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(&*secret, b"pw");
+    if stuck {
+        assert!(status.contains("the accepted rollbacks could not be cleared"), "{status}");
+        assert_eq!(&*later, b"later");
+    }
 }

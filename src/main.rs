@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 use dybw_core::ports::Storage;
 use dybw_core::profile;
 
-use crate::backend::bitwarden::{KDF_OFFERED, kdf_offer, ran_kdf};
+use crate::backend::bitwarden::{ACCEPT_ROLLBACK, KDF_OFFERED, ROLLBACKS_HELD, kdf_offer, ran_kdf, rollbacks};
 use crate::backend::{Backend, bitwarden::BitwardenBackend, kdf_text, memory::MemoryBackend};
 use crate::bw::api::identity_origin;
 use crate::config::{BackendKind, Credentials, Paths, Trust};
@@ -245,6 +245,24 @@ async fn security_accept(
         bail!("not confirmed; the version this device saw stays");
     }
     Ok(profile::accept_security_version(storage, version).await?)
+}
+
+/// `bwss sync --accept-rollback`: accepts, for the next sync of the unlocked
+/// keyring, exactly the rollbacks held back now, which `bwss status` lists
+/// (ADR 0019). Returns what it accepts, to show.
+async fn accept_rollbacks(unlocked: bool, storage: &impl Storage) -> anyhow::Result<Vec<String>> {
+    if !unlocked {
+        bail!("the keyring is locked: unlock it, check what `bwss status` lists, then accept it; nothing was accepted");
+    }
+    let held = rollbacks(storage, ROLLBACKS_HELD).await;
+    if held.is_empty() {
+        bail!("no item is held back from an older server version; nothing to accept");
+    }
+    storage.save(ACCEPT_ROLLBACK, &serde_json::to_vec(&held)?).await?;
+    Ok(held
+        .iter()
+        .map(|r| format!("accepting the server's version of {} (cipher {}, revision {})", r.id, r.cipher, r.revision))
+        .collect())
 }
 
 /// The pinentry the daemon and the answering commands ask through, checked
@@ -508,11 +526,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Sync { accept_rollback } => {
+            let control = control().await?;
             if accept_rollback {
-                // The daemon's next sync reads and clears it; a locked one, at its unlock.
-                answering()?.0.save(backend::bitwarden::ACCEPT_ROLLBACK, b"yes").await?;
+                let (unlocked, _, _): (bool, u32, String) = control
+                    .call("Status", &())
+                    .await
+                    .context("the bwss daemon cannot be reached; nothing was accepted")?;
+                for line in accept_rollbacks(unlocked, &answering()?.0).await? {
+                    println!("{line}");
+                }
             }
-            control().await?.call::<_, _, ()>("Sync", &()).await?;
+            control.call::<_, _, ()>("Sync", &()).await?;
             Ok(())
         }
         Command::Status => {
@@ -613,6 +637,28 @@ async fn main() -> std::process::ExitCode {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accept_rollback_needs_an_unlocked_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().as_os_str().to_owned();
+        let storage = FileStorage::new(&Paths::with(|v| (v == "HOME").then(|| home.clone())), "p");
+        let held = br#"[{"id":"gh","cipher":"c1","revision":"2026-01-01T00:00:00Z"}]"#;
+        storage.save(ROLLBACKS_HELD, held).await.unwrap();
+        let locked = accept_rollbacks(false, &storage).await.unwrap_err().to_string();
+        assert!(locked.contains("the keyring is locked") && locked.contains("nothing was accepted"), "{locked}");
+        assert_eq!(storage.load(ACCEPT_ROLLBACK).await.unwrap(), None, "no record while locked");
+
+        let shown = accept_rollbacks(true, &storage).await.unwrap();
+        assert_eq!(shown, ["accepting the server's version of gh (cipher c1, revision 2026-01-01T00:00:00Z)"]);
+        assert_eq!(rollbacks(&storage, ACCEPT_ROLLBACK).await, rollbacks(&storage, ROLLBACKS_HELD).await);
+
+        storage.remove(ACCEPT_ROLLBACK).await.unwrap();
+        storage.remove(ROLLBACKS_HELD).await.unwrap();
+        let none = accept_rollbacks(true, &storage).await.unwrap_err().to_string();
+        assert!(none.contains("nothing to accept"), "{none}");
+        assert_eq!(storage.load(ACCEPT_ROLLBACK).await.unwrap(), None);
+    }
 
     #[test]
     fn only_yes_on_a_terminal_confirms() {

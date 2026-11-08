@@ -66,8 +66,27 @@ pub(crate) const KDF_OFFERED: &str = "kdf-offered";
 const USER_KEY_ID: &str = "user-key-id";
 /// Storage key of the sealed bindings, `bwss:id` to cipher id (ADR 0019).
 const BINDINGS: &str = "bindings";
-/// Storage key of the flag `bwss sync --accept-rollback` leaves for the next sync.
+/// Storage key of the rollbacks held back now, which `bwss status` lists.
+pub(crate) const ROLLBACKS_HELD: &str = "rollbacks-held";
+/// Storage key of the rollbacks `bwss sync --accept-rollback` accepted, for
+/// the next sync only.
 pub(crate) const ACCEPT_ROLLBACK: &str = "accept-rollback";
+
+/// A version the server sent older than this device's copy (ADR 0019): it is
+/// held back, and accepted only as exactly this cipher at this revision.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct Rollback {
+    pub id: String,
+    pub cipher: String,
+    /// The server's (older) `revisionDate`.
+    pub revision: String,
+}
+
+/// A list of rollbacks kept in `key`; none when it is missing or unreadable.
+pub(crate) async fn rollbacks(storage: &impl Storage, key: &str) -> Vec<Rollback> {
+    let raw = storage.load(key).await.ok().flatten();
+    raw.and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+}
 /// Why a COSE account takes no writes yet.
 const COSE_READ_ONLY: &str =
     "this account's user key is a COSE key: this bwss reads its items but cannot write to it yet, and writes nothing";
@@ -427,7 +446,9 @@ pub(crate) fn build(
         }
         let features = report.unknown_features.iter().find(|(c, _)| c == cid).map_or(&[][..], |(_, f)| f.as_slice());
         let why = format!("{cid}: {}", skip_text(*reason, features));
-        tracing::warn!("skipped: {why}");
+        if first_report(("skipped", &why)) {
+            tracing::warn!("skipped: {why}");
+        }
         skipped.push((cid.clone(), why));
     }
 
@@ -497,25 +518,36 @@ pub(crate) fn build(
     }
 }
 
-/// ADR 0019, no rollback below the cached base: a bound cipher that `sync`
-/// sends with an older `revisionDate` than `base` has keeps the base's copy.
-/// Returns the ids held back, sorted.
-fn hold_rollbacks(base: &Value, sync: &mut Value, bound: &Bindings) -> Vec<String> {
+/// ADR 0019, no rollback below the cached base: a watched cipher (`bwss:id`
+/// to cipher id) that `sync` sends with an older `revisionDate` than `base`
+/// has keeps the base's copy, unless `accept` lists exactly that cipher at
+/// that revision. Returns what was held back and what was accepted.
+fn hold_rollbacks(
+    base: &Value,
+    sync: &mut Value,
+    watch: &Bindings,
+    accept: &[Rollback],
+) -> (Vec<Rollback>, Vec<Rollback>) {
     let old: HashMap<&str, &Value> = ciphers(base).iter().map(|c| (cipher_id(c), c)).collect();
-    let ids: HashMap<&str, &str> = bound.iter().map(|(id, cid)| (cid.as_str(), id.as_str())).collect();
+    let ids: HashMap<&str, &str> = watch.iter().map(|(id, cid)| (cid.as_str(), id.as_str())).collect();
     let rev = |c: &Value| c.get("revisionDate").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let mut held = Vec::new();
+    let (mut held, mut accepted) = (Vec::new(), Vec::new());
     for c in sync.get_mut("ciphers").and_then(Value::as_array_mut).into_iter().flatten() {
         let cid = cipher_id(c).to_owned();
         if let (Some(id), Some(was)) = (ids.get(cid.as_str()), old.get(cid.as_str()))
             && is_rollback(&rev(was), &rev(c))
         {
-            *c = (*was).clone();
-            held.push((*id).to_owned());
+            let rollback = Rollback { id: (*id).to_owned(), cipher: cid, revision: rev(c) };
+            if accept.contains(&rollback) {
+                accepted.push(rollback);
+            } else {
+                *c = (*was).clone();
+                held.push(rollback);
+            }
         }
     }
-    held.sort();
-    held
+    held.sort_by(|a, b| a.id.cmp(&b.id));
+    (held, accepted)
 }
 
 /// The collections shown: `login`, the registry's live entries and every
@@ -820,7 +852,7 @@ pub(super) struct Unlocked {
     /// What `bwss status` reports about this unlock.
     notices: Vec<String>,
     /// Ids the server sent older than the cached copy, which is kept (ADR 0019).
-    rollbacks: Vec<String>,
+    rollbacks: Vec<Rollback>,
     /// Bridge until B5-B6: a COSE user key, which bwss's own write code cannot use.
     read_only: bool,
 }
@@ -850,6 +882,8 @@ pub(crate) struct Bitwarden {
     storage: FileStorage,
     /// The sealed `BINDINGS` file, written from the worker without awaiting.
     bindings_path: PathBuf,
+    /// An accept record a sync used but could not remove: never used again.
+    spent_accept: std::sync::Mutex<Option<Vec<Rollback>>>,
     acl_confirmed: PathBuf,
 }
 
@@ -949,6 +983,7 @@ impl Bitwarden {
             },
             storage: FileStorage::new(paths, profile),
             bindings_path: paths.tool_state.join("core").join(BINDINGS),
+            spent_accept: std::sync::Mutex::new(None),
             acl_confirmed: paths.acl_confirmed(),
         })
     }
@@ -1165,34 +1200,45 @@ impl Bitwarden {
         }
     }
 
-    /// The bindings the last build kept; none when there is no file or it
-    /// does not open (§7 then decides, as on a new device).
-    fn load_bindings(&self, user: &CoreKey) -> Bindings {
-        let opened = match std::fs::read(&self.bindings_path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Bindings::new(),
+    /// The bindings the last build kept: `Ok(None)` when there is no file,
+    /// `Err` when it does not open.
+    fn load_bindings(&self, user: &CoreKey) -> Result<Option<Bindings>, String> {
+        match std::fs::read(&self.bindings_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.to_string()),
             Ok(raw) => String::from_utf8(raw)
                 .map_err(|e| e.to_string())
                 .and_then(|s| Self::bindings_key(user).decrypt(s.trim()).map_err(|e| e.to_string()))
-                .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string())),
-        };
-        opened.unwrap_or_else(|e| {
-            tracing::warn!("the saved item bindings cannot be read ({e}); duplicates are picked afresh");
-            Bindings::new()
-        })
-    }
-
-    /// Whether `bwss sync --accept-rollback` asked the next sync to take the
-    /// server's versions.
-    async fn accepts_rollback(&self) -> bool {
-        self.storage.load(ACCEPT_ROLLBACK).await.ok().flatten().is_some()
-    }
-
-    /// The accepted sync happened: the next one checks again.
-    async fn rollback_accepted(&self) {
-        if let Err(e) = self.storage.remove(ACCEPT_ROLLBACK).await {
-            tracing::warn!("could not clear the accepted rollback: {e}");
+                .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string()))
+                .map(Some),
         }
+    }
+
+    /// Keeps the rollbacks held back now, for `bwss sync --accept-rollback`.
+    async fn keep_held_rollbacks(&self, held: &[Rollback]) {
+        let kept = if held.is_empty() {
+            self.storage.remove(ROLLBACKS_HELD).await
+        } else {
+            // Strings only: it always serializes.
+            self.storage.save(ROLLBACKS_HELD, &serde_json::to_vec(held).unwrap_or_default()).await
+        };
+        if let Err(e) = kept {
+            tracing::warn!("could not keep the list of rollbacks held back: {e}");
+        }
+    }
+
+    /// The accept record was used by a sync, or the keyring locked or
+    /// unlocked: it is never applied again. One that cannot be removed is
+    /// remembered as spent, and the returned note says so.
+    async fn drop_accepted_rollbacks(&self) -> Option<String> {
+        let record = rollbacks(&self.storage, ACCEPT_ROLLBACK).await;
+        let e = self.storage.remove(ACCEPT_ROLLBACK).await.err()?;
+        if let Ok(mut spent) = self.spent_accept.lock() {
+            *spent = Some(record);
+        }
+        let note = format!("the accepted rollbacks could not be cleared ({e}); they are not used again");
+        tracing::warn!("{note}");
+        Some(note)
     }
 
     /// Records what the server did in the cache, so later edits build on it.
@@ -1251,12 +1297,33 @@ impl Bitwarden {
             notices.push(COSE_READ_ONLY.into());
         }
         let profile::Unlocked { keys: core_keys, mut sync, .. } = unlocked;
-        let bound = self.load_bindings(&core_keys.user);
-        let accept = !from_cache && self.accepts_rollback().await;
+        // Accepted for an unlocked keyring only: one left by an earlier session is never applied.
+        notices.extend(self.drop_accepted_rollbacks().await);
         // The offline copy is the base: the server may not go below it.
-        let base = if from_cache || accept { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
-        let rollbacks = base.map(|base| hold_rollbacks(&base.sync, &mut sync, &bound)).unwrap_or_default();
+        let base = if from_cache { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
+        let lost = match self.load_bindings(&core_keys.user) {
+            Ok(Some(bound)) => Ok(bound),
+            Ok(None) if base.is_none() && !from_cache => Ok(Bindings::new()),
+            Ok(None) => Err("are missing".to_owned()),
+            Err(e) => Err(format!("cannot be read ({e})")),
+        };
+        let bound = match lost {
+            Ok(bound) => bound,
+            Err(why) => {
+                // Read again from the offline copy, so neither check is off.
+                let note = format!(
+                    "the saved item bindings {why}: duplicate and rollback protection rests on the offline copy \
+                     until the next build rewrites them"
+                );
+                tracing::warn!("{note}");
+                notices.push(note);
+                let copy = base.as_ref().map_or(&sync, |b| &b.sync);
+                build(copy, &core_keys, None, &mut UnmarkedCache::default(), &Bindings::new()).bound
+            }
+        };
+        let rollbacks = base.map(|base| hold_rollbacks(&base.sync, &mut sync, &bound, &[]).0).unwrap_or_default();
         report_rollbacks(&rollbacks);
+        self.keep_held_rollbacks(&rollbacks).await;
 
         let mut queue = self.queue.lock().await;
         // A COSE account's queue is left as it is, for B6 to open.
@@ -1300,9 +1367,6 @@ impl Bitwarden {
         *guard = Some(state);
         drop(guard);
         drop(queue);
-        if accept {
-            self.rollback_accepted().await;
-        }
 
         if !from_cache && let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
@@ -1320,6 +1384,8 @@ impl Bitwarden {
             queue.clear();
         }
         self.api.lock().await.logout();
+        // Accepted for this session only.
+        let _ = self.drop_accepted_rollbacks().await;
     }
 
     pub(crate) async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
@@ -1330,9 +1396,14 @@ impl Bitwarden {
         // Before the first `/sync` of this session (offline unlock), writes
         // cannot name their owner: sync first, flush after.
         let synced = self.can_write().await;
-        let accept = self.accepts_rollback().await;
+        let mut accept = rollbacks(&self.storage, ACCEPT_ROLLBACK).await;
+        let spent = self.spent_accept.lock().map(|s| s.as_ref() == Some(&accept)).unwrap_or(true);
+        if spent {
+            accept.clear();
+        }
+        let accepting = !accept.is_empty();
         // An accepted rollback always pulls, so what was held back is taken.
-        if synced && !accept {
+        if synced && !accepting {
             if let Err(e) = self.flush_queue().await {
                 tracing::info!("queued changes stay queued: {e}");
             }
@@ -1344,21 +1415,29 @@ impl Bitwarden {
             }
         }
         let (revision, mut sync) = self.fetch().await.map_err(map_api)?;
-        {
+        let held = {
             let queue = self.queue.lock().await;
             let mut guard = self.state.lock().await;
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
-            state.rollbacks =
-                if accept { Vec::new() } else { hold_rollbacks(&state.sync, &mut sync, &state.built.bound) };
+            let (held, accepted) = hold_rollbacks(&state.sync, &mut sync, &state.built.bound, &accept);
+            for r in &accepted {
+                tracing::warn!(id = %r.id, cipher = %r.cipher, revision = %r.revision, "rollback accepted");
+            }
+            state.rollbacks = held;
             report_rollbacks(&state.rollbacks);
             state.keyring_folder = keyring_folder(&sync, &state.core_keys.user, &self.root);
             state.sync = sync;
             state.revision = revision;
             self.save_cache(state);
             self.rebuild(state, &queue);
-        }
-        if accept {
-            self.rollback_accepted().await;
+            state.rollbacks.clone()
+        };
+        self.keep_held_rollbacks(&held).await;
+        if accepting
+            && let Some(note) = self.drop_accepted_rollbacks().await
+            && let Some(state) = self.state.lock().await.as_mut()
+        {
+            state.notices.push(note);
         }
         if let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
@@ -1432,7 +1511,8 @@ impl Bitwarden {
 }
 
 /// What `bwss status` says about items the server sent older (ADR 0019).
-fn rollback_text(ids: &[String]) -> String {
+fn rollback_text(held: &[Rollback]) -> String {
+    let ids: Vec<&str> = held.iter().map(|r| r.id.as_str()).collect();
     format!(
         "older on the server than the copy this device has, which is kept: {}; `bwss sync --accept-rollback` takes \
          the server's versions",
@@ -1440,7 +1520,7 @@ fn rollback_text(ids: &[String]) -> String {
     )
 }
 
-fn report_rollbacks(ids: &[String]) {
+fn report_rollbacks(ids: &[Rollback]) {
     if !ids.is_empty() && first_report(("rollback", ids)) {
         tracing::warn!("{}", rollback_text(ids));
     }
