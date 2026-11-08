@@ -2,6 +2,7 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
@@ -12,13 +13,14 @@ use zeroize::Zeroizing;
 use super::Backend;
 use super::BackendError;
 use super::bitwarden::{Bitwarden, BitwardenBackend};
-use super::ops::{Loaded, QUEUE_FORMAT, new_item_of, read_formats, unseal};
+use super::ops::{Loaded, QUEUE_FORMAT, Queue, new_item_of, read_formats, unseal};
 use super::registry::Registry;
 use super::runner::Effect;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::field_names;
 use crate::bw::scan::{Keys, Scan, scan};
 use crate::config::{Config, Credentials, Paths};
+use crate::core_ports::random::OsRandom;
 use crate::model::{Attributes, ItemData, Snapshot};
 use dybw_core::ports::Storage;
 use dybw_core::sync::Op;
@@ -425,7 +427,10 @@ impl Vault {
     /// The ops in queue.json, opened with the queue key.
     fn queue_file(&self) -> usize {
         match read_formats(&self.dir.join("state/queue.json"), "legacy", &[QUEUE_FORMAT]) {
-            Loaded::Ok(v) => unseal(&v, &super::bitwarden::queue_key(&core_key(&self.keys.user))).unwrap().len(),
+            Loaded::Ok(v) => {
+                let key = super::bitwarden::queue_key(&core_key(&self.keys.user));
+                unseal(&v, &key, v["user_key_id"].as_str().unwrap()).unwrap().0.len()
+            }
             Loaded::Missing => 0,
             _ => panic!("queue.json cannot be read"),
         }
@@ -441,11 +446,12 @@ impl Vault {
     /// Records that this device already confirmed its first write back to
     /// the login password of `id`, in cipher `cid` (ADR 0016).
     async fn confirm_write_back(&self, id: &str, cid: &str) {
+        let queue = self.backend.queue.lock().await;
         let mut guard = self.backend.state.lock().await;
         let state = guard.as_mut().unwrap();
         let record = WriteRecord { written: vec![], confirmed: true, cipher_id: Some(cid.into()) };
         state.records.insert(id.into(), record);
-        self.backend.save_records(&state.records, &super::bitwarden::queue_key(&state.core_keys.user));
+        self.backend.keep_queue(&queue, state).unwrap();
     }
 }
 
@@ -1234,19 +1240,31 @@ async fn a_write_record_belongs_to_its_cipher() {
 async fn write_records_that_cannot_be_kept_ask_again() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
-    // Directories where the files go: writing them fails, for any user.
-    std::fs::create_dir_all(v.dir.join("state/write-records/x")).unwrap();
-    v.fake.with(|s| s.down = true);
-    *v.backend.client.lock().await = None;
-    let item = ItemData { secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline("gh").await };
-    v.backend.put_item(&item).await.unwrap();
-    v.fake.with(|s| s.down = false);
-    v.backend.refresh().await.unwrap();
-    assert!(v.backend.describe().await.contains("waits for your answer"));
-    // The records do not open after a restart: the next write asks again.
+    // The records live in the queue file: a directory where its temporary
+    // copy goes makes writing it fail, for any user.
+    let blocker = crate::fsutil::temp_path(&v.dir.join("state/queue.json"));
+    std::fs::create_dir_all(&blocker).unwrap();
+    let item = ItemData { secret: Zeroizing::new(b"new".to_vec()), ..v.item_offline("gh").await };
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(err, BackendError::Ask(HistoryQuestion::FirstWriteBack)), "{err}");
+    let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
+    v.backend.put_item_answered(&item, Some(answer)).await.unwrap();
+    assert!(v.backend.state.lock().await.as_ref().unwrap().records["gh"].confirmed, "kept in memory");
+    // Not on disk: after a restart the next write asks again.
+    std::fs::remove_dir(&blocker).unwrap();
     v.backend.lock().await;
     v.backend.unlock(PASSWORD).await.unwrap();
     assert!(v.backend.state.lock().await.as_ref().unwrap().records.is_empty());
+    let item = ItemData { secret: Zeroizing::new(b"newer".to_vec()), ..v.item_offline("gh").await };
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(err, BackendError::Ask(HistoryQuestion::FirstWriteBack)), "{err}");
+    // Kept this time, in the queue file: a restart does not ask again.
+    v.backend.put_item_answered(&item, Some(answer)).await.unwrap();
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(v.backend.state.lock().await.as_ref().unwrap().records["gh"].confirmed);
+    let item = ItemData { secret: Zeroizing::new(b"newest".to_vec()), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
 }
 
 #[tokio::test]
@@ -1276,7 +1294,7 @@ async fn a_live_op_without_a_session_waits() {
     else {
         panic!("a patch")
     };
-    let failed = v.backend.run(&Op::Patch(p)).await.unwrap_err();
+    let failed = v.backend.run(&Queue::default(), &Op::Patch(p)).await.unwrap_err();
     assert!(format!("{failed:?}").contains("not logged in"), "{failed:?}");
 }
 
@@ -1782,7 +1800,7 @@ async fn ops_that_were_done_before_send_nothing() {
 
     // A queued create that was accepted before (just before a lock).
     let create = Op::Create(new_item_of(&item, None));
-    let effect = v.backend.run(&create).await.unwrap();
+    let effect = v.backend.run(&Queue::default(), &create).await.unwrap();
     assert!(matches!(effect, Effect::Nothing), "{effect:?}");
 
     // A patch with no change.
@@ -1797,7 +1815,7 @@ async fn ops_that_were_done_before_send_nothing() {
         value: ValueChange::Keep,
         answer: None,
     });
-    let effect = v.backend.run(&empty).await.unwrap();
+    let effect = v.backend.run(&Queue::default(), &empty).await.unwrap();
     assert!(matches!(effect, Effect::Nothing), "{effect:?}");
     assert_eq!((v.fake.count("POST", "/api/ciphers"), v.fake.count("PUT", "/api/ciphers")), (posts, puts));
 }
@@ -2604,6 +2622,7 @@ async fn a_new_user_key_resets_queue_and_acl_confirmations() {
     assert_eq!(v.queued().await, 0);
     let status = v.backend.describe().await;
     assert!(status.contains(&format!("queue.{old}.bak")) && status.contains("asked again"), "{status}");
+    assert!(status.contains("1 change queued before that cannot be sent"), "counted without opening it: {status}");
 
     // Unchanged on the next unlock: nothing more is reset.
     v.backend.lock().await;
@@ -3028,5 +3047,77 @@ async fn an_accepted_rollback_that_cannot_be_cleared_is_still_taken() {
     if stuck {
         assert!(status.contains("the accepted rollbacks could not be cleared"), "{status}");
         assert_eq!(&*later, b"later");
+    }
+}
+
+#[tokio::test]
+async fn a_migrated_queue_keeps_its_old_file_until_a_flush_moves_on() {
+    let v = github().await;
+    v.backend.lock().await;
+    // A delete queued by bwss's format-3 writer.
+    let plain = format!(r#"[{{"Delete":{{"id":"gh","base_revision":"{REV}","cipher_id":"c1"}}}}]"#);
+    let key = super::bitwarden::queue_key(&core_key(&v.keys.user));
+    let old = json!({ "format": 3, "ops": key.encrypt(plain.as_bytes(), &OsRandom).unwrap() });
+    std::fs::write(v.dir.join("state/queue.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+    let backup = v.dir.join("state/queue.json.v3.bak");
+
+    // Offline: migrated, nothing sent, the old file kept.
+    v.fake.with(|s| s.down = true);
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!((v.queued().await, v.queue_file()), (1, 1));
+    assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&backup).unwrap()).unwrap(), old);
+    assert!(v.backend.refresh().await.is_err());
+    assert!(backup.exists(), "a flush that sends nothing keeps it");
+
+    // The delete is sent: the old file would replay it, so it goes.
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!((v.queued().await, v.queue_file()), (0, 0));
+    assert!(!backup.exists());
+
+    // One that cannot be removed is left; the flush goes on.
+    std::fs::create_dir_all(backup.join("x")).unwrap();
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queued().await, 0);
+    assert!(backup.is_dir());
+}
+
+#[tokio::test]
+async fn bindings_have_a_key_of_their_own() {
+    let k = SymmetricKey::generate();
+    let (_fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
+    let user = core_key(&k);
+    let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
+    b.unlock(PASSWORD).await.unwrap();
+    let bindings = dir.path().join("tool-state/core/bindings");
+    let open = |key: &dybw_core::crypto::SymmetricKey| {
+        let sealed = std::fs::read_to_string(&bindings).unwrap();
+        key.decrypt(sealed.trim()).ok().and_then(|j| serde_json::from_slice::<BTreeMap<String, String>>(&j).ok())
+    };
+    let bound = open(&user.derive_bwss("bindings")).expect("sealed with the bindings key");
+    assert_eq!(bound["gh"], "c1");
+    assert!(open(&super::bitwarden::queue_key(&user)).is_none(), "never with the queue key");
+    b.lock().await;
+
+    // Bindings an older bwss sealed with the queue key are read once and sealed again.
+    let json = serde_json::to_vec(&bound).unwrap();
+    std::fs::write(&bindings, super::bitwarden::queue_key(&user).encrypt(&json, &OsRandom).unwrap()).unwrap();
+    b.unlock(PASSWORD).await.unwrap();
+    assert!(!b.describe().await.contains("bindings"));
+    assert_eq!(open(&user.derive_bwss("bindings")), Some(bound));
+    b.lock().await;
+
+    // Another file of the queue key never passes for bindings.
+    let queue =
+        super::ops::seal(&Queue::default(), &BTreeMap::new(), &super::bitwarden::queue_key(&user), "u", &OsRandom);
+    let records = super::bitwarden::queue_key(&user).encrypt(b"{}", &OsRandom).unwrap();
+    for planted in [queue.unwrap()["set"].as_str().unwrap().to_owned(), records] {
+        std::fs::write(&bindings, planted).unwrap();
+        b.unlock(PASSWORD).await.unwrap();
+        assert!(b.describe().await.contains("the saved item bindings cannot be read ("));
+        b.lock().await;
     }
 }

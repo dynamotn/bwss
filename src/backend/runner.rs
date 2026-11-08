@@ -37,7 +37,7 @@ use super::bitwarden::{
     Bitwarden, Built, CoreClient, KIND_COLLECTIONS, QUEUED, Unlocked, ciphers, copy_keys, queue_key, read_registry,
     registry_with_queue, uninspectable_text, with_queue,
 };
-use super::ops::{Queue, RegistryOp, new_item_of, target};
+use super::ops::{Queue, Records, RegistryOp, new_item_of, target};
 use super::registry::{Entry, REGISTRY_ID, Registry};
 use super::{BackendError, question_text};
 use crate::bw::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_ID, F_KIND, F_LABEL, F_PASSWORD, PREFIX};
@@ -514,10 +514,11 @@ impl Bitwarden {
         Ok(id)
     }
 
-    pub(super) async fn run(&self, op: &Op) -> Result<Effect, Failure> {
+    /// Sends `op` now. `queue` is kept on disk with a write record it adds.
+    pub(super) async fn run(&self, queue: &Queue, op: &Op) -> Result<Effect, Failure> {
         match op {
             Op::Create(item) => self.run_create(item).await,
-            Op::Patch(patch) => self.run_patch(patch).await,
+            Op::Patch(patch) => self.run_patch(queue, patch).await,
             Op::Delete { id, .. } => self.run_delete(id).await,
         }
     }
@@ -540,7 +541,7 @@ impl Bitwarden {
         }
     }
 
-    async fn run_patch(&self, patch: &Patch) -> Result<Effect, Failure> {
+    async fn run_patch(&self, queue: &Queue, patch: &Patch) -> Result<Effect, Failure> {
         if is_empty(patch) {
             return Ok(Effect::Nothing);
         }
@@ -563,13 +564,14 @@ impl Bitwarden {
         };
         let Some((reply, wrote)) = sent else { return Ok(Effect::Nothing) };
         if let Some(mark) = wrote {
-            self.record_login_write(&patch.id, &cid, mark).await;
+            self.record_login_write(queue, &patch.id, &cid, mark).await;
         }
         Ok(Effect::Saved(reply))
     }
 
-    /// Keeps what this device wrote to a login password (ADR 0016).
-    async fn record_login_write(&self, id: &str, cid: &str, mark: [u8; 32]) {
+    /// Keeps what this device wrote to a login password (ADR 0016), in the
+    /// queue file.
+    async fn record_login_write(&self, queue: &Queue, id: &str, cid: &str, mark: [u8; 32]) {
         let mut guard = self.state.lock().await;
         // Locked meanwhile: the next write asks again, the safe direction.
         let Some(state) = guard.as_mut() else { return };
@@ -578,7 +580,8 @@ impl Bitwarden {
             *record = WriteRecord { cipher_id: Some(cid.to_owned()), ..WriteRecord::default() };
         }
         record_write(record, mark);
-        self.save_records(&state.records, &queue_key(&state.core_keys.user));
+        // Logged in `save_queue`: a write that is not recorded asks again.
+        let _ = self.keep_queue(queue, state);
     }
 
     /// Design §5.4: strip, save, then trash only what the server's answer
@@ -718,7 +721,7 @@ impl Bitwarden {
         if behind || held || !self.can_write().await {
             return self.enqueue(queue, op).await;
         }
-        match self.run(&op).await {
+        match self.run(queue, &op).await {
             Ok(effect) => self.settle(queue, effect).await,
             Err(Failure::Transient(why)) => {
                 tracing::info!("offline ({why}); the change is queued");
@@ -788,7 +791,7 @@ impl Bitwarden {
         };
         let undo = push_op(&mut queue.ops, op, server);
         // Not on disk, not durable: the app is told, and nothing is kept.
-        if let Err(e) = self.save_queue(queue, &queue_key(&state.core_keys.user)) {
+        if let Err(e) = self.keep_queue(queue, state) {
             undo.apply(&mut queue.ops);
             return Err(BackendError::Unavailable(format!("the change cannot be queued on disk: {e}")));
         }
@@ -800,7 +803,7 @@ impl Bitwarden {
         let mut guard = self.state.lock().await;
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
         queue.registry.push(op);
-        if let Err(e) = self.save_queue(queue, &queue_key(&state.core_keys.user)) {
+        if let Err(e) = self.keep_queue(queue, state) {
             queue.registry.pop();
             return Err(BackendError::Unavailable(format!("the change cannot be queued on disk: {e}")));
         }
@@ -946,13 +949,15 @@ impl Bitwarden {
         // queue.json must lose every op the server accepted, even when the
         // keyring locks during the flush (R12c): these copies live until the
         // flush ends.
-        let (keys, seal_key, sync, mut records, held) = self
+        let (keys, seal, sync, mut records, held) = self
             .with_state(|s| {
                 let held: HashSet<String> = s.rollbacks.iter().map(|r| r.id.clone()).collect();
-                Ok((copy_keys(&s.core_keys), queue_key(&s.core_keys.user), s.sync.clone(), s.records.clone(), held))
+                let seal = (queue_key(&s.core_keys.user), s.user_key_id.clone());
+                Ok((copy_keys(&s.core_keys), seal, s.sync.clone(), s.records.clone(), held))
             })
             .await
             .map_err(|f| refusal(f).0)?;
+        let start = queue.len();
         // ADR 0019: an item the server sent older than this device's copy
         // is never written over; its ops wait until that is settled.
         let report = {
@@ -968,9 +973,12 @@ impl Bitwarden {
             report
         };
         let mut changed = log_report(&report);
-        let _ = self.save_queue(queue, &seal_key);
-        self.save_records(&records, &seal_key);
-        let stopped = self.flush_registry(queue, &seal_key, &mut changed).await;
+        let _ = self.save_queue(queue, &records, &seal.0, &seal.1);
+        let stopped = self.flush_registry(queue, &records, &seal, &mut changed).await;
+        // The queue moved on: a migrated one's old file would replay what left it.
+        if queue.len() < start {
+            self.drop_v3_backup();
+        }
         {
             let mut guard = self.state.lock().await;
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
@@ -994,14 +1002,15 @@ impl Bitwarden {
     async fn flush_registry(
         &self,
         queue: &mut Queue,
-        seal_key: &CoreKey,
+        records: &Records,
+        (key, user_key_id): &(CoreKey, String),
         changed: &mut bool,
     ) -> Result<(), BackendError> {
         while let Some(op) = queue.registry.first() {
             let rescan = match self.run_registry(&op.collection, &op.entry).await {
                 Ok(effect) => {
                     queue.registry.remove(0);
-                    let _ = self.save_queue(queue, seal_key);
+                    let _ = self.save_queue(queue, records, key, user_key_id);
                     self.settle(queue, effect).await?;
                     *changed = true;
                     continue;
@@ -1015,7 +1024,7 @@ impl Bitwarden {
                 Err(f) => refusal(f).1,
             };
             queue.registry.remove(0);
-            let _ = self.save_queue(queue, seal_key);
+            let _ = self.save_queue(queue, records, key, user_key_id);
             *changed = true;
             if let Some(cid) = rescan {
                 self.rescan(queue, &cid).await;
@@ -1059,7 +1068,7 @@ impl Bitwarden {
         if emptied {
             queue.ops.remove(at);
         }
-        if let Err(e) = self.save_queue(queue, &queue_key(&state.core_keys.user)) {
+        if let Err(e) = self.keep_queue(queue, state) {
             // Not on disk: the answer is not kept in memory either.
             if emptied {
                 queue.ops.insert(at, before);

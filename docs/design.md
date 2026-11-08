@@ -614,10 +614,23 @@ vault can therefore never hold up the queue. Ops written without it keep
 the older behaviour.
 
 **Write queue** (`~/.local/state/bwss/queue.json`, mode 0600). The ordered
-list of ops not yet accepted by the server, sealed as a whole: the file is
-`{ "format": 3, "ops": "<EncString>" }`, one EncString under the queue key
-(the user key derived for `"queue"`) holding every op with its ids, fields,
-values, marks, cipher ids and revision dates. Only `format` is plain.
+list of ops not yet accepted by the server, sealed as a whole, with this
+device's write records (ADR 0016) beside it. The file is format 4:
+`{ "format": 4, "user_key_id": "<id>", "count": N, "set": "<EncString>" }`.
+The EncString, under the queue key (the user key derived for `"queue"`),
+holds `{ "user_key_id", "ops": [core op], "registry": [registry op],
+"records": { bwss:id: record } }`: every op with its ids, fields, values,
+marks, cipher ids and revision dates. Only the format, the id of the user
+key and the number of queued changes are plain, so a queue of another user
+key is set aside without being opened (ADR 0023): it is renamed
+`queue.<old id>.bak` (numbered, never over an earlier one), and `bwss
+status` says how many changes were lost. A set whose own `user_key_id`
+differs from the header's or the unlocked key's does not open.
+
+The item bindings (ADR 0019, `tool-state/core/bindings`) are sealed with a
+key of their own, the user key derived for `"bindings"`, so neither file
+can pass for the other. Bindings an older build sealed with the queue key
+are read once, when they hold at least one binding, and sealed again.
 
 The user key itself must not open the queue: a process of the same user
 that can create an item gets text of its choice encrypted under the user
@@ -628,14 +641,21 @@ one-time migration window, closed by the device flag
 `$XDG_STATE_HOME/dybw/tools/bwss/queue-key-migrated`:
 
 - While the flag is absent, a format-2 queue is opened with the user key at
-  unlock, resealed as format 3 at once, and the flag is set. If the reseal
+  unlock, migrated to format 4 at once, and the flag is set. If that
   fails, the file stays as it was and the window stays open for the next
   unlock.
+- A format-3 queue (bwss's own ops under the queue key) is migrated the
+  same way: every op in order becomes the core's (a create its new item,
+  named and laid out as bwss always wrote it; ACL lines a line append to
+  `bwss:acl`), registry ops stay bwss's, and the write records kept in
+  `state/write-records` move into the file. A non-empty old file is kept as
+  `queue.json.v3.bak` until a flush sends or drops one of its changes.
 - The flag is also set when the daemon starts, or a queue is loaded, with
-  no queue file, and when a format-3 queue opens with the queue key.
-- Once it is set, a format-2 queue, or a format-3 one that does not open
-  with the queue key, is renamed `queue.json.unsealable` with a warning,
-  never deleted, and its ops are not replayed.
+  no queue file, and when a format-3 or format-4 queue opens with the queue
+  key.
+- Once it is set, a format-2 queue, or any queue that does not open with
+  the queue key, is renamed `queue.json.unsealable` with a warning, never
+  deleted, and its ops are not replayed.
 
 A same-user process that deletes the flag reopens the window. Like the
 other same-user checks (R13), this is a speed bump, not a boundary.

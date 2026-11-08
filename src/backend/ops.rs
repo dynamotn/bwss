@@ -2,8 +2,8 @@
 //!
 //! Queued ops hold secrets, ids and labels, so the whole list is sealed with
 //! the queue key (design §8.1, stricter: op kinds are hidden too). State
-//! files carry `"format": 2` (the queue: 3); anything older is set aside,
-//! never overwritten.
+//! files carry `"format": 2` (the queue: 4, read from 2 and 3 once to
+//! migrate); anything older is set aside, never overwritten.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,9 @@ use dybw_core::crypto::{CryptoError, SymmetricKey};
 use dybw_core::ports::Random;
 use dybw_core::sync::Op as CoreOp;
 use dybw_core::vault::ValueSource;
-use dybw_core::vault::write::{FieldSet, HistoryAnswer, HistoryQuestion, LineAppend, NewItem, Patch, ValueChange};
+use dybw_core::vault::write::{
+    FieldSet, HistoryAnswer, HistoryQuestion, LineAppend, NewItem, Patch, ValueChange, WriteRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -24,13 +26,17 @@ use crate::model::{ItemData, LOGIN_COLLECTION};
 use super::registry::Entry;
 
 pub(crate) const FORMAT: u64 = 2;
-/// `queue.json` sealed with the queue key. Format 2 was sealed with the user
-/// key itself and is opened only during the one-time migration.
-pub(crate) const QUEUE_FORMAT: u64 = 3;
+/// `queue.json`: the core's ops, the registry ops and the write records,
+/// sealed with the queue key (`seal`).
+pub(crate) const QUEUE_FORMAT: u64 = 4;
+/// `queue.json` as bwss's own ops, sealed with the queue key; read once, to
+/// migrate. Format 2 was sealed with the user key itself and is opened only
+/// during the one-time migration.
+pub(crate) const QUEUE_V3: u64 = 3;
 const PLAIN: &str = "text/plain";
 
 /// A queued change to the collection registry: bwss's own op (design §4).
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegistryOp {
     pub collection: String,
     pub entry: Entry,
@@ -105,6 +111,7 @@ pub fn new_item_of(item: &ItemData, folder_id: Option<&str>) -> NewItem {
 }
 
 /// The item a new item holds: `new_item_of` read back.
+#[cfg(test)]
 pub fn item_of(new: &NewItem) -> ItemData {
     let get = |name: &str| new.tool_fields.iter().find(|f| f.name == name).map(|f| f.value.as_str());
     let created = get(F_CREATED).and_then(|c| c.trim().parse().ok()).unwrap_or(0);
@@ -126,11 +133,83 @@ pub fn item_of(new: &NewItem) -> ItemData {
     }
 }
 
-// shortcut: the file keeps format 3, read and written through these mirrors of bwss's old ops; B6 moves it to
-// format 4 (core ops, registry ops and write records in one sealed set).
+/// What this device wrote to login passwords, by `bwss:id` (ADR 0016).
+pub type Records = BTreeMap<String, WriteRecord>;
 
-/// Serde mirror of `ItemData`, which deliberately has no serde of its own.
-#[derive(Serialize, Deserialize)]
+/// What a format-4 file seals: everything but the header.
+#[derive(Serialize)]
+struct SetRef<'a> {
+    user_key_id: &'a str,
+    ops: &'a [CoreOp],
+    registry: &'a [RegistryOp],
+    records: &'a Records,
+}
+
+#[derive(Deserialize)]
+struct Set {
+    user_key_id: String,
+    ops: Vec<CoreOp>,
+    registry: Vec<RegistryOp>,
+    records: Records,
+}
+
+/// Seals the queue and `records` as format 4: the core's ops, the registry
+/// ops and the write records in one EncString under `"set"`, under `key`
+/// (the queue key of the user key `user_key_id`). The id and the number of
+/// queued changes stay plain, so a queue of another user key can be set
+/// aside and counted without opening it (ADR 0023).
+///
+/// Known limitation: while `serde_json` serializes (here) and parses (in
+/// `unseal`), its `Vec<u8>` growth can leave partial unwiped copies of the
+/// queued secrets behind.
+pub fn seal(
+    queue: &Queue,
+    records: &Records,
+    key: &SymmetricKey,
+    user_key_id: &str,
+    rng: &impl Random,
+) -> Result<Value, CryptoError> {
+    let set = SetRef { user_key_id, ops: &queue.ops, registry: &queue.registry, records };
+    // Plain derived-Serialize structs always serialize.
+    let json = Zeroizing::new(serde_json::to_vec(&set).map_err(|_| CryptoError::Malformed)?);
+    Ok(serde_json::json!({
+        "format": QUEUE_FORMAT,
+        "user_key_id": user_key_id,
+        "count": queue.len(),
+        "set": key.encrypt(&json, rng)?,
+    }))
+}
+
+/// The plain header of a format-4 file: the user key id it was sealed
+/// under, and how many changes it holds (absent when not recorded).
+pub fn header(file: &Value) -> Option<(&str, Option<u64>)> {
+    if file.get("format").and_then(Value::as_u64) != Some(QUEUE_FORMAT) {
+        return None;
+    }
+    let id = file.get("user_key_id").and_then(Value::as_str)?;
+    Some((id, file.get("count").and_then(Value::as_u64)))
+}
+
+/// Opens a format-4 file sealed for the user key `user_key_id`. A wrong key,
+/// tampered data, or a set of another user key (inside or in the header) is
+/// an error; the caller decides what to do with the file.
+pub fn unseal(file: &Value, key: &SymmetricKey, user_key_id: &str) -> Result<(Queue, Records), CryptoError> {
+    let Some((id, _)) = header(file) else { return Err(CryptoError::Malformed) };
+    let enc = file.get("set").and_then(Value::as_str).ok_or(CryptoError::Malformed)?;
+    let plain = key.decrypt(enc)?;
+    let set: Set = serde_json::from_slice(&plain).map_err(|_| CryptoError::Malformed)?;
+    if set.user_key_id != user_key_id || id != user_key_id {
+        return Err(CryptoError::Malformed);
+    }
+    Ok((Queue { ops: set.ops, registry: set.registry }, set.records))
+}
+
+// --- formats 2 and 3: read once, to migrate ---------------------------------
+// Serde mirrors of bwss's own ops as formats 2 and 3 wrote them; nothing
+// writes them any more.
+
+/// `ItemData` as format 3 held it.
+#[derive(Deserialize)]
 struct SealedItem {
     id: String,
     collection: String,
@@ -141,22 +220,6 @@ struct SealedItem {
     created: u64,
     modified: u64,
     acl: Vec<String>,
-}
-
-impl From<ItemData> for SealedItem {
-    fn from(i: ItemData) -> Self {
-        Self {
-            id: i.id,
-            collection: i.collection,
-            label: i.label,
-            attributes: i.attributes,
-            secret: i.secret,
-            content_type: i.content_type,
-            created: i.created,
-            modified: i.modified,
-            acl: i.acl,
-        }
-    }
 }
 
 impl From<SealedItem> for ItemData {
@@ -176,23 +239,12 @@ impl From<SealedItem> for ItemData {
 }
 
 /// The value sources by bwss's old names.
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 enum SealedSource {
     Field,
     BwssNotes,
     NoteBody,
     LoginPassword,
-}
-
-impl From<ValueSource> for SealedSource {
-    fn from(s: ValueSource) -> Self {
-        match s {
-            ValueSource::Field => Self::Field,
-            ValueSource::Notes => Self::BwssNotes,
-            ValueSource::NoteBody => Self::NoteBody,
-            ValueSource::LoginPassword => Self::LoginPassword,
-        }
-    }
 }
 
 impl From<SealedSource> for ValueSource {
@@ -206,7 +258,7 @@ impl From<SealedSource> for ValueSource {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 enum SealedValue {
     Keep,
     Set {
@@ -218,7 +270,7 @@ enum SealedValue {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct SealedPatch {
     id: String,
     base_revision: String,
@@ -231,7 +283,7 @@ struct SealedPatch {
     #[serde(default)]
     cipher_id: Option<String>,
     /// The user's answer to a history question (ADR 0016).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     answer: Option<(HistoryQuestion, HistoryAnswer)>,
 }
 
@@ -261,33 +313,10 @@ impl From<SealedPatch> for Patch {
     }
 }
 
-impl From<Patch> for SealedPatch {
-    fn from(p: Patch) -> Self {
-        // bwss appends to `bwss:acl` only.
-        let acl_add = p.append_lines.into_iter().filter(|a| a.name == F_ACL).flat_map(|a| a.lines).collect();
-        SealedPatch {
-            id: p.id,
-            base_revision: p.base_revision,
-            set: p.set.into_iter().map(|f| (f.name, f.value, f.hidden)).collect(),
-            remove: p.remove,
-            acl_add,
-            value: match p.value {
-                ValueChange::Keep => SealedValue::Keep,
-                ValueChange::Set { source, secret, base_mark, owned } => {
-                    SealedValue::Set { source: source.into(), secret, base_mark, owned }
-                }
-            },
-            cipher_id: p.cipher_id,
-            answer: p.answer,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 enum SealedOp {
+    /// Format 3 also wrote `id` and `collection`, which the item carries.
     Create {
-        id: String,
-        collection: String,
         item: SealedItem,
     },
     Patch(SealedPatch),
@@ -304,40 +333,11 @@ enum SealedOp {
     },
 }
 
-fn sealed(op: &CoreOp) -> SealedOp {
-    match op {
-        CoreOp::Create(new) => {
-            let item = item_of(new);
-            SealedOp::Create { id: item.id.clone(), collection: item.collection.clone(), item: item.into() }
-        }
-        CoreOp::Patch(p) => SealedOp::Patch(p.clone().into()),
-        CoreOp::Delete { id, base_revision, cipher_id, .. } => {
-            SealedOp::Delete { id: id.clone(), base_revision: base_revision.clone(), cipher_id: cipher_id.clone() }
-        }
-    }
-}
-
-/// Seals the whole queue as one EncString under `"ops"`; only `"format"`
-/// stays plain.
-///
-/// Known limitation: while `serde_json` serializes (here) and parses (in
-/// `unseal`), its `Vec<u8>` growth can leave partial unwiped copies of the
-/// queued secrets behind.
-pub fn seal(queue: &Queue, key: &SymmetricKey, rng: &impl Random) -> Result<Value, CryptoError> {
-    let mut mirror: Vec<SealedOp> = queue.ops.iter().map(sealed).collect();
-    mirror.extend(
-        queue.registry.iter().map(|r| SealedOp::Registry { collection: r.collection.clone(), entry: r.entry.clone() }),
-    );
-    // Plain derived-Serialize structs always serialize.
-    let json = Zeroizing::new(serde_json::to_vec(&mirror).map_err(|_| CryptoError::Malformed)?);
-    Ok(serde_json::json!({ "format": QUEUE_FORMAT, "ops": key.encrypt(&json, rng)? }))
-}
-
-/// Opens a sealed queue. A wrong key or tampered data is an error; the
-/// caller decides what to do with the file.
+/// Opens a format-2 or format-3 queue (`"ops"`, bwss's own ops) and maps
+/// every op, in order, to the core's; registry ops keep their own order.
 /// Which key may open which format is the caller's decision.
-pub fn unseal(file: &Value, key: &SymmetricKey) -> Result<Queue, CryptoError> {
-    if !matches!(file.get("format").and_then(Value::as_u64), Some(FORMAT | QUEUE_FORMAT)) {
+pub fn unseal_legacy(file: &Value, key: &SymmetricKey) -> Result<Queue, CryptoError> {
+    if !matches!(file.get("format").and_then(Value::as_u64), Some(FORMAT | QUEUE_V3)) {
         return Err(CryptoError::Malformed);
     }
     let enc = file.get("ops").and_then(Value::as_str).ok_or(CryptoError::Malformed)?;
@@ -346,7 +346,8 @@ pub fn unseal(file: &Value, key: &SymmetricKey) -> Result<Queue, CryptoError> {
     let mut queue = Queue::default();
     for op in mirror {
         match op {
-            // The folder is found, or made, when the create is sent.
+            // Named and laid out as bwss's `new_note` wrote it; the folder is
+            // found, or made, when the create is sent.
             SealedOp::Create { item, .. } => queue.ops.push(CoreOp::Create(new_item_of(&item.into(), None))),
             SealedOp::Patch(p) => queue.ops.push(CoreOp::Patch(p.into())),
             SealedOp::Delete { id, base_revision, cipher_id } => {
@@ -420,6 +421,9 @@ pub(crate) fn set_aside(path: &Path, suffix: &str) -> Loaded<Value> {
 mod tests {
     use super::*;
     use crate::core_ports::random::OsRandom;
+    use serde_json::json;
+
+    const UK: &str = "uk-1";
 
     fn item() -> ItemData {
         ItemData {
@@ -440,7 +444,16 @@ mod tests {
     }
 
     fn seal(queue: &Queue, key: &SymmetricKey) -> Value {
-        super::seal(queue, key, &OsRandom).unwrap()
+        super::seal(queue, &Records::new(), key, UK, &OsRandom).unwrap()
+    }
+
+    fn unseal(file: &Value, key: &SymmetricKey) -> Result<Queue, CryptoError> {
+        super::unseal(file, key, UK).map(|(q, _)| q)
+    }
+
+    /// A format-2/3 file holding `plain`, the JSON list bwss's old writer sealed.
+    fn legacy(format: u64, plain: &[u8], key: &SymmetricKey) -> Value {
+        serde_json::json!({ "format": format, "ops": key.encrypt(plain, &OsRandom).unwrap() })
     }
 
     fn delete(id: &str, cipher_id: Option<&str>) -> CoreOp {
@@ -459,10 +472,15 @@ mod tests {
 
     #[test]
     fn sealed_item_secret_is_zeroizing() {
-        let sealed = SealedItem::from(item());
+        // As format 3 wrote an item.
+        let sealed: SealedItem = serde_json::from_str(
+            r#"{"id":"id-7f3a-unique","collection":"work","label":"label-xyzzy-unique","attributes":{"k":"v"},
+                "secret":[115,51,99,114,51,116,45,112,108,117,109,98,45,117,110,105,113,117,101],
+                "content_type":"text/plain","created":1,"modified":1,"acl":["/usr/bin/x"]}"#,
+        )
+        .unwrap();
         assert_eq!(_assert_zeroizing(&sealed).as_slice(), b"s3cr3t-plumb-unique");
-        let back = ItemData::from(sealed);
-        assert_eq!(back, item());
+        assert_eq!(ItemData::from(sealed), item());
     }
 
     #[test]
@@ -476,21 +494,51 @@ mod tests {
             }],
         };
         let sealed = seal(&queue, &key);
-        assert_eq!(sealed["format"], 3);
+        assert_eq!((&sealed["format"], &sealed["user_key_id"], &sealed["count"]), (&json!(4), &json!(UK), &json!(3)));
         let text = sealed.to_string();
-        for needle in ["s3cr3t-plumb-unique", "id-7f3a-unique", "label-xyzzy-unique"] {
+        for needle in ["s3cr3t-plumb-unique", "id-7f3a-unique", "label-xyzzy-unique", "Create", "Delete"] {
             assert!(!text.contains(needle), "{needle} leaked");
         }
         let back = unseal(&sealed, &key).unwrap();
         assert_eq!((back.ops.len(), back.registry.len()), (2, 1));
         let CoreOp::Create(got) = &back.ops[0] else { panic!("expected Create") };
         assert_eq!(item_of(got), item());
-        assert_eq!(got.folder_id, None, "the folder is looked up when the create is sent");
+        assert_eq!(got.folder_id.as_deref(), Some("f1"));
         assert!(matches!(&back.ops[1], CoreOp::Delete { base_revision, cipher_id, .. }
             if base_revision == "rev" && cipher_id.as_deref() == Some("c9")));
         assert_eq!(back.registry[0].entry.created, 3);
         assert!(unseal(&sealed, &super::tests::key()).is_err());
-        assert!(matches!(unseal(&serde_json::json!({"ops": "x"}), &key), Err(CryptoError::Malformed)));
+        assert!(matches!(unseal(&json!({"set": "x"}), &key), Err(CryptoError::Malformed)));
+    }
+
+    #[test]
+    fn format4_round_trips() {
+        let key = key();
+        let records = Records::from([(
+            "gh".to_owned(),
+            WriteRecord { written: vec![[3; 32]], confirmed: true, cipher_id: Some("c1".into()) },
+        )]);
+        let queue = Queue { ops: vec![delete("a", None)], registry: vec![] };
+        let file = super::seal(&queue, &records, &key, UK, &OsRandom).unwrap();
+        let (back, kept) = super::unseal(&file, &key, UK).unwrap();
+        assert_eq!((back.len(), kept), (1, records.clone()));
+        assert_eq!(header(&file), Some((UK, Some(1))));
+        // An empty queue still carries the records.
+        let file = super::seal(&Queue::default(), &records, &key, UK, &OsRandom).unwrap();
+        assert_eq!(super::unseal(&file, &key, UK).unwrap().1, records);
+        // Only for its own user key: in the header and inside the set alike.
+        assert!(matches!(super::unseal(&file, &key, "uk-2"), Err(CryptoError::Malformed)));
+        let mut relabelled = file.clone();
+        relabelled["user_key_id"] = json!("uk-2");
+        assert!(matches!(super::unseal(&relabelled, &key, "uk-2"), Err(CryptoError::Malformed)));
+        let mut unlabelled = file;
+        unlabelled.as_object_mut().unwrap().remove("user_key_id");
+        assert_eq!(header(&unlabelled), None);
+        assert!(matches!(super::unseal(&unlabelled, &key, UK), Err(CryptoError::Malformed)));
+        assert_eq!(header(&json!({"format": 3, "user_key_id": UK})), None, "format 4 only");
+        // A set of the wrong shape (another file sealed with the same key) does not open.
+        let other = json!({"format": 4, "user_key_id": UK, "set": key.encrypt(b"{}", &OsRandom).unwrap()});
+        assert!(matches!(super::unseal(&other, &key, UK), Err(CryptoError::Malformed)));
     }
 
     #[test]
@@ -624,15 +672,14 @@ mod tests {
 
     #[test]
     fn value_sources_keep_their_old_names_in_the_file() {
-        for (source, old) in [
-            (ValueSource::Field, "Field"),
-            (ValueSource::Notes, "BwssNotes"),
-            (ValueSource::NoteBody, "NoteBody"),
-            (ValueSource::LoginPassword, "LoginPassword"),
+        for (old, source) in [
+            ("Field", ValueSource::Field),
+            ("BwssNotes", ValueSource::Notes),
+            ("NoteBody", ValueSource::NoteBody),
+            ("LoginPassword", ValueSource::LoginPassword),
         ] {
-            let sealed = serde_json::to_value(SealedSource::from(source)).unwrap();
-            assert_eq!(sealed, serde_json::json!(old));
-            assert_eq!(ValueSource::from(serde_json::from_value::<SealedSource>(sealed).unwrap()), source);
+            let read: SealedSource = serde_json::from_value(json!(old)).unwrap();
+            assert_eq!(ValueSource::from(read), source);
         }
     }
 
@@ -641,24 +688,33 @@ mod tests {
         let key = key();
         let old = br#"[{"Delete":{"id":"a","base_revision":"r"}},
             {"Patch":{"id":"b","base_revision":"r","set":[["bwss:label","l",false]],"remove":[],"acl_add":["/x"],
-              "value":{"Set":{"source":"BwssNotes","secret":[1],"base_mark":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}}}]"#;
-        let file = serde_json::json!({ "format": 2, "ops": key.encrypt(old, &OsRandom).unwrap() });
-        let back = unseal(&file, &key).unwrap();
-        assert!(matches!(&back.ops[0], CoreOp::Delete { cipher_id: None, .. }));
-        let CoreOp::Patch(p) = &back.ops[1] else { panic!("expected Patch") };
-        assert!(p.cipher_id.is_none() && p.answer.is_none());
-        assert!(matches!(p.value, ValueChange::Set { source: ValueSource::Notes, owned: false, .. }));
-        assert_eq!(p.append_lines[0].lines[0].as_str(), "/x");
+              "value":{"Set":{"source":"BwssNotes","secret":[1],"base_mark":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}}},
+            {"Patch":{"id":"c","base_revision":"r","set":[],"remove":[],"acl_add":[],"value":"Keep"}}]"#;
+        for format in [2, 3] {
+            let back = unseal_legacy(&legacy(format, old, &key), &key).unwrap();
+            assert!(matches!(&back.ops[0], CoreOp::Delete { cipher_id: None, organization_id: None, .. }));
+            let CoreOp::Patch(p) = &back.ops[1] else { panic!("expected Patch") };
+            assert!(p.cipher_id.is_none() && p.answer.is_none());
+            assert!(matches!(p.value, ValueChange::Set { source: ValueSource::Notes, owned: false, .. }));
+            assert_eq!(p.append_lines[0].lines[0].as_str(), "/x");
+            let CoreOp::Patch(p) = &back.ops[2] else { panic!("expected Patch") };
+            assert!(p.append_lines.is_empty() && matches!(p.value, ValueChange::Keep));
+        }
+        // Only formats 2 and 3 are read this way, and only with their key.
+        assert!(matches!(unseal_legacy(&legacy(4, old, &key), &key), Err(CryptoError::Malformed)));
+        assert!(matches!(unseal_legacy(&json!({"format": 3}), &key), Err(CryptoError::Malformed)));
+        assert!(unseal_legacy(&legacy(3, old, &key), &super::tests::key()).is_err());
+        assert!(matches!(unseal_legacy(&legacy(3, b"{}", &key), &key), Err(CryptoError::Malformed)));
     }
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
         let key = key();
         let mut sealed = seal(&Queue { ops: vec![delete("a", None)], registry: vec![] }, &key);
-        let mut enc = sealed["ops"].as_str().unwrap().to_string();
+        let mut enc = sealed["set"].as_str().unwrap().to_string();
         let last = enc.pop().unwrap();
         enc.push(if last == 'A' { 'B' } else { 'A' });
-        sealed["ops"] = Value::String(enc);
+        sealed["set"] = Value::String(enc);
         assert!(unseal(&sealed, &key).is_err());
     }
 
