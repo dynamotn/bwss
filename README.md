@@ -80,6 +80,9 @@ git clone <this repository> && cd bwss
 cargo install --path .            # puts bwss in ~/.cargo/bin (Rust 1.89 or newer)
 ```
 
+cargo fetches dybw-core from `https://gitlab.com/dynamo-tools/dybw-core.git`,
+so git must be able to read that repository.
+
 **2. Connect your account.** bwss shares one config file with the other dybw
 tools, `~/.config/dybw/config.toml`: your account is a profile there, and
 bwss's own settings go in `[bwss]`. Start from the example, then store a
@@ -177,12 +180,13 @@ never puts them on the bus.
   `login` (alias `default`) always exists; the collections apps created are
   listed in a secure note marked `bwss:id=_collections`.
 
-bwss follows the **dybw data model 1.4**, shared with the Obsidian plugin
-keychain-bitwarden. Under the hood it implements Bitwarden's client-side
-crypto itself (PBKDF2 or Argon2id, HKDF, AES-256-CBC with HMAC): only
-ciphertext crosses the network, the master password never leaves the machine,
-and the API key only *authenticates*; decrypting still needs the master
-password.
+bwss follows the **dybw data model 1.6**, shared with the Obsidian plugin
+keychain-bitwarden. Under the hood it runs on **dybw-core**, the dybw tools'
+shared Rust core, which implements Bitwarden's client-side crypto (PBKDF2 or
+Argon2id, HKDF, AES-256-CBC with HMAC, and the newer COSE keys and blob
+items): only ciphertext crosses the network, the master password never
+leaves the machine, and the API key only *authenticates*; decrypting still
+needs the master password.
 
 ## 💻 Commands
 
@@ -290,9 +294,15 @@ parts you should know.
   followed, so the API key cannot be bounced to another host. The API key is
   bound to the identity server it was entered for and is never sent to
   another one.
-- Only Bitwarden's authenticated encryption (EncString type 2) is accepted,
-  and server-supplied KDF parameters are range-checked to stop downgrades and
-  resource exhaustion. Server answers are capped at 256 MiB.
+- Only authenticated encryption is accepted (EncString type 2, and type 7
+  on COSE accounts), and server-supplied KDF parameters are range-checked to
+  stop downgrades and resource exhaustion. Server answers are capped at
+  256 MiB.
+- A server cannot quietly weaken this device: a weaker KDF than the one
+  pinned here, an older account security state, or an item older than the
+  copy on this device stops the unlock or is held back until you accept it
+  (`bwss kdf accept`, `bwss security accept`, `bwss sync --accept-rollback`).
+  Items that need a newer bwss are left alone, never treated as deleted.
 
 **The bus and what you see**
 
@@ -333,8 +343,9 @@ it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests (crypto known-answer vectors, mapping, write-back, sessions, keyring, access control, config, logind) | 403 pass, 1 ignored (perf) |
-| End-to-end against Vaultwarden 1.37.4 | 101 pass |
+| Unit tests on Linux (mapping, write-back, the core's glue, sessions, keyring, access control, config, logind); the crypto's known-answer vectors are dybw-core's | 448 pass, 1 ignored (perf) |
+| dybw-core's conformance vectors (read, write, sync) | all pass but the 2 organization ones (not supported yet) |
+| End-to-end against Vaultwarden 1.37.4 | 108 pass |
 | Line coverage of `src/`, unit and end-to-end combined | 100% |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
@@ -347,8 +358,7 @@ screen locking under a real systemd-logind, and end-to-end tests on x86_64.
 - `pam_bwss`, to unlock at login;
 - the Flatpak secret portal;
 - `bwss import`, to mark existing Bitwarden logins from any folder;
-- organization collections;
-- push updates instead of polling.
+- organization collections.
 
 ## 🛠️ Development
 
@@ -363,7 +373,10 @@ and runs the tests as a non-root user, since bwss trusts no pinentry for root.
 Most tests need a throwaway Vaultwarden, which the test container joins:
 
 ```sh
-docker build -t bwss-e2e -f tests/e2e/Dockerfile .
+# dybw-core is private: pass a GitLab token that can read it. The image
+# fetches the crates with it; the token is a build secret, never stored.
+DYBW_CORE_TOKEN=… docker build -t bwss-e2e -f tests/e2e/Dockerfile \
+  --secret id=dybw_core_token,env=DYBW_CORE_TOKEN .
 
 # Recreate Vaultwarden for every run: a third run on one container hits HTTP 429.
 docker rm -f bw-it
@@ -402,6 +415,11 @@ CI runs the same checks on both forges:
   Releases go to the Generic Package Registry and are linked from the release.
   aarch64 builds need an arm64 runner (`ARM64_RUNNER_TAG`, default
   `saas-linux-small-arm64`).
+
+dybw-core is a private repository, so CI fetches it with a token. On GitHub
+set the secret `DYBW_CORE_TOKEN` (a GitLab token that can read it) and,
+unless its user name is `oauth2`, `DYBW_CORE_TOKEN_USER`. On GitLab the
+job token is used: add this project to dybw-core's job token allowlist.
 
 The design is in [`docs/design.md`](docs/design.md): the item model,
 collections, writing and deletion, access control, locking, the offline queue,

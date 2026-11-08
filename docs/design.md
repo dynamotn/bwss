@@ -1,12 +1,19 @@
 # bwss — redesign
 
-This design follows the **dybw data model, version 1.4**
+This design follows the **dybw data model, version 1.6**
 (`docs/data-model.md` in the dybw umbrella repository). That spec is
 normative and wins over this document; this document adds the `bwss`
 namespace's own rules (its fields are registered in dybw's
 `docs/namespaces.md`). A change to a shared rule goes through a dybw ADR,
 then the spec, then this document. Section references written "spec §n"
 point into the data model.
+
+Since M4 bwss runs on **dybw-core**, the dybw Rust core shared with the
+other tools: it brings the crypto (legacy and COSE keys), the API client,
+the marker scan, the read and write rules of the spec, the write queue and
+the notifications hub. This document says what bwss adds around them: the
+Secret Service, the collections, the access control, the device state it
+keeps, and the order in which it calls the core (§13).
 
 This document describes bwss rebuilt from scratch around one idea: **a
 vault item belongs to the keyring because the user marked it, not because of
@@ -51,8 +58,9 @@ solves the same problem for Obsidian:
 
 ### Non-goals
 
-- Organization items and COSE (type 7) items in the first version (see §12
-  for how they fit later).
+- Organization items in the first version (see §12 for how they fit
+  later). COSE (type 7) accounts and blob ciphers are read and written
+  (§8.2).
 - Cards, identities and SSH key items.
 - A PAM module, the Flatpak secret portal, `ChangeLock`, and aliases other
   than `default`.
@@ -146,6 +154,10 @@ For a marked item:
   device. The others are left out of
   the keyring, a warning is logged, and `bwss status` lists them so the
   user can fix them.
+- `creationDate` is unauthenticated server data, so a device that already
+  binds the id to a cipher (§8.1, the bindings) keeps that cipher while it
+  is still marked and readable, even when the order above would pick
+  another, and reports the conflict (spec §7, ADR 0019).
 
 ### 3.4 Unmarked items
 
@@ -161,6 +173,22 @@ a refresh, it stays there as last read, without `ItemDeleted`, until it can
 be read again or the keyring is locked. Marked items of another type
 (card, identity, SSH key) are skipped and reported, as are items with a
 `bwss:location` or `bwss:encoding` value this version does not know.
+
+**Blob ciphers** (spec §4.2, ADR 0021) keep the whole item in one sealed
+`cipher.data`. A personal blob is decrypted whole, in memory, and only its
+field names are looked at until the marker is found; an unmarked blob is
+wiped at once and nothing of it is logged, cached or kept. A marked blob is
+read and written like any other item, its value source inside the blob. A
+blob that fails a check is uninspectable, as above. On an account at
+security state 2 or higher, a new item is created as a blob, as the
+official clients do.
+
+**Required features** (spec §4.1, ADR 0020): an item whose `dybw:requires`
+names a `bwss:` or `dybw:` feature this version does not implement is not
+used at all, neither read, written nor served as last read, and `bwss
+status` lists it as needing a newer bwss. Like an uninspectable item it is
+never treated as deleted: its binding stays (§8.1), so no later write or
+create takes over its id. Features of other namespaces are ignored.
 
 ## 4. Collections
 
@@ -626,7 +654,13 @@ key is set aside without being opened (ADR 0023): it is renamed
 status` says how many changes were lost. A set whose own `user_key_id`
 differs from the header's or the unlocked key's does not open.
 
-The item bindings (ADR 0019, `tool-state/core/bindings`) are sealed with a
+The item bindings (ADR 0019, `tool-state/core/bindings`) map each
+`bwss:id` to the cipher this device last served for it. They are the
+device's base for the server integrity checks: a duplicate keeps its bound
+cipher (§3.3), a cipher sent older than the cached copy is held back as a
+rollback (§8.2), and an item that is present but cannot be used now
+(uninspectable, or held by `dybw:requires`) stays bound, so its id is not
+cleared or taken by another cipher. They are sealed with a
 key of their own, the user key derived for `"bindings"`, so neither file
 can pass for the other. Bindings an older build sealed with the queue key
 are read once, when they hold at least one binding, and sealed again.
@@ -668,18 +702,43 @@ this device see it before the server does.
 
 ### 8.2 Unlocking
 
-1. Online: prelogin (KDF parameters), API-key login, `GET /sync`, decrypt
-   the user key with the master key. Save the response as the cache.
+1. Online, through dybw-core's `profile` unlock: prelogin, API-key login,
+   `GET /sync`, then the master key derived with the KDF parameters that
+   come with the key they open (`userDecryption.masterPasswordUnlock` when
+   the server sends it, prelogin otherwise; ADR 0022), and the user key
+   opened with it. Legacy (AES-CBC with HMAC) and COSE (XChaCha20-Poly1305)
+   user keys both open. Only `Unlocked.sync` is saved as the cache.
 2. Offline, when step 1 fails transiently (connection errors, 429, 5xx):
-   load the cache instead. The password check is identical (the MAC of the
-   protected user key).
-3. Re-apply every queued op to the loaded cache, so pending writes stay
-   visible.
-4. Scan: for every personal login or secure note not in the trash, decrypt
-   the item key and the field names; for marked ones, decrypt the rest and
-   build a `MarkedItem`. Resolve duplicate ids (§3.3). Read the registry.
-5. Build the keyring and the locked index, and flush the queue in the
-   background.
+   the core's `unlock_cached` opens the cache instead, with the same checks.
+   The password check is identical (the protected user key must open).
+3. Device state checked on every unlock (spec §10):
+   - the **KDF pin** (ADR 0017): parameters weaker than the ones this
+     device pinned stop the unlock; `bwss kdf accept` shows them in the
+     pinentry and accepts them once confirmed. Parameters below the floors
+     for a new pin unlock with a warning in `bwss status`;
+   - the **security state** (ADR 0019): on a v2 account a version older
+     than the highest one seen stops the unlock until `bwss security accept
+     <version>`;
+   - the **user key id** (ADR 0023): a queue or ACL confirmation sealed for
+     another user key is set aside, never opened (§8.1);
+   - **rollbacks** (ADR 0019): a bound cipher the server sends older than
+     the offline copy keeps the copy; `bwss status` lists it, and `bwss sync
+     --accept-rollback` takes the server's versions of exactly those ciphers
+     in the next sync.
+4. Load the queue (format 4) and re-apply every queued op to the loaded
+   cache, so pending writes stay visible.
+5. Scan (dybw-core): for every personal login or secure note not in the
+   trash, decrypt the item key and the field names (a blob whole, §3.4);
+   for marked ones, decrypt the rest and build a `MarkedItem`. Resolve
+   duplicate ids (§3.3). Read the registry, which stays bwss's own.
+6. Build the keyring and the locked index, write the bindings, flush the
+   queue, and start following the notifications hub (§8.4).
+
+bwss's own keys come from the user key through the core's
+`derive_bwss(purpose)` (ADR 0023): `"queue"` (the queue and the write
+records), `"bindings"`, and `"acl-confirm"` (§6). For a legacy key they are
+the same bytes as before, so existing files keep working; for a COSE key
+they are derived from the key's own PRK.
 
 ### 8.3 Writing
 
@@ -841,6 +900,7 @@ email = "you@example.com"
 profile = "personal"             # default: `default`
 folder = "secret-service"        # where new items are created
 backend = "bitwarden"            # or "memory" (with memory_password) for tests and demos
+notifications = true             # follow the server's notifications hub (§8.4)
 ```
 
 - **One profile.** bwss serves `[bwss] profile`, or the file's `default`.
@@ -850,8 +910,9 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
   300, `pinentry`). `auth` must resolve to `"api-key"`, the only login bwss
   has. The memory backend needs no profile.
 - **Validation.** bwss checks the top level and the profile it serves
-  against the key registry of profiles §1, and `[bwss]` against its four
-  keys (`profile`, `folder`, `backend`, `memory_password`). An unknown key
+  against the key registry of profiles §1, and `[bwss]` against its five
+  keys (`profile`, `folder`, `backend`, `memory_password`,
+  `notifications`). An unknown key
   there is an error, and so is a shared key (`default`,
   `clipboard_clear_seconds`) inside a profile. Every other table
   (`[ssh_agent]`, `[obsidian]`, other profiles, a newer tool's section) is
@@ -998,8 +1059,9 @@ boundary for `--password-stdin`.
 | Master password, user key | Local only, zeroized, dropped on lock |
 | API key | 0600 regular file owned by the user, bound to its identity origin and never sent to another; https only except loopback, redirects disabled |
 | Settings that weaken a check | Never read from the synced config file: ACL off is device state, `pinentry` must be a program the user cannot replace or one under bwss's own prefix (§10); bwss refuses to run as root |
-| Disk | Bitwarden ciphertext only (cache, queue under its own derived key after a one-time migration, ACL confirmations); hashed locked index without derived attributes unless this device opted in (§7) |
+| Disk | Bitwarden ciphertext only (cache; queue, bindings and ACL confirmations each under their own key derived from the user key, ADR 0023); hashed locked index without derived attributes unless this device opted in (§7) |
 | Server input | KDF bounds, MAC checked before decrypt, response bodies capped at 256 MiB while they are read, error text stripped of control characters (ANSI escapes included) and invisible format characters, then clipped |
+| A hostile or restored server | Device state it cannot rewrite (§8.2): the KDF pin (ADR 0017), the highest security state version, rollbacks held back and bound duplicates kept (ADR 0019); items needing a newer bwss are left alone (ADR 0020); the hub's notifications only trigger a sync and are never read for content |
 | Prompt text | The caller's path and the item label are shown on one line: line breaks, other control characters and invisible format characters (category Cf, bidi overrides and isolates included, and U+2028/U+2029) become U+FFFD |
 
 Notes:
@@ -1068,14 +1130,24 @@ written; in bwss's terms:
 
 ## 13. Architecture
 
-The module split of `legacy` is kept. The builder may port code from `legacy`
-(crypto, API client, sessions, pinentry, ACL identity, D-Bus objects,
-config, fsutil), since none of those change in substance.
+The module split of `legacy` is kept, with dybw-core underneath since M4.
+
+dybw-core's futures are not `Send`, so every core object lives on one
+**vault worker** thread (`backend/worker.rs`): a `current_thread` runtime
+and a `LocalSet` that own the `Bitwarden` backend, its client, keys,
+queue and hub task. The D-Bus side reaches it through `WorkerHandle`, which
+is `Send + Sync` and sends one command per `Backend` method; only `Send`
+reply data comes back. Each command runs as a task of its own, so a `lock`
+is handled between two awaits of a running unlock or flush. A command that
+panics fails its call, the vault is locked, and the worker goes on.
 
 | Module | Change from `legacy` |
 |---|---|
 | `bw/*` | Removed (M4): the crypto, the API client, the marker scan, the read and write rules of §3 and §5, the foreign-content check and the field-level re-apply on conflict come from dybw-core; `core_ports/` gives the core its ports and `backend/worker.rs` hosts it |
-| `backend/bitwarden.rs` | Snapshot built from marked items and the collection registry; no sub-folders, no `whole_vault`, no `vault-acl` |
+| `backend/bitwarden.rs` | Snapshot built from marked items and the collection registry over the core's scan; unlock, device-state checks, bindings and rollbacks, the hub task; no sub-folders, no `whole_vault`, no `vault-acl` |
+| `backend/runner.rs`, `backend/ops.rs` | bwss's write plan over the core's writer and queue; the registry ops; the format 4 queue file and its migrations |
+| `backend/worker.rs` | The vault worker thread (above) |
+| `core_ports/` | The core's ports: HTTP (reqwest, rustls, no redirects, capped bodies), storage (`tool-state/core/`), clock, random, Argon2id on the blocking pool, and the hub's WebSocket (tokio-tungstenite, rustls) |
 | `model.rs` | No `read_only`; reversible path escape |
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
@@ -1152,8 +1224,14 @@ file is migrated like any older bwss config, with `bwss config migrate`
   - a cloned item does not change which item apps see;
   - all existing scenarios from `legacy` (unlock, ACL, offline queue,
     locked index, collections, sessions).
+- **Conformance vectors** (`cargo test --features vectors vectors::`, with
+  `DYBW_VECTORS_DIR`): dybw-core's read, write and sync vectors run through
+  bwss's glue; the only failures allowed are listed in
+  `tests/vectors-expected-failures.txt`.
 - `cargo fmt --check`, `cargo clippy --locked --all-targets`,
-  `cargo test --locked`, the ignored perf test, and `cargo audit`.
+  `cargo test --locked`, the ignored perf test, `cargo audit`, the MSRV
+  check, and `scripts/coverage.sh`: 100% line coverage of `src/`, unit and
+  end-to-end combined.
 
 ## 16. Left to the builder
 
