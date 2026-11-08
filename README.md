@@ -373,10 +373,11 @@ and runs the tests as a non-root user, since bwss trusts no pinentry for root.
 Most tests need a throwaway Vaultwarden, which the test container joins:
 
 ```sh
-# dybw-core is private: pass a GitLab token that can read it. The image
-# fetches the crates with it; the token is a build secret, never stored.
-DYBW_CORE_TOKEN=… docker build -t bwss-e2e -f tests/e2e/Dockerfile \
-  --secret id=dybw_core_token,env=DYBW_CORE_TOKEN .
+# dybw-core is private: pass a GitLab token that can read it, from a file
+# only you can read (never on the command line). The image fetches the
+# crates with it; the token is a build secret, never stored in the image.
+docker build -t bwss-e2e -f tests/e2e/Dockerfile \
+  --secret id=dybw_core_token,src="$HOME/.config/dybw-core-token" .
 
 # Recreate Vaultwarden for every run: a third run on one container hits HTTP 429.
 docker rm -f bw-it
