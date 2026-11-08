@@ -174,28 +174,38 @@ def test_the_file_cannot_put_derived_attributes_in_the_locked_index():
     d = Daemon({"backend": "memory", "index_derived_attributes": True})
     r = run_daemon(d)
     assert r.returncode != 0
-    assert "`index_derived_attributes` in [bwss]" in r.stderr and "bwss index derived on" in r.stderr, r.stderr
+    assert "`index_derived_attributes` in [bwss]" in r.stderr and "bwss derive on" in r.stderr, r.stderr
 
 
-def test_derived_attributes_in_the_index_need_a_confirmation_on_a_terminal():
+def test_derived_attributes_need_a_confirmation_on_a_terminal():
     d = Daemon({"backend": "memory"})
-    flag = d.state / "tools" / "bwss" / "index-derived"
-    r = d.cli("index", "derived", "on", input="yes\n", check=False)
+    flag = d.state / "tools" / "bwss" / "derive-on"
+    r = d.cli("derive", "on", input="yes\n", check=False)
     assert r.returncode != 0 and "terminal" in r.stderr, r.stderr
     assert not flag.exists()
 
-    code, _, shown = on_terminal(d, "index", "derived", "on", answer="no")
-    assert code != 0 and "usernames and URIs" in shown and "guessable offline from ~/.cache" in shown, shown
+    code, _, shown = on_terminal(d, "derive", "on", answer="no")
+    assert code != 0 and "usernames and first URIs" in shown and "Every app on the session bus" in shown and "guessable offline from ~/.cache" in shown, shown
     assert str(d.home / "cache" / "bwss" / "locked-index.json") in shown.replace("\r\n", "\n").replace("\n", "")
     assert not flag.exists()
 
-    code, out, _ = on_terminal(d, "index", "derived", "on", answer="yes")
-    assert code == 0 and "in the locked index on this device" in out, out
+    code, out, _ = on_terminal(d, "derive", "on", answer="yes")
+    assert code == 0 and "derived attributes are on on this device" in out, out
     assert flag.exists() and mode(flag) == 0o600
 
     # Off needs no question.
-    assert "out of the locked index" in d.cli("index", "derived", "off").stdout
+    assert "derived attributes are off" in d.cli("derive", "off").stdout
     assert not flag.exists()
+
+    # `bwss index derived` is an alias with a deprecation notice; an old flag is read as derive-on.
+    old = flag.with_name("index-derived")
+    old.write_text("on\n")
+    r = d.cli("index", "derived", "off")
+    assert "deprecated" in r.stderr and "bwss derive off" in r.stderr, r.stderr
+    assert not old.exists() and not flag.exists()
+    old.write_text("on\n")
+    d.cli("derive", "off")
+    assert not old.exists() and not flag.exists()
 
 
 def test_unknown_keys_stop_the_daemon():
@@ -352,7 +362,7 @@ def test_a_migration_with_an_untrusted_prompter_changes_nothing():
 def test_a_device_flag_that_cannot_be_cleared_names_the_file():
     d = Daemon({"backend": "memory"})
     tools = d.state / "tools" / "bwss"
-    for command, flag in ((("acl", "on"), "acl-off"), (("index", "derived", "off"), "index-derived")):
+    for command, flag in ((("acl", "on"), "acl-off"), (("derive", "off"), "derive-on")):
         (tools / flag).mkdir(parents=True)  # a directory where the flag file goes
         r = d.cli(*command, check=False)
         assert r.returncode != 0 and str(tools / flag) in r.stderr, (command, r.stderr)

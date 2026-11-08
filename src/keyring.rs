@@ -5,8 +5,8 @@
 //! locked), a *locked index* of salted attribute hashes is kept on disk, the
 //! same trade-off gnome-keyring makes: it reveals which items exist and lets
 //! someone with the file test guesses of attribute values, never secrets.
-//! Derived attributes (item name, username, URI, id) are left out unless
-//! this device opted in (design §7).
+//! Derived attributes (item name, username, URI) are left out unless this
+//! device opted in (ADR 0015); the id is always indexed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bw::fields::DERIVED;
+use crate::bw::fields::{A_ID, DERIVED};
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, now};
 
 /// Version of the locked index file; an index of another version is not
@@ -337,7 +337,7 @@ impl Keyring {
             .filter(|i| i.collection != SESSION_COLLECTION)
             .map(|i| {
                 let (derived, own): (Vec<_>, Vec<_>) =
-                    i.attributes.iter().partition(|(k, _)| DERIVED.contains(&k.as_str()));
+                    i.attributes.iter().partition(|(k, _)| k.as_str() != A_ID && DERIVED.contains(&k.as_str()));
                 IndexedItem {
                     id: i.id.clone(),
                     collection: i.collection.clone(),
@@ -581,27 +581,28 @@ mod tests {
     fn derived_attributes_stay_out_of_the_locked_index_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
-        let flag = dir.path().join("index-derived");
+        let flag = dir.path().join("derive-on");
         let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
         k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
         // Unlocked, the item is still found by its derived attributes.
         assert_eq!(k.search(&q(&[("bwss:name", "GitHub")]), None).0.len(), 1);
         k.lock();
-        assert_eq!(hashes_on_disk(&path), 1, "only the attribute the app set");
+        assert_eq!(hashes_on_disk(&path), 2, "the attribute the app set and the id");
 
         let restarted = Keyring::new(Some(path.clone()), Some(flag));
         assert_eq!(restarted.search(&q(&[("service", "gh")]), None).1, vec![("login".into(), "a".into())]);
-        for (name, value) in DERIVED {
+        for (name, value) in DERIVED.iter().filter(|(n, _)| *n != "bwss:id") {
             assert!(restarted.search(&q(&[(name, value)]), None).1.is_empty(), "{name}");
             assert!(restarted.search(&q(&[("service", "gh"), (name, value)]), None).1.is_empty(), "{name}");
         }
+        assert_eq!(restarted.search(&q(&[("bwss:id", "a")]), None).1.len(), 1, "the id is always indexed");
     }
 
     #[test]
     fn the_device_flag_indexes_derived_attributes_until_it_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.json");
-        let flag = dir.path().join("index-derived");
+        let flag = dir.path().join("derive-on");
         std::fs::write(&flag, "on\n").unwrap();
         let mut k = Keyring::new(Some(path.clone()), Some(flag.clone()));
         k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
@@ -615,7 +616,7 @@ mod tests {
         // Turned off while the daemon runs: the next index write drops them.
         std::fs::remove_file(&flag).unwrap();
         k.load(Snapshot { collections: vec![], items: vec![derived_item()], ..Default::default() });
-        assert_eq!(hashes_on_disk(&path), 1);
+        assert_eq!(hashes_on_disk(&path), 2);
         k.lock();
         assert!(k.search(&q(&[("bwss:name", "GitHub")]), None).1.is_empty());
 
@@ -625,7 +626,7 @@ mod tests {
         assert_eq!(hashes_on_disk(&path), 5);
         std::fs::remove_file(&flag).unwrap();
         let off = Keyring::new(Some(path.clone()), Some(flag));
-        assert_eq!(hashes_on_disk(&path), 1);
+        assert_eq!(hashes_on_disk(&path), 2);
         assert!(off.search(&q(&[("bwss:name", "GitHub")]), None).1.is_empty());
         assert_eq!(off.search(&q(&[("service", "gh")]), None).1.len(), 1, "the rest of the index is kept");
     }

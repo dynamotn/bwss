@@ -210,8 +210,13 @@ impl Paths {
         self.tool_state.join("queue-key-migrated")
     }
 
-    /// Present when derived attributes go in the locked index on this device.
-    pub fn index_derived(&self) -> PathBuf {
+    /// Present when derived attributes are on for this device (ADR 0015).
+    pub fn derive_on(&self) -> PathBuf {
+        self.tool_state.join("derive-on")
+    }
+
+    /// The flag of `bwss index derived on`, before it merged into `derive-on`.
+    fn index_derived(&self) -> PathBuf {
         self.tool_state.join("index-derived")
     }
 }
@@ -321,7 +326,7 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
         if key == "index_derived_attributes" {
             bail!(
                 "`index_derived_attributes` in [bwss] is not read from the config file: a synced file must never \
-                 weaken the locked index. Put derived attributes in it on this device with `bwss index derived on`"
+                 weaken the locked index. Turn derived attributes on for this device with `bwss derive on`"
             );
         }
         bail!("unknown key `{key}` in [bwss]");
@@ -648,10 +653,23 @@ pub fn set_acl_off(paths: &Paths, off: bool) -> std::io::Result<()> {
     set_flag(&paths.acl_off(), off, b"off\n")
 }
 
-/// Puts derived attributes in the locked index on this device, or takes
-/// them out again; the daemon reads it at every index write.
-pub fn set_index_derived(paths: &Paths, on: bool) -> std::io::Result<()> {
-    set_flag(&paths.index_derived(), on, b"on\n")
+/// Turns derived attributes on (or off) for this device; the daemon reads
+/// it at every build of the keyring and every index write.
+pub fn set_derive(paths: &Paths, on: bool) -> std::io::Result<()> {
+    migrate_index_derived(paths)?;
+    set_flag(&paths.derive_on(), on, b"on\n")
+}
+
+/// Reads the old `index-derived` flag once as `derive-on` (ADR 0015).
+pub fn migrate_index_derived(paths: &Paths) -> std::io::Result<()> {
+    let old = paths.index_derived();
+    if !flag_set(&old) {
+        return Ok(());
+    }
+    if !flag_set(&paths.derive_on()) {
+        crate::fsutil::write_private(&paths.derive_on(), b"on\n")?;
+    }
+    set_flag(&old, false, b"")
 }
 
 /// Reads a profile's API key: a regular file owned by `user`, mode 0600,
@@ -962,10 +980,7 @@ mod tests {
         let base = format!("default = \"personal\"\n{ACCOUNT}");
         for value in ["true", "false"] {
             let e = err(&format!("{base}[bwss]\nindex_derived_attributes = {value}\n"));
-            assert!(
-                e.contains("`index_derived_attributes` in [bwss]") && e.contains("bwss index derived on"),
-                "{value}: {e}"
-            );
+            assert!(e.contains("`index_derived_attributes` in [bwss]") && e.contains("bwss derive on"), "{value}: {e}");
             assert!(!e.contains("unknown key"), "{e}");
         }
     }
@@ -1010,7 +1025,7 @@ mod tests {
         assert_eq!(p.credentials("work"), Path::new("/st/dybw/profiles/work/credentials"));
         assert_eq!(p.device_id("work"), Path::new("/st/dybw/profiles/work/devices/bwss"));
         assert_eq!(p.acl_off(), Path::new("/st/dybw/tools/bwss/acl-off"));
-        assert_eq!(p.index_derived(), Path::new("/st/dybw/tools/bwss/index-derived"));
+        assert_eq!(p.derive_on(), Path::new("/st/dybw/tools/bwss/derive-on"));
         assert_eq!(p.locked_index(), Path::new("/home/u/.cache/bwss/locked-index.json"));
         assert_eq!(p.queue_key_migrated(), Path::new("/st/dybw/tools/bwss/queue-key-migrated"));
         assert_eq!(p.cache, Path::new("/home/u/.cache/bwss"));
@@ -1026,21 +1041,41 @@ mod tests {
     }
 
     #[test]
-    fn derived_attributes_in_the_index_are_device_state() {
+    fn derived_attributes_are_device_state() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let p = paths_in(dir.path());
-        assert!(!flag_set(&p.index_derived()));
-        set_index_derived(&p, true).unwrap();
-        assert!(flag_set(&p.index_derived()));
-        assert_eq!(std::fs::metadata(p.index_derived()).unwrap().permissions().mode() & 0o777, 0o600);
-        set_index_derived(&p, true).unwrap();
-        set_index_derived(&p, false).unwrap();
-        assert!(!flag_set(&p.index_derived()));
-        set_index_derived(&p, false).unwrap();
+        assert!(!flag_set(&p.derive_on()), "off by default");
+        set_derive(&p, true).unwrap();
+        assert!(flag_set(&p.derive_on()));
+        assert_eq!(std::fs::metadata(p.derive_on()).unwrap().permissions().mode() & 0o777, 0o600);
+        set_derive(&p, true).unwrap();
+        set_derive(&p, false).unwrap();
+        assert!(!flag_set(&p.derive_on()));
+        set_derive(&p, false).unwrap();
         // The ACL flag is another file.
-        set_index_derived(&p, true).unwrap();
+        set_derive(&p, true).unwrap();
         assert_eq!(acl_mode(&p), AclMode::Prompt);
+    }
+
+    #[test]
+    fn index_derived_is_an_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths_in(dir.path());
+        migrate_index_derived(&p).unwrap();
+        assert!(!flag_set(&p.derive_on()), "nothing to migrate");
+        crate::fsutil::write_private(&p.index_derived(), b"on\n").unwrap();
+        migrate_index_derived(&p).unwrap();
+        assert!(flag_set(&p.derive_on()) && !flag_set(&p.index_derived()));
+        // Turning it off stays off: the old flag is gone.
+        set_derive(&p, false).unwrap();
+        migrate_index_derived(&p).unwrap();
+        assert!(!flag_set(&p.derive_on()));
+        // An old flag next to the new one is dropped, not merged back.
+        set_derive(&p, true).unwrap();
+        crate::fsutil::write_private(&p.index_derived(), b"on\n").unwrap();
+        migrate_index_derived(&p).unwrap();
+        assert!(flag_set(&p.derive_on()) && !flag_set(&p.index_derived()));
     }
 
     #[test]

@@ -40,7 +40,7 @@ use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, now};
 /// bwss's snapshot build over the core's scan.
 fn build(sync: &Value, core: &CoreKeys, previous: Option<&Built>) -> Built {
     let bound = previous.map(|p| p.bound.clone()).unwrap_or_default();
-    crate::backend::bitwarden::build(sync, core, previous, &mut Default::default(), &bound)
+    crate::backend::bitwarden::build(sync, core, previous, &mut Default::default(), &bound, true)
 }
 
 /// The core's keys for bwss's own legacy keys.

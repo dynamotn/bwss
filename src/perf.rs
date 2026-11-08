@@ -71,9 +71,9 @@ fn perf_budgets() {
     let core = dybw_core::vault::Keys { user, marker, orgs: Default::default(), security_version: 0 };
     let mut cache = dybw_core::vault::UnmarkedCache::default();
     let none = Default::default();
-    let built = time("build-10000-items", 5_000, || build(&sync, &core, None, &mut cache, &none));
+    let built = time("build-10000-items", 5_000, || build(&sync, &core, None, &mut cache, &none, true));
     assert_eq!(built.snapshot.items.len(), 10_000);
-    time("rescan-10000-unchanged", 5_000, || build(&sync, &core, Some(&built), &mut cache, &built.bound));
+    time("rescan-10000-unchanged", 5_000, || build(&sync, &core, Some(&built), &mut cache, &built.bound, true));
     let decoded = built.snapshot.items;
 
     let mut k = Keyring::new(None, None);

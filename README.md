@@ -136,15 +136,19 @@ never puts them on the bus.
 |---|---|
 | default collection (`login`, alias `default`) | marked items without `bwss:collection` |
 | collection "Work" | items with `bwss:collection=work` |
-| item label | the `bwss:label` field, falling back to the `bwss:id` |
+| item label | the `bwss:label` field, falling back to the `bwss:id` (the item name with `bwss derive on`) |
 | secret | see *Reading the secret* below |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
 
-- **Finding an item you marked by hand.** Apps also see the derived
-  attributes `bwss:id`, `bwss:name`, `bwss:username` and `bwss:uri`, so
-  `secret-tool lookup bwss:name GitHub` works even though no app created the
-  item.
+- **Finding an item you marked by hand.** Apps find it by `bwss:id`
+  (`secret-tool lookup bwss:id github`) or by the `bwss:attr:*` fields you add
+  with `dybw mark` or by hand. The item name, username and first URI
+  (`bwss:name`, `bwss:username`, `bwss:uri`) are hidden on the bus and in the
+  locked index unless you run `bwss derive on` on that device (ADR 0015).
+  Without `bwss:label` the label is the `bwss:id`, or the item name while
+  derived attributes are on. `bwss status` lists the marked items that have no
+  `bwss:attr:*` field.
 - **Reading the secret.** The first of these that exists wins:
   1. a custom field `bwss:password` (even when empty);
   2. the item's notes, when the field `bwss:location=notes` is set;
@@ -194,7 +198,7 @@ password.
 | `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the value change. The daemon asks you to confirm `login` and `separate` in its pinentry first. Then sync. |
 | `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
 | `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
-| `bwss index derived on` / `off` | Put item names, usernames, URIs and ids in the locked index on this device, or take them out (the default). |
+| `bwss derive on` / `off` | Show the item name, username and URI of marked items to apps and in the locked index on this device, or hide them (the default; asks on the terminal before turning it on). `bwss index derived` is a deprecated alias. |
 | `bwss config migrate` | Move an old `~/.config/bwss/config.toml` into the shared dybw file. |
 | `bwss kdf accept` | After an unlock refused a KDF weaker than the one this device pinned: show it in the pinentry and, once you confirm it (check it in the web vault first), accept it on this device. |
 | `bwss security accept <version>` | After an unlock refused an older account security state: accept that version on this device, for a profile moved to another server or account. |
@@ -276,8 +280,8 @@ parts you should know.
   same file, so anyone who can read `~/.cache/bwss/locked-index.json` can test
   guesses of those values offline. bwss accepts this because apps must find
   locked items before the first unlock; unlocking at login (the planned
-  `pam_bwss`) is the long-term answer. Item names, usernames, URIs and ids
-  stay out of the index unless you run `bwss index derived on` on that device.
+  `pam_bwss`) is the long-term answer. Item names, usernames and URIs
+  stay out of the index, and off the bus, unless you run `bwss derive on` on that device.
 - HTTPS is required (plain http only for `localhost`), and redirects are not
   followed, so the API key cannot be bounced to another host. The API key is
   bound to the identity server it was entered for and is never sent to
@@ -303,7 +307,7 @@ parts you should know.
 
 - The config file may travel with your dotfiles, so nothing in it switches a
   protection off. Access control and the derived index are device state, set
-  with `bwss acl` and `bwss index derived` and confirmed on the terminal.
+  with `bwss acl` and `bwss derive` and confirmed on the terminal.
 - The pinentry must be a program you cannot write to, nor any directory above
   it. A Homebrew-installed bwss also accepts a pinentry from the same Homebrew
   prefix, but never one under your home directory. Otherwise the daemon

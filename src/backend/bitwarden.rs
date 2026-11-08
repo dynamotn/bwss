@@ -324,9 +324,10 @@ pub(super) fn uninspectable_text(why: Uninspectable) -> &'static str {
 }
 
 /// bwss's item from the core's read (design §3). The label is `bwss:label`,
-/// else the id (ADR 0015); a name, username or URI that does not decrypt is
-/// left out of the derived attributes.
-fn to_marked(m: CoreItem, keys: &CoreKeys) -> MarkedItem {
+/// else the id, or the item name when `derive` is on (ADR 0015). The name,
+/// username and URI are attributes only when `derive` is on; one that does
+/// not decrypt is left out.
+fn to_marked(m: CoreItem, keys: &CoreKeys, derive: bool) -> MarkedItem {
     let meta = item_meta(&m, keys);
     let tool = |name: &str| m.tool_fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
     let mut attributes: Attributes = m
@@ -336,12 +337,15 @@ fn to_marked(m: CoreItem, keys: &CoreKeys) -> MarkedItem {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     attributes.insert(A_ID.to_owned(), m.id.clone());
-    for (k, v) in [(A_NAME, &meta.name), (A_USERNAME, &meta.username), (A_URI, &meta.uri)] {
-        if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
-            attributes.insert(k.to_owned(), v.clone());
+    if derive {
+        for (k, v) in [(A_NAME, &meta.name), (A_USERNAME, &meta.username), (A_URI, &meta.uri)] {
+            if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+                attributes.insert(k.to_owned(), v.clone());
+            }
         }
     }
-    let label = tool(F_LABEL).filter(|l| !l.is_empty()).unwrap_or(&m.id).to_owned();
+    let fallback = meta.name.as_deref().filter(|n| derive && !n.is_empty()).unwrap_or(&m.id);
+    let label = tool(F_LABEL).filter(|l| !l.is_empty()).unwrap_or(fallback).to_owned();
     let collection = match tool(F_COLLECTION) {
         None => LOGIN_COLLECTION.to_owned(),
         Some(c) => {
@@ -400,6 +404,7 @@ pub(crate) fn build(
     previous: Option<&Built>,
     cache: &mut UnmarkedCache,
     bound: &Bindings,
+    derive: bool,
 ) -> Built {
     let report = scan_vault_with(sync, &Namespace::BWSS, keys, &Organizations::None, &|_| true, cache, bound);
     let list = ciphers(sync);
@@ -463,7 +468,7 @@ pub(crate) fn build(
     let duplicates = report.duplicates.into_iter().map(|d| (d.id, d.left)).collect();
     let served: HashSet<String> = report.items.iter().map(|m| m.cipher_id.clone()).collect();
     let mut marked: HashMap<String, MarkedItem> =
-        report.items.into_iter().map(|m| (m.id.clone(), to_marked(m, keys))).collect();
+        report.items.into_iter().map(|m| (m.id.clone(), to_marked(m, keys, derive))).collect();
     for (id, m) in previous.map(|p| &p.marked).into_iter().flatten() {
         if marked.contains_key(id) || m.cipher_id == QUEUED {
             continue;
@@ -651,13 +656,14 @@ fn build_view(
     folder: Option<&str>,
     previous: &Built,
     cache: &mut UnmarkedCache,
+    derive: bool,
 ) -> Built {
     let mut built = if queue.ops.is_empty() {
-        build(sync, keys, Some(previous), cache, &previous.bound)
+        build(sync, keys, Some(previous), cache, &previous.bound, derive)
     } else {
         let view: Vec<Value> =
             with_queue(sync, queue, keys, folder, previous).into_iter().map(Cow::into_owned).collect();
-        build(&json!({ "ciphers": view }), keys, Some(previous), cache, &previous.bound)
+        build(&json!({ "ciphers": view }), keys, Some(previous), cache, &previous.bound, derive)
     };
     if !queue.registry.is_empty() {
         // `built.registry` stays the server's: only what is shown changes.
@@ -675,12 +681,13 @@ fn build_fresh(
     folder: Option<&str>,
     cache: &mut UnmarkedCache,
     bound: &Bindings,
+    derive: bool,
 ) -> Built {
-    let base = build(sync, keys, None, cache, bound);
+    let base = build(sync, keys, None, cache, bound, derive);
     if queue.is_empty() {
         return base;
     }
-    build_view(sync, queue, keys, folder, &base, cache)
+    build_view(sync, queue, keys, folder, &base, cache, derive)
 }
 
 /// Id of the keyring folder: the folder named `name`, lowest id first.
@@ -950,6 +957,8 @@ pub(crate) struct Bitwarden {
     /// An accept record a sync used but could not remove: never used again.
     spent_accept: std::sync::Mutex<Option<Vec<Rollback>>>,
     acl_confirmed: PathBuf,
+    /// The device flag `bwss derive on` (ADR 0015), read at every build.
+    derive_on: PathBuf,
 }
 
 /// The online half of an unlock.
@@ -1046,6 +1055,7 @@ impl Bitwarden {
             records_path: paths.state.join("write-records"),
             spent_accept: std::sync::Mutex::new(None),
             acl_confirmed: paths.acl_confirmed(),
+            derive_on: paths.derive_on(),
         })
     }
 
@@ -1251,6 +1261,7 @@ impl Bitwarden {
             state.keyring_folder.as_deref(),
             &state.built,
             &mut state.cache,
+            crate::config::flag_set(&self.derive_on),
         );
         if built.bound != state.built.bound {
             self.save_bindings(&state.core_keys.user, &built.bound);
@@ -1430,7 +1441,7 @@ impl Bitwarden {
                 tracing::warn!("{note}");
                 notices.push(note);
                 let copy = base.as_ref().map_or(&sync, |b| &b.sync);
-                build(copy, &core_keys, None, &mut UnmarkedCache::default(), &Bindings::new()).bound
+                build(copy, &core_keys, None, &mut UnmarkedCache::default(), &Bindings::new(), false).bound
             }
         };
         let rollbacks = base.map(|base| hold_rollbacks(&base.sync, &mut sync, &bound, &[]).0).unwrap_or_default();
@@ -1445,7 +1456,15 @@ impl Bitwarden {
         notices.extend(file.notices);
         let folder = keyring_folder(&sync, &core_keys.user, &self.root);
         let mut cache = UnmarkedCache::default();
-        let built = build_fresh(&sync, &queue, &core_keys, folder.as_deref(), &mut cache, &bound);
+        let built = build_fresh(
+            &sync,
+            &queue,
+            &core_keys,
+            folder.as_deref(),
+            &mut cache,
+            &bound,
+            crate::config::flag_set(&self.derive_on),
+        );
         if built.bound != bound {
             self.save_bindings(&core_keys.user, &built.bound);
         }
@@ -1628,7 +1647,7 @@ impl Bitwarden {
         );
         if let Some(state) = self.state.lock().await.as_ref() {
             let rollbacks = (!state.rollbacks.is_empty()).then(|| rollback_text(&state.rollbacks));
-            let lines = status_lines(&state.built)
+            let lines = status_lines(&state.built, crate::config::flag_set(&self.derive_on))
                 .into_iter()
                 .chain(rollbacks)
                 .chain(queue_lines(state, &queue))
@@ -1764,7 +1783,7 @@ mod tests {
     /// `super::build` with a fresh scan cache, bound as `previous` was.
     fn build(sync: &Value, k: &Keys, previous: Option<&Built>) -> Built {
         let bound = previous.map(|p| p.bound.clone()).unwrap_or_default();
-        super::build(sync, &core(k), previous, &mut UnmarkedCache::default(), &bound)
+        super::build(sync, &core(k), previous, &mut UnmarkedCache::default(), &bound, false)
     }
 
     fn build_list(view: &[Cow<'_, Value>], k: &Keys, previous: Option<&Built>) -> Built {
@@ -1772,7 +1791,7 @@ mod tests {
     }
 
     fn build_fresh(sync: &Value, queue: &Queue, k: &Keys, folder: Option<&str>) -> Built {
-        super::build_fresh(sync, queue, &core(k), folder, &mut UnmarkedCache::default(), &Bindings::new())
+        super::build_fresh(sync, queue, &core(k), folder, &mut UnmarkedCache::default(), &Bindings::new(), false)
     }
 
     fn with_queue<'a>(sync: &'a Value, ops: Vec<Op>, k: &Keys) -> Vec<Cow<'a, Value>> {
@@ -1879,13 +1898,14 @@ mod tests {
     fn unchanged_unmarked_ciphers_are_not_rescanned() {
         let (k, mut cache) = (keys(), UnmarkedCache::default());
         let none = Bindings::new();
-        let first = super::build(&sync(vec![login(&k, "c9", &[("other", "x")])]), &core(&k), None, &mut cache, &none);
+        let first =
+            super::build(&sync(vec![login(&k, "c9", &[("other", "x")])]), &core(&k), None, &mut cache, &none, false);
         assert!(!first.snapshot.held.contains("c9"));
         let mut garbled = login(&k, "c9", &[]);
         garbled["fields"] = json!([{ "type": 0, "name": "2.bad|bad|bad", "value": "2.bad|bad|bad" }]);
         let s = sync(vec![garbled]);
         // The core's cache lives with the keyring: the same cipher is not opened again.
-        let again = super::build(&s, &core(&k), Some(&first), &mut cache, &none);
+        let again = super::build(&s, &core(&k), Some(&first), &mut cache, &none, false);
         assert!(!again.snapshot.held.contains("c9"), "still known as unmarked");
         // Rescanned, the same cipher cannot be read.
         assert!(build(&s, &k, None).snapshot.held.contains("c9"));

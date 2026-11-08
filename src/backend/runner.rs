@@ -190,19 +190,31 @@ impl Undo {
 }
 
 /// Extra `bwss status` lines: what the user may want to fix.
-pub(super) fn status_lines(built: &Built) -> Vec<String> {
+pub(super) fn status_lines(built: &Built, derive: bool) -> Vec<String> {
     let mut lines = Vec::new();
     for (id, losers) in &built.duplicates {
         lines.push(format!("duplicate id {id}: {} items ignored", losers.len()));
     }
     // Items an app could not tell apart: one collection, one attribute set.
-    // Items without attributes are found by their derived ones instead.
+    // Items without attributes are found by their derived ones instead, or
+    // by `bwss:id` alone while those are off (ADR 0015).
     let mut groups: BTreeMap<(&str, Attributes), Vec<(&str, &str)>> = BTreeMap::new();
+    let mut bare = Vec::new();
     for m in built.marked.values() {
         let attributes = own_attributes(&m.item.attributes);
         if !attributes.is_empty() {
             groups.entry((&m.item.collection, attributes)).or_default().push((&m.item.label, &m.item.id));
+        } else if !derive {
+            bare.push(m.item.id.as_str());
         }
+    }
+    if !bare.is_empty() {
+        bare.sort_unstable();
+        lines.push(format!(
+            "no bwss:attr:* field, so apps find these by bwss:id only while derived attributes are off \
+             (`bwss derive on`, or add attributes with `dybw mark`): {}",
+            bare.join(", ")
+        ));
     }
     for mut group in groups.into_values().filter(|g| g.len() > 1) {
         group.sort_by_key(|&(_, id)| id);
@@ -1609,13 +1621,32 @@ mod tests {
             ..Built::default()
         };
         assert_eq!(
-            status_lines(&built),
+            status_lines(&built, true),
             [
                 "duplicate id a: 2 items ignored".to_owned(),
                 "skipped: c4: item type 3 is not supported".to_owned(),
                 REGISTRY_UNREADABLE.to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn status_lists_items_without_attributes() {
+        let bare = |id: &str| {
+            let mut m = old();
+            m.item.id = id.into();
+            m.item.attributes = BTreeMap::from([("bwss:id".to_owned(), id.to_owned())]);
+            (id.to_owned(), m)
+        };
+        let built =
+            Built { marked: HashMap::from([bare("zed"), bare("abe"), ("a".into(), old())]), ..Built::default() };
+        let says = |derive| status_lines(&built, derive).join("\n");
+        assert!(
+            says(false).contains("bwss:id only while derived attributes are off")
+                && says(false).ends_with(": abe, zed")
+        );
+        assert!(!says(false).contains("GitHub"), "an item with attributes is not listed");
+        assert_eq!(says(true), "", "with derived attributes on they find it");
     }
 
     #[test]

@@ -348,7 +348,15 @@ fn serve(sync: Value) -> (Fake, Config, Credentials, Paths, tempfile::TempDir) {
 }
 
 async fn vault(ciphers: Vec<Value>, user: SymmetricKey) -> Vault {
+    vault_with(ciphers, user, false).await
+}
+
+/// `vault` on a device where `bwss derive on` was (or was not) run.
+async fn vault_with(ciphers: Vec<Value>, user: SymmetricKey, derive: bool) -> Vault {
     let (fake, config, creds, paths, dir) = server(ciphers, &user);
+    if derive {
+        crate::config::set_derive(&paths, true).unwrap();
+    }
     let backend = Arc::new(Bitwarden::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
     let keys = Keys { mark: user.derive("value-mark"), user };
@@ -2742,7 +2750,7 @@ async fn blob_items_are_served() {
     let k = SymmetricKey::generate();
     let marked = blob(&k, "c1", &[("bwss:id", "b"), ("bwss:attr:service", "blobby")], "sealed pw");
     let unmarked = blob(&k, "c2", &[("other", "x")], "never read");
-    let v = vault(vec![marked, unmarked], k).await;
+    let v = vault_with(vec![marked, unmarked], k, true).await;
     let item = v.item("b").await;
     assert_eq!(&*item.secret, b"sealed pw");
     assert_eq!(item.attributes["service"], "blobby");
@@ -2801,8 +2809,37 @@ async fn label_falls_back_to_the_id() {
     // ADR 0015: the item name ("GitHub") is no label.
     assert_eq!(v.item("gh").await.label, "gh");
     assert_eq!(v.item("lab").await.label, "My label");
-    // Derived attributes are still shown until B7 turns them off by default.
-    assert_eq!(v.item("gh").await.attributes["bwss:name"], "GitHub");
+}
+
+#[tokio::test]
+async fn derived_attributes_are_off_by_default() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    let item = v.item("gh").await;
+    assert_eq!(item.attributes["bwss:id"], "gh", "the id is always shown");
+    for a in ["bwss:name", "bwss:username", "bwss:uri"] {
+        assert!(!item.attributes.contains_key(a), "{a}");
+    }
+    assert_eq!(item.attributes["service"], "git");
+    assert_eq!(item.label, "gh");
+}
+
+#[tokio::test]
+async fn derive_on_shows_them_after_confirmation() {
+    // The terminal confirmation is `main::derive` (see `turning_derived_attributes_on_says_what_becomes_visible`);
+    // what it sets is the device flag the vault reads.
+    let k = SymmetricKey::generate();
+    let v = vault_with(vec![hand_marked(&k, "c1", "gh")], k, true).await;
+    let item = v.item("gh").await;
+    assert_eq!(item.attributes["bwss:name"], "GitHub");
+    assert_eq!(item.attributes["bwss:username"], "me");
+    assert_eq!(item.attributes["bwss:uri"], "https://github.com");
+    assert_eq!(item.label, "GitHub", "ADR 0015: the item name is the label while derived attributes are on");
+
+    // Turned off again: the next build drops them.
+    std::fs::remove_file(v.dir.join("tool-state").join("derive-on")).unwrap();
+    v.fake.with(|s| s.rev += 1);
+    assert!(!v.item("gh").await.attributes.contains_key("bwss:name"));
 }
 
 /// The fake's copy of `cid` replaced by `cipher` as it was, as a server

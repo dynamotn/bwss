@@ -149,23 +149,26 @@ def test_derived_attributes_are_found_while_locked_only_after_this_device_opts_i
         assert r.returncode != 0 and r.stdout == ""
         assert not getpins()
         assert d.cli("status").stdout.startswith("locked")
-        # Unlocked, derived attributes match as always.
+        # ADR 0015: unlocked, they are off as well, and the stored attribute still matches.
         unlock(d, account)
-        assert d.tool("lookup", "bwss:name", "derived-e2e").stdout == "found"
+        r = d.tool("lookup", "bwss:name", "derived-e2e", check=False)
+        assert r.returncode != 0 and r.stdout == ""
+        assert d.tool("lookup", "derived", "e2e").stdout == "found"
     assert not indexed()
 
-    code, _, shown = on_terminal(d, "index", "derived", "on", answer="yes")
-    assert code == 0 and "usernames and URIs" in shown
-    assert mode(d.state / "tools" / "bwss" / "index-derived") == 0o600
+    code, _, shown = on_terminal(d, "derive", "on", answer="yes")
+    assert code == 0 and "usernames and first URIs" in shown
+    assert mode(d.state / "tools" / "bwss" / "derive-on") == 0o600
     with running():
         unlock(d, account)  # the next index write puts them in
         assert indexed()
+        assert d.tool("lookup", "bwss:name", "derived-e2e").stdout == "found"
     with running():
         d.pinentry(pins=[account.password])
         assert d.tool("lookup", "bwss:name", "derived-e2e").stdout == "found"
         assert getpins()
 
-    d.cli("index", "derived", "off")
+    d.cli("derive", "off")
     # Off: they leave the index when the daemon starts.
     with running():
         assert not indexed()
@@ -298,15 +301,16 @@ def test_marked_login_is_found_and_written_back(account):
         c = account.add_login(None, "GitHub", "gh-old", {"bwss:id": "gh"}, username="octocat", uri="https://github.com")
         assert account.item(c["id"])["folder"] is None
         d.cli("sync")
-        assert d.tool("lookup", "bwss:name", "GitHub").stdout == "gh-old"
         assert d.tool("lookup", "bwss:id", "gh").stdout == "gh-old"
-        assert d.tool("lookup", "bwss:username", "octocat").stdout == "gh-old"
-        assert d.tool("lookup", "bwss:uri", "https://github.com").stdout == "gh-old"
+        # ADR 0015: the derived attributes are off by default, on the bus too.
+        for attr, value in (("bwss:name", "GitHub"), ("bwss:username", "octocat"), ("bwss:uri", "https://github.com")):
+            assert d.tool("lookup", attr, value, check=False).stdout == "", attr
+        assert "no bwss:attr:* field" in d.cli("status").stdout
 
         # ADR 0015: without bwss:label the label is the id, so storing under it writes no label field.
         # ADR 0016: the first write back to this login is confirmed in the pinentry.
         d.pinentry(confirm="once")
-        d.tool("store", "--label=gh", "bwss:name", "GitHub", input="gh-new")
+        d.tool("store", "--label=gh", "bwss:id", "gh", input="gh-new")
         assert any(p.startswith("SETOK Write to the login") for p in d.prompts()), d.prompts()
         it = account.item(c["id"])
         assert it["password"] == "gh-new"
@@ -534,7 +538,7 @@ def test_unmarked_items_never_reach_the_bus(account):
         account.add_login(FOLDER, "Plain Unmarked Login", "plain-pw", username="plainuser", uri="https://plain.example")
         account.add_login(None, "Obsidian Only Login", "obs-pw", {"obsidian:id": "o1"})
         account.add_note(FOLDER, "Unmarked Journal", "dear diary", {"other:thing": "x"})
-        account.add_login(None, "Marked Visible", "vis-pw", {"bwss:id": "vis"})
+        account.add_login(None, "Marked Visible", "vis-pw", {"bwss:id": "vis"}, username="visuser", uri="https://vis.example")
         d.cli("sync")
         bus = secretstorage.dbus_init()
         try:
@@ -547,8 +551,9 @@ def test_unmarked_items_never_reach_the_bus(account):
         finally:
             bus.close()
         blob = "\n".join(seen)
-        assert "Marked Visible" in blob
-        for hidden in ("Plain Unmarked Login", "plainuser", "plain.example", "Obsidian Only Login", "Unmarked Journal", "_collections"):
+        # ADR 0015: a marked item shows its id, not what was taken from it.
+        assert "'bwss:id': 'vis'" in blob
+        for hidden in ("Marked Visible", "visuser", "vis.example", "Plain Unmarked Login", "plainuser", "plain.example", "Obsidian Only Login", "Unmarked Journal", "_collections"):
             assert hidden not in blob, hidden
     finally:
         d.stop()

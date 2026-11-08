@@ -98,7 +98,13 @@ enum Command {
         #[arg(value_enum)]
         mode: Switch,
     },
-    /// Choose what the locked index holds on this device.
+    /// Show or hide the item name, username and URI of marked items on this
+    /// device, on the bus and in the locked index (ADR 0015).
+    Derive {
+        #[arg(value_enum)]
+        mode: Switch,
+    },
+    /// Deprecated: use `bwss derive`.
     Index {
         #[command(subcommand)]
         command: IndexCommand,
@@ -173,8 +179,7 @@ enum Switch {
 
 #[derive(Subcommand)]
 enum IndexCommand {
-    /// Put the derived attributes (bwss:id, bwss:name, bwss:username,
-    /// bwss:uri) in the locked index, or take them out (the default).
+    /// Deprecated alias of `bwss derive on|off`.
     Derived {
         #[arg(value_enum)]
         mode: Switch,
@@ -191,11 +196,12 @@ const ACL_OFF_QUESTION: &str = "Turn off per-application access control on this 
     Every program running as you could then use every keyring item without being asked.\n\
     Type \"yes\" to turn it off: ";
 
-/// The question before derived attributes go in the locked index at `index`.
-fn index_derived_question(index: &std::path::Path) -> String {
+/// The question before derived attributes are turned on; `index` is the locked index.
+fn derive_question(index: &std::path::Path) -> String {
     format!(
-        "Put derived attributes (bwss:id, bwss:name, bwss:username, bwss:uri) in the locked index on this device?\n\
-         Item names, usernames and URIs then become guessable offline from ~/.cache: anyone who can read\n\
+        "Turn derived attributes (bwss:name, bwss:username, bwss:uri) on for this device?\n\
+         Every app on the session bus can then read the names, usernames and first URIs of marked items,\n\
+         and they become guessable offline from ~/.cache: anyone who can read\n\
          {} can test guesses of them without the master password.\n\
          Type \"yes\" to turn it on: ",
         index.display()
@@ -472,6 +478,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     let paths = Paths::from_env();
     let trust = Trust::system()?;
     let config = config::load(&paths, &trust)?;
+    config::migrate_index_derived(&paths).with_context(|| format!("{}", paths.derive_on().display()))?;
     for dir in [&paths.cache, &paths.state, &paths.tool_state] {
         fsutil::ensure_private_dir(dir).with_context(|| format!("{}", dir.display()))?;
     }
@@ -489,7 +496,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
         }
     };
     let prompter = guarded_prompter(&config.pinentry, trust);
-    let daemon = Daemon::new(Keyring::new(index, Some(paths.index_derived())), backend, prompter, config.clone());
+    let daemon = Daemon::new(Keyring::new(index, Some(paths.derive_on())), backend, prompter, config.clone());
     daemon.set_acl_state_path(paths.acl_confirmed());
 
     let conn = zbus::connection::Builder::session().build().await?;
@@ -530,6 +537,20 @@ fn status_lines(unlocked: bool, items: u32, backend: &str) -> Vec<String> {
     let mut lines = vec![format!("{}, {items} item(s), {summary}", if unlocked { "unlocked" } else { "locked" })];
     lines.extend(details.lines().map(|line| format!("  {line}")));
     lines
+}
+
+fn derive(mode: Switch) -> anyhow::Result<()> {
+    let paths = Paths::from_env();
+    let on = matches!(mode, Switch::On);
+    if on && !confirm_on_terminal(&derive_question(&paths.locked_index()))? {
+        bail!("not confirmed; derived attributes stay off");
+    }
+    config::set_derive(&paths, on).with_context(|| format!("{}", paths.derive_on().display()))?;
+    println!(
+        "derived attributes are {} on this device from the next sync, unlock or change of the keyring",
+        if on { "on" } else { "off" }
+    );
+    Ok(())
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -620,19 +641,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Derive { mode } => derive(mode),
         Command::Index { command: IndexCommand::Derived { mode } } => {
-            let paths = Paths::from_env();
-            let on = matches!(mode, Switch::On);
-            if on && !confirm_on_terminal(&index_derived_question(&paths.locked_index()))? {
-                bail!("not confirmed; derived attributes stay out of the locked index");
-            }
-            config::set_index_derived(&paths, on).with_context(|| format!("{}", paths.index_derived().display()))?;
-            println!(
-                "derived attributes are {} the locked index on this device from its next write \
-                 (the next unlock or change)",
-                if on { "in" } else { "out of" }
+            eprintln!(
+                "`bwss index derived` is deprecated: use `bwss derive {}`",
+                if matches!(mode, Switch::On) { "on" } else { "off" }
             );
-            Ok(())
+            derive(mode)
         }
         Command::Kdf { command: KdfCommand::Accept } => {
             let (storage, origin, prompter) = answering()?;
@@ -759,11 +774,20 @@ mod tests {
     }
 
     #[test]
-    fn turning_derived_attributes_on_says_what_becomes_guessable() {
-        let q = index_derived_question(std::path::Path::new("/home/u/.cache/bwss/locked-index.json"));
-        assert!(q.contains("usernames and URIs") && q.contains("guessable offline"), "{q}");
+    fn turning_derived_attributes_on_says_what_becomes_visible() {
+        let q = derive_question(std::path::Path::new("/home/u/.cache/bwss/locked-index.json"));
+        assert!(q.contains("usernames and first URIs") && q.contains("Every app on the session bus"), "{q}");
+        assert!(q.contains("guessable offline"), "{q}");
         assert!(q.contains("~/.cache") && q.contains("/home/u/.cache/bwss/locked-index.json"), "{q}");
         assert!(q.ends_with("Type \"yes\" to turn it on: "), "{q}");
+    }
+
+    #[test]
+    fn index_derived_stays_as_an_alias() {
+        for args in ["derive on", "derive off", "index derived on", "index derived off"] {
+            let argv = std::iter::once("bwss").chain(args.split(' '));
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args}");
+        }
     }
 
     #[test]
