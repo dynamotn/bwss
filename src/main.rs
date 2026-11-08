@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 use dybw_core::ports::Storage;
 use dybw_core::profile;
 
-use crate::backend::bitwarden::{KDF_OFFERED, kdf_offer};
+use crate::backend::bitwarden::{KDF_OFFERED, kdf_offer, ran_kdf};
 use crate::backend::{Backend, bitwarden::BitwardenBackend, kdf_text, memory::MemoryBackend};
 use crate::bw::api::identity_origin;
 use crate::config::{BackendKind, Credentials, Paths, Trust};
@@ -179,25 +179,43 @@ fn confirm(question: &str, tty: bool, input: &mut dyn BufRead, out: &mut dyn Wri
 }
 
 /// `bwss kdf accept`: confirms on this device the KDF the last unlock
-/// refused, or forgets a pin that cannot be read (ADR 0017).
-async fn kdf_accept(storage: &impl Storage, ask: impl AsyncFnOnce(&str) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+/// refused, or forgets a pin that cannot be read (ADR 0017). `origin` is the
+/// identity origin of the configured server: an offer for another one is
+/// never accepted.
+async fn kdf_accept(
+    storage: &impl Storage,
+    origin: &str,
+    ask: impl AsyncFnOnce(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
     let offer = kdf_offer(storage).await?.context("no unlock waits for a KDF confirmation on this device")?;
+    if offer.origin != origin {
+        bail!(
+            "the KDF waiting for a confirmation came from {}, not from the configured server {origin}; \
+             unlock again to be asked about this server",
+            offer.origin
+        );
+    }
     match offer.kdf() {
         Some(kdf) => {
             let question = format!(
-                "The server offers a weaker KDF than the one this device pinned: {}.\n\n\
+                "The server {origin} offers a weaker KDF than the one this device pinned: {}.\n\n\
                  Accept it only if you lowered it yourself in the web vault.",
                 kdf_text(&kdf)
             );
             if !ask(&question).await? {
                 bail!("not confirmed; the pinned KDF stays");
             }
-            profile::accept_kdf(storage, kdf, &offer.origin).await?;
+            profile::accept_kdf(storage, kdf, origin).await?;
         }
         None => {
-            let question = "The KDF pin saved on this device is unreadable.\n\n\
-                Forget it? The next unlock pins the KDF the server offers.";
-            if !ask(question).await? {
+            if ran_kdf(storage).await.is_some() {
+                bail!("the KDF pin saved on this device can be read; there is nothing to forget");
+            }
+            let question = format!(
+                "The KDF pin saved on this device for {origin} is unreadable.\n\n\
+                 Forget it? The next unlock pins the KDF the server offers."
+            );
+            if !ask(&question).await? {
                 bail!("not confirmed; the pin stays");
             }
             storage.remove("kdf-pin").await?;
@@ -231,13 +249,14 @@ fn guarded_prompter(program: &str, trust: Trust) -> Prompter {
     Prompter::guarded(program, Duration::from_secs(120), Arc::new(move |p: &str| verify_pinentry(&guard, p)))
 }
 
-/// The device state and the pinentry of the profile bwss serves.
-fn answering() -> anyhow::Result<(FileStorage, Prompter)> {
+/// The device state, the identity origin and the pinentry of the profile bwss serves.
+fn answering() -> anyhow::Result<(FileStorage, String, Prompter)> {
     let paths = Paths::from_env();
     let trust = Trust::system()?;
     let config = config::load(&paths, &trust)?;
     let profile = config.profile.as_deref().context("bwss serves no profile")?;
-    Ok((FileStorage::new(&paths, profile), guarded_prompter(&config.pinentry, trust)))
+    let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
+    Ok((FileStorage::new(&paths, profile), origin, guarded_prompter(&config.pinentry, trust)))
 }
 
 async fn pinentry_yes(prompter: &Prompter, question: &str) -> anyhow::Result<bool> {
@@ -542,13 +561,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Kdf { command: KdfCommand::Accept } => {
-            let (storage, prompter) = answering()?;
-            kdf_accept(&storage, async |q: &str| pinentry_yes(&prompter, q).await).await?;
+            let (storage, origin, prompter) = answering()?;
+            kdf_accept(&storage, &origin, async |q: &str| pinentry_yes(&prompter, q).await).await?;
             println!("accepted on this device; unlock again");
             Ok(())
         }
         Command::Security { command: SecurityCommand::Accept { version } } => {
-            let (storage, prompter) = answering()?;
+            let (storage, _, prompter) = answering()?;
             security_accept(&storage, version, async |q: &str| pinentry_yes(&prompter, q).await).await?;
             println!("accepted on this device; unlock again");
             Ok(())
@@ -607,17 +626,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().as_os_str().to_owned();
         let storage = FileStorage::new(&Paths::with(|v| (v == "HOME").then(|| home.clone())), "p");
-        let err = kdf_accept(&storage, async |_| Ok(true)).await.unwrap_err().to_string();
+        let err = kdf_accept(&storage, "o", async |_| Ok(true)).await.unwrap_err().to_string();
         assert_eq!(err, "no unlock waits for a KDF confirmation on this device");
         storage.save(KDF_OFFERED, br#"{"origin":"o","kdf":null}"#).await.unwrap();
         storage.save("kdf-pin", b"{").await.unwrap();
-        assert!(kdf_accept(&storage, async |_| Ok(false)).await.is_err());
+        assert!(kdf_accept(&storage, "o", async |_| Ok(false)).await.is_err());
         assert!(storage.load("kdf-pin").await.unwrap().is_some(), "a no keeps the pin");
-        let failed = kdf_accept(&storage, async |_| anyhow::bail!("pinentry is gone")).await.unwrap_err();
+        let failed = kdf_accept(&storage, "o", async |_| anyhow::bail!("pinentry is gone")).await.unwrap_err();
         assert_eq!(failed.to_string(), "pinentry is gone");
-        kdf_accept(&storage, async |_| Ok(true)).await.unwrap();
+        kdf_accept(&storage, "o", async |_| Ok(true)).await.unwrap();
         assert!(storage.load("kdf-pin").await.unwrap().is_none());
         assert!(storage.load(KDF_OFFERED).await.unwrap().is_none());
+
+        // An offer from another server is never accepted for this one.
+        let weak = br#"{"origin":"https://elsewhere.example","kdf":{"type":"pbkdf2","iterations":5000}}"#;
+        storage.save(KDF_OFFERED, weak).await.unwrap();
+        let err = kdf_accept(&storage, "o", async |_| Ok(true)).await.unwrap_err().to_string();
+        assert!(err.contains("came from https://elsewhere.example, not from the configured server o"), "{err}");
+        assert!(storage.load("kdf-pin").await.unwrap().is_none(), "nothing pinned");
+        // A pin that can be read is not forgotten as unreadable.
+        profile::accept_kdf(&storage, dybw_core::crypto::KdfParams::Pbkdf2 { iterations: 600_000 }, "o").await.unwrap();
+        storage.save(KDF_OFFERED, br#"{"origin":"o","kdf":null}"#).await.unwrap();
+        let err = kdf_accept(&storage, "o", async |_| Ok(true)).await.unwrap_err().to_string();
+        assert_eq!(err, "the KDF pin saved on this device can be read; there is nothing to forget");
+        assert!(storage.load("kdf-pin").await.unwrap().is_some());
 
         let err = security_accept(&storage, 1, async |_| Ok(false)).await.unwrap_err().to_string();
         assert_eq!(err, "not confirmed; the version this device saw stays");

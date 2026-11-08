@@ -2039,7 +2039,7 @@ async fn unlocks_offline_from_the_cache() {
     doc.as_object_mut().unwrap().remove("kdf");
     std::fs::write(&cache, serde_json::to_vec(&doc).unwrap()).unwrap();
     let err = v.backend.unlock(PASSWORD).await.unwrap_err();
-    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("incomplete unlock data")), "{err}");
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("the offline copy lacks its KDF")), "{err}");
 }
 
 #[tokio::test]
@@ -2064,19 +2064,19 @@ async fn a_weakened_kdf_is_refused_until_accepted() {
     assert!(v.backend.state.lock().await.is_none());
 
     // A no at the question changes nothing.
-    assert!(crate::kdf_accept(&storage, async |_| Ok(false)).await.is_err());
+    assert!(crate::kdf_accept(&storage, &v.origin(), async |_| Ok(false)).await.is_err());
     assert!(matches!(v.backend.unlock(PASSWORD).await, Err(BackendError::KdfWeakened { .. })));
 
     let mut asked = String::new();
-    crate::kdf_accept(&storage, async |q: &str| {
+    crate::kdf_accept(&storage, &v.origin(), async |q: &str| {
         asked = q.to_owned();
         Ok(true)
     })
     .await
     .unwrap();
-    assert!(asked.contains("PBKDF2, 5000 iterations"), "{asked}");
+    assert!(asked.contains("PBKDF2, 5000 iterations") && asked.contains(&v.origin()), "{asked}");
     assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
-    let none = crate::kdf_accept(&storage, async |_| Ok(true)).await.unwrap_err().to_string();
+    let none = crate::kdf_accept(&storage, &v.origin(), async |_| Ok(true)).await.unwrap_err().to_string();
     assert!(none.contains("no unlock waits"), "{none}");
 
     // An offer that cannot be kept still refuses the unlock.
@@ -2084,25 +2084,26 @@ async fn a_weakened_kdf_is_refused_until_accepted() {
     std::fs::create_dir_all(crate::fsutil::temp_path(&v.dir.join("tool-state/core/kdf-offered"))).unwrap();
     v.backend.lock().await;
     assert!(matches!(v.backend.unlock(PASSWORD).await, Err(BackendError::KdfWeakened { .. })));
-    assert!(crate::kdf_accept(&storage, async |_| Ok(true)).await.is_err());
+    assert!(crate::kdf_accept(&storage, &v.origin(), async |_| Ok(true)).await.is_err());
 }
 
 #[tokio::test]
 async fn an_unreadable_kdf_pin_is_forgotten_once_confirmed() {
     let v = github().await;
+    let origin = v.origin();
     v.backend.lock().await;
     std::fs::write(v.dir.join("tool-state/core/kdf-pin"), "{").unwrap();
     let err = v.backend.unlock(PASSWORD).await.unwrap_err();
     assert!(matches!(err, BackendError::KdfPinUnreadable), "{err}");
     assert!(err.to_string().contains("`bwss kdf accept`"), "{err}");
     let mut asked = String::new();
-    crate::kdf_accept(&v.storage(), async |q: &str| {
+    crate::kdf_accept(&v.storage(), &origin, async |q: &str| {
         asked = q.to_owned();
         Ok(true)
     })
     .await
     .unwrap();
-    assert!(asked.contains("unreadable"), "{asked}");
+    assert!(asked.contains("unreadable") && asked.contains(&origin), "{asked}");
     assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
 }
 
@@ -2196,6 +2197,16 @@ async fn a_new_user_key_resets_queue_and_acl_confirmations() {
     assert!(confirmed.exists());
     assert!(!v.backend.describe().await.contains("asked again"));
 
+    // The same old key changing away again keeps both backups.
+    v.backend.lock().await;
+    std::fs::write(v.dir.join("tool-state/core/user-key-id"), &old).unwrap();
+    std::fs::write(v.dir.join("state/queue.json"), "{}").unwrap();
+    v.backend.unlock(PASSWORD).await.unwrap();
+    let second = v.dir.join(format!("state/queue.{old}.bak.2"));
+    assert_eq!(std::fs::read(&second).unwrap(), b"{}");
+    assert!(std::fs::metadata(v.dir.join(format!("state/queue.{old}.bak"))).unwrap().len() > 2, "the first one kept");
+    assert!(v.backend.describe().await.contains(&second.display().to_string()), "the name used is reported");
+
     // A planted id never names a path outside the state directory.
     v.backend.lock().await;
     std::fs::write(v.dir.join("tool-state/core/user-key-id"), "../../x/evil").unwrap();
@@ -2209,8 +2220,10 @@ async fn a_key_change_that_cannot_reset_says_so() {
     let v = github().await;
     v.backend.lock().await;
     let core = v.dir.join("tool-state/core");
-    std::fs::write(core.join("user-key-id"), "old").unwrap();
-    std::fs::create_dir_all(v.dir.join("state/queue.old.bak/full")).unwrap();
+    // An id too long for a file name: the queue cannot be moved under it.
+    let long = "o".repeat(250);
+    std::fs::write(core.join("user-key-id"), &long).unwrap();
+    std::fs::create_dir_all(v.dir.join("state")).unwrap();
     std::fs::write(v.dir.join("state/queue.json"), "{}").unwrap();
     std::fs::create_dir_all(v.dir.join("tool-state/acl-confirmed/full")).unwrap();
     std::fs::create_dir_all(crate::fsutil::temp_path(&core.join("user-key-id"))).unwrap();
@@ -2218,9 +2231,41 @@ async fn a_key_change_that_cannot_reset_says_so() {
     let status = v.backend.describe().await;
     assert!(status.contains("the write queue could not be set aside"), "{status}");
     assert!(status.contains("the ACL confirmations could not be reset"), "{status}");
-    assert_eq!(
-        std::fs::read_to_string(core.join("user-key-id")).unwrap(),
-        "old",
-        "not recorded: asked again next time"
-    );
+    assert_eq!(std::fs::read_to_string(core.join("user-key-id")).unwrap(), long, "not recorded: asked again next time");
+}
+
+#[tokio::test]
+async fn a_write_racing_a_cose_unlock_is_refused() {
+    use std::rc::Rc;
+    use std::time::Duration;
+    let (sync, password) = cose_v2();
+    let (fake, config, creds, paths, dir) = serve(sync);
+    let b = Rc::new(Bitwarden::new(&config, creds, &paths).unwrap());
+    let opened = dir.path().join("tool-state/core/user-key-id");
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let held = b.queue.lock().await;
+            let unlocking = tokio::task::spawn_local({
+                let b = b.clone();
+                async move { b.unlock(&password).await }
+            });
+            // The key is open: next the unlock waits for the queue.
+            while !opened.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Sent while the keyring is still locked, it waits behind the unlock.
+            let writing = tokio::task::spawn_local({
+                let b = b.clone();
+                async move { b.put_item(&new_item("n1", "login")).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(held);
+            unlocking.await.unwrap().unwrap();
+            let err = writing.await.unwrap().unwrap_err();
+            assert!(matches!(&err, BackendError::Rejected(m) if m.contains("COSE")), "{err}");
+            assert_eq!(fake.count("POST", "/api/"), 0, "nothing sent under the stand-in key");
+            assert_eq!(b.queue.lock().await.len(), 0, "nothing queued under it either");
+        })
+        .await;
 }

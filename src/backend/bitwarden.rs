@@ -110,7 +110,7 @@ pub(crate) async fn kdf_offer(storage: &impl Storage) -> Result<Option<KdfOffer>
 /// The KDF the last successful unlock ran: the core's pin holds exactly it
 /// then (`kdf-pin`: `{kdf, iterations, memory, parallelism, origin}`).
 // shortcut: reads the core's pin format; use the KDF from `profile::Unlocked` once the core reports it.
-async fn ran_kdf(storage: &impl Storage) -> Option<KdfParams> {
+pub(crate) async fn ran_kdf(storage: &impl Storage) -> Option<KdfParams> {
     #[derive(Deserialize)]
     struct Pin {
         kdf: u32,
@@ -713,7 +713,12 @@ fn map_profile(e: ProfileError) -> BackendError {
         ProfileError::SecurityState(fault) => BackendError::SecurityState(format!(
             "the account's security state {fault}: check the account in the web vault"
         )),
-        e @ (ProfileError::Crypto(_) | ProfileError::IncompleteUnlockData) => BackendError::Rejected(e.to_string()),
+        ProfileError::IncompleteUnlockData => BackendError::Rejected(
+            "the account sent no usable unlock data, or the offline copy lacks its KDF: unlock online, or check \
+             the account in the web vault"
+                .into(),
+        ),
+        e @ ProfileError::Crypto(_) => BackendError::Rejected(e.to_string()),
     }
 }
 
@@ -860,7 +865,13 @@ impl Bitwarden {
         if let Some(old) = old.filter(|old| *old != id) {
             // Only the characters of an id the core makes: never a path.
             let name: String = old.chars().filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c)).collect();
-            let aside = self.queue_path.with_file_name(format!("queue.{name}.bak"));
+            // Never over an earlier backup: the same old key can change away twice.
+            let mut aside = self.queue_path.with_file_name(format!("queue.{name}.bak"));
+            let mut n = 1;
+            while std::fs::symlink_metadata(&aside).is_ok() {
+                n += 1;
+                aside = self.queue_path.with_file_name(format!("queue.{name}.bak.{n}"));
+            }
             match std::fs::rename(&self.queue_path, &aside) {
                 Ok(()) => notices.push(format!(
                     "the user key changed: changes queued before that cannot be sent and were set aside in {}",
@@ -1087,32 +1098,36 @@ impl Bitwarden {
     }
 
     pub(crate) async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
-        self.writable().await?;
         let mut queue = self.queue.lock().await;
+        // Under the queue lock: no unlock can install a COSE key after the check.
+        self.writable().await?;
         let result = self.create_collection_locked(&mut queue, label).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
     pub(crate) async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
-        self.writable().await?;
         let mut queue = self.queue.lock().await;
+        // Under the queue lock: no unlock can install a COSE key after the check.
+        self.writable().await?;
         let result = self.delete_collection_locked(&mut queue, id, items).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
     pub(crate) async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        self.writable().await?;
         let mut queue = self.queue.lock().await;
+        // Under the queue lock: no unlock can install a COSE key after the check.
+        self.writable().await?;
         let result = self.put_locked(&mut queue, item).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
     pub(crate) async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        self.writable().await?;
         let mut queue = self.queue.lock().await;
+        // Under the queue lock: no unlock can install a COSE key after the check.
+        self.writable().await?;
         let result = self.delete_locked(&mut queue, &item.id).await;
         self.forget_if_locked(&mut queue).await;
         result
@@ -1742,7 +1757,7 @@ mod tests {
         );
         assert!(matches!(map_profile(CryptoError::BadMac.into()), BackendError::Rejected(_)));
         assert!(
-            matches!(map_profile(ProfileError::IncompleteUnlockData), BackendError::Rejected(m) if m.contains("incomplete"))
+            matches!(map_profile(ProfileError::IncompleteUnlockData), BackendError::Rejected(m) if m.contains("no usable unlock data") && m.contains("unlock online"))
         );
         let weakened = text(ProfileError::KdfWeakened { pinned, offered: weak, kdf_source: KdfSource::SyncUnlockData });
         assert_eq!(
