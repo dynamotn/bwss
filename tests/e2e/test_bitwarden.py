@@ -175,11 +175,9 @@ def test_derived_attributes_are_found_while_locked_only_after_this_device_opts_i
         assert json.loads(index.read_text())["items"], "the rest of the index stays"
 
 
-def test_derive_off_hides_them_on_the_bus_at_once_and_a_carried_flag_is_announced():
+def test_derive_off_hides_them_on_the_bus_at_once_and_a_carried_flag_is_announced(account):
     from test_config import on_terminal
 
-    # An account of its own: an attribute-less item would make `store bwss:id` ambiguous in the others.
-    account = Account(URL)
     d = bitwarden_daemon(account)
     tools = d.state / "tools" / "bwss"
     tools.mkdir(parents=True, exist_ok=True)

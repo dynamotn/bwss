@@ -895,19 +895,25 @@ impl Daemon {
             if k.collection_locked(collection) {
                 return Err(SecretError::IsLocked("the collection is locked".into()));
             }
-            if replace {
-                // Same app attributes; derived ones (`bwss:*`) do not count (§5.1).
-                let wanted = own_attributes(&attributes);
-                let (unlocked, held) = k.search(&wanted, Some(collection));
+            // Same app attributes; derived ones (`bwss:*`) do not count (§5.1), except that a
+            // `bwss:id` names the one item. No attributes at all name nothing: a new item.
+            let wanted = own_attributes(&attributes);
+            let id = attributes.get("bwss:id");
+            if replace && (id.is_some() || !wanted.is_empty()) {
+                let mut query = wanted.clone();
+                query.extend(id.map(|v| ("bwss:id".to_owned(), v.clone())));
+                let (unlocked, held) = k.search(&query, Some(collection));
                 // A match that exists but cannot be read (a blob cipher) would
                 // be stored again as a duplicate.
                 if !held.is_empty() {
                     return Err(SecretError::Failed("the item cannot be read now; try again later".into()));
                 }
-                unlocked
-                    .into_iter()
-                    .map(|(_, id)| id)
-                    .find(|id| k.item(id).is_some_and(|i| own_attributes(&i.attributes) == wanted))
+                unlocked.into_iter().map(|(_, id)| id).find(|found| {
+                    k.item(found).is_some_and(|i| {
+                        own_attributes(&i.attributes) == wanted
+                            && id.is_none_or(|v| i.attributes.get("bwss:id") == Some(v))
+                    })
+                })
             } else {
                 None
             }
@@ -1426,6 +1432,65 @@ mod tests {
         let item = k.item("x").unwrap();
         assert_eq!(&*item.secret, b"new");
         assert_eq!(own_attributes(&item.attributes), Attributes::from([("service".to_owned(), "git".to_owned())]));
+    }
+
+    async fn bare_daemon(ids: &[&str]) -> Arc<Daemon> {
+        let backend = Arc::new(MemoryBackend::new("pw"));
+        backend.unlock("pw").await.unwrap();
+        for id in ids {
+            let item = ItemData {
+                id: (*id).into(),
+                collection: LOGIN_COLLECTION.into(),
+                label: (*id).into(),
+                attributes: Attributes::from([("bwss:id".to_owned(), (*id).to_owned())]),
+                secret: Zeroizing::new(format!("old-{id}").into_bytes()),
+                content_type: "text/plain".into(),
+                created: 1,
+                modified: 1,
+                acl: vec!["/usr/bin/git".into()],
+            };
+            backend.put_item(&item).await.unwrap();
+        }
+        let d = Daemon::new(
+            Keyring::new(None, None),
+            backend,
+            Prompter::new("false", Duration::from_secs(1)),
+            Config::default(),
+        );
+        d.unlock_with_password("pw").await.unwrap();
+        d
+    }
+
+    fn replacing(attributes: &[(&str, &str)]) -> NewItem {
+        NewItem {
+            label: "L".into(),
+            attributes: attributes.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            secret: Zeroizing::new(b"new".to_vec()),
+            content_type: "text/plain".into(),
+            replace: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_by_bwss_id_targets_only_that_item() {
+        let d = bare_daemon(&["a", "b"]).await;
+        let path = d.create_item(LOGIN_COLLECTION, replacing(&[("bwss:id", "b")]), "/usr/bin/git").await.unwrap();
+        assert_eq!(path.as_str(), item_path(LOGIN_COLLECTION, "b"));
+        let k = d.keyring.lock().await;
+        assert_eq!(&*k.item("b").unwrap().secret, b"new");
+        assert_eq!(&*k.item("a").unwrap().secret, b"old-a", "never the other attribute-less item");
+        assert_eq!(k.item_refs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replace_with_no_attributes_creates_a_new_item() {
+        let d = bare_daemon(&["a", "b"]).await;
+        d.create_item(LOGIN_COLLECTION, replacing(&[]), "/usr/bin/git").await.unwrap();
+        d.create_item(LOGIN_COLLECTION, replacing(&[("bwss:name", "x")]), "/usr/bin/git").await.unwrap();
+        let k = d.keyring.lock().await;
+        assert_eq!(k.item_refs().len(), 4);
+        assert_eq!(&*k.item("a").unwrap().secret, b"old-a");
+        assert_eq!(&*k.item("b").unwrap().secret, b"old-b");
     }
 
     #[tokio::test]
