@@ -1335,7 +1335,7 @@ mod tests {
             ..Default::default()
         });
         keyring.lock();
-        keyring.load(Snapshot { blobs: ["c1".to_owned()].into(), ..Default::default() });
+        keyring.load(Snapshot { held: ["c1".to_owned()].into(), ..Default::default() });
         let backend = Arc::new(MemoryBackend::new("pw"));
         backend.unlock("pw").await.unwrap();
         let d =

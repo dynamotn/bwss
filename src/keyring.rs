@@ -248,12 +248,12 @@ impl Keyring {
             items.insert(item.id.clone(), item);
         }
         self.items = items;
-        // Items whose cipher is a blob now cannot be read, but are not gone.
+        // Items whose cipher cannot be read now are not gone.
         let candidates = if was_unlocked { std::mem::take(&mut self.held) } else { self.index.items.clone() };
         self.held = candidates
             .into_iter()
             .filter(|e| !self.items.contains_key(&e.id) && self.collections.contains_key(&e.collection))
-            .filter(|e| e.cipher.as_ref().is_some_and(|c| snap.blobs.contains(c)))
+            .filter(|e| e.cipher.as_ref().is_some_and(|c| snap.held.contains(c)))
             .collect();
         self.cipher_of = snap.ciphers;
         self.unlocked = true;
@@ -441,7 +441,7 @@ mod tests {
         // Another client turned c1 into a blob: it cannot be read, not gone.
         let mut k = Keyring::new(Some(path.clone()), None);
         let blobs = ["c1".to_owned()].into();
-        let diff = k.load(Snapshot { items: vec![], blobs, ..Default::default() });
+        let diff = k.load(Snapshot { items: vec![], held: blobs, ..Default::default() });
         assert_eq!(diff.deleted, [r("login", "b")]);
         assert_eq!(k.item_refs(), [r("login", "a")]);
         assert_eq!(k.search(&q(&[("service", "gh")]), None).1, [r("login", "a")], "found as locked");
@@ -451,7 +451,7 @@ mod tests {
 
         // A refresh that still sees the blob keeps it; once the cipher is gone, it is deleted.
         let blobs = ["c1".to_owned()].into();
-        assert!(k.load(Snapshot { blobs, ..Default::default() }).deleted.is_empty());
+        assert!(k.load(Snapshot { held: blobs, ..Default::default() }).deleted.is_empty());
         let diff = k.load(Snapshot::default());
         assert_eq!(diff.deleted, [r("login", "a")]);
         assert!(k.item_refs().is_empty());
@@ -470,7 +470,7 @@ mod tests {
             k.lock();
             // `new(None)` has no disk index: the locked refs come from memory.
             let blobs = if blob_still_there { ["c1".to_owned()].into() } else { Default::default() };
-            let diff = k.load(Snapshot { blobs, ..Default::default() });
+            let diff = k.load(Snapshot { held: blobs, ..Default::default() });
             assert_eq!(diff.deleted.is_empty(), blob_still_there);
         }
     }

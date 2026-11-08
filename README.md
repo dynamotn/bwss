@@ -136,7 +136,7 @@ never puts them on the bus.
 |---|---|
 | default collection (`login`, alias `default`) | marked items without `bwss:collection` |
 | collection "Work" | items with `bwss:collection=work` |
-| item label | the `bwss:label` field, falling back to the item name |
+| item label | the `bwss:label` field, falling back to the `bwss:id` |
 | secret | see *Reading the secret* below |
 | attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
 | `session` collection | memory only, never stored |
@@ -183,6 +183,7 @@ password.
 | `bwss unlock --password-stdin` | For scripts and login hooks: send the password read from stdin (see Security below). |
 | `bwss lock` | Lock the keyring and forget the keys. |
 | `bwss sync` | Pull changes from Bitwarden now (otherwise every `sync_interval_seconds`). |
+| `bwss sync --accept-rollback` | When `bwss status` lists items the server sent older than the copy on this device (kept until then), take the server's versions in this one sync, for example after restoring the server from a backup. |
 | `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
 | `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
 | `bwss index derived on` / `off` | Put item names, usernames, URIs and ids in the locked index on this device, or take them out (the default). |

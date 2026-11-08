@@ -16,10 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dybw_core::api::{ApiKey as CoreApiKey, Client, DeviceInfo, ServerUrls};
-use dybw_core::crypto::{AwsLcRsa, KdfParams};
+use dybw_core::crypto::{AwsLcRsa, KdfParams, SymmetricKey as CoreKey};
 use dybw_core::ports::Storage;
 use dybw_core::profile::{self, CachedSync, ProfileError, SecurityFault, UnlockWarning};
-use dybw_core::vault::{Keys as CoreKeys, Namespace, Organizations};
+use dybw_core::sync::is_rollback;
+use dybw_core::vault::fields as core_fields;
+use dybw_core::vault::{
+    Keys as CoreKeys, MarkedItem as CoreItem, Namespace, Organizations, SkipReason, Uninspectable, UnmarkedCache,
+    ValueSource as CoreSource, item_meta, scan_vault_with,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -34,14 +39,19 @@ use super::worker::{Command, Worker, WorkerHandle};
 use super::{AclTrust, Backend, BackendError, kdf_text};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::SymmetricKey;
-use crate::bw::fields::{F_KIND, field_names, field_value, first_index};
-use crate::bw::items::item_key;
-use crate::bw::scan::{Keys, MarkedItem, Scan, is_blob, normalize_collection, resolve_duplicates, scan};
+use crate::bw::fields::{
+    A_ID, A_NAME, A_URI, A_USERNAME, DERIVED, F_ACL, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND,
+    F_LABEL, F_LOCATION,
+};
+use crate::bw::items::parse_date;
+use crate::bw::scan::{Keys, MarkedItem, Scan, ValueSource, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
 use crate::config::{Config, Credentials, Paths};
-use crate::core_ports::{clock::SystemClock, http::HttpPort, kdf::BlockingArgon2, storage::FileStorage};
+use crate::core_ports::{
+    clock::SystemClock, http::HttpPort, kdf::BlockingArgon2, random::OsRandom, storage::FileStorage,
+};
 use crate::fsutil::{write_json_private, write_private};
-use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
+use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
 
 const FORMAT: u64 = 2;
 const TYPE_SECURE_NOTE: u64 = 2;
@@ -54,9 +64,13 @@ pub(super) const QUEUED: &str = "";
 pub(crate) const KDF_OFFERED: &str = "kdf-offered";
 /// Storage key of the id of the user key this device last opened (ADR 0023).
 const USER_KEY_ID: &str = "user-key-id";
+/// Storage key of the sealed bindings, `bwss:id` to cipher id (ADR 0019).
+const BINDINGS: &str = "bindings";
+/// Storage key of the flag `bwss sync --accept-rollback` leaves for the next sync.
+pub(crate) const ACCEPT_ROLLBACK: &str = "accept-rollback";
 /// Why a COSE account takes no writes yet.
 const COSE_READ_ONLY: &str =
-    "this account's user key is a COSE key: this bwss cannot read or write its items yet, and writes nothing to it";
+    "this account's user key is a COSE key: this bwss reads its items but cannot write to it yet, and writes nothing";
 
 /// KDF parameters as `sync.json` has always stored them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,9 +144,9 @@ pub(crate) async fn ran_kdf(storage: &impl Storage) -> Option<KdfParams> {
     }
 }
 
-/// Bridge until B4-B6: bwss's own code reads and writes with its own key
-/// type, which holds a legacy key only. A COSE key gets a random stand-in that
-/// opens nothing, and the keyring takes no writes (`true`).
+/// Bridge until B5-B6: bwss's own code writes with its own key type, which
+/// holds a legacy key only. A COSE key gets a random stand-in that opens
+/// nothing, and the keyring takes no writes (`true`); reads use the core's keys.
 fn bridge_keys(user: &dybw_core::crypto::SymmetricKey) -> Result<(Keys, bool), BackendError> {
     let (user, read_only) = match SymmetricKey::from_bytes(&user.to_bytes()) {
         Ok(user) => (user, false),
@@ -171,10 +185,16 @@ struct CacheRef<'a> {
     sync: &'a Value,
 }
 
+/// `bwss:id` to the cipher id it is read from: the device's base binding
+/// (ADR 0019), kept sealed in the `bindings` file.
+pub(crate) type Bindings = BTreeMap<String, String>;
+
 /// The keyring as read from one copy of the vault.
+#[derive(Default)]
 pub(crate) struct Built {
     pub snapshot: Snapshot,
-    /// Marked items by `bwss:id`, duplicates resolved, registry excluded.
+    /// Marked items by `bwss:id`, duplicates resolved, registry excluded,
+    /// held items as last read.
     pub marked: HashMap<String, MarkedItem>,
     /// Union of every registry note.
     pub registry: Registry,
@@ -186,8 +206,12 @@ pub(crate) struct Built {
     pub duplicates: Vec<(String, Vec<String>)>,
     /// `(cipher id, reason)` of marked items that are not supported.
     pub skipped: Vec<(String, String)>,
-    /// Scan cache: `(cipher id, raw revisionDate)` of unmarked ciphers.
+    /// Scan cache of the write path: `(cipher id, raw revisionDate)` of
+    /// unmarked ciphers.
     pub unmarked: HashSet<(String, String)>,
+    /// The bindings after this build: every item served from the server,
+    /// and every held id whose cipher is still there.
+    pub bound: Bindings,
 }
 
 /// Whether a message about `what` is logged for the first time in this
@@ -209,6 +233,10 @@ pub(super) fn cache_key(cipher: &Value) -> Option<(String, String)> {
 
 pub(super) fn ciphers(sync: &Value) -> &[Value] {
     sync.get("ciphers").and_then(Value::as_array).map_or(&[], Vec::as_slice)
+}
+
+fn cipher_id(cipher: &Value) -> &str {
+    cipher.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
 /// Why a registry note could not be read.
@@ -237,15 +265,15 @@ impl std::fmt::Display for RegistryError {
 
 /// A marked item with the registry id: `Ok(Some)` for a registry note,
 /// `Ok(None)` for anything else, `Err` when its notes cannot be read.
-pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Registry>, RegistryError> {
+pub(super) fn read_registry(cipher: &Value, keys: &CoreKeys) -> Result<Option<Registry>, RegistryError> {
     use RegistryError::{Fields, Key, Notes, Parse};
     if cipher.get("type").and_then(Value::as_u64) != Some(TYPE_SECURE_NOTE) {
         return Ok(None);
     }
-    let key = item_key(cipher, &keys.user).map_err(|_| Key)?;
-    let names = field_names(cipher, &key).map_err(|_| Fields)?;
-    let Some(i) = first_index(&names, F_KIND) else { return Ok(None) };
-    if field_value(cipher, i, &key).map_err(|_| Fields)?.trim() != KIND_COLLECTIONS {
+    let key = core_fields::item_key(cipher, &keys.user).map_err(|_| Key)?;
+    let names = core_fields::field_names(cipher, &key).map_err(|_| Fields)?;
+    let Some(i) = core_fields::first_index(&names, F_KIND) else { return Ok(None) };
+    if core_fields::field_value(cipher, i, &key).map_err(|_| Fields)?.trim() != KIND_COLLECTIONS {
         return Ok(None);
     }
     let notes = match cipher.get("notes").and_then(Value::as_str) {
@@ -258,103 +286,236 @@ pub(super) fn read_registry(cipher: &Value, keys: &Keys) -> Result<Option<Regist
     Registry::try_parse(&notes).map(Some).map_err(|_| Parse)
 }
 
-/// Builds the keyring from a copy of the vault (design §8.2 step 4).
-///
-/// `previous` supplies the scan cache (unchanged unmarked ciphers are not
-/// decrypted again) and the items to hold: a marked item whose cipher can
-/// no longer be inspected stays as last read (§3.4).
-pub(crate) fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Built {
-    build_list(ciphers(sync), keys, previous)
+/// What `bwss status` says about a skipped item; `features` are the
+/// `dybw:requires` names this bwss does not implement.
+fn skip_text(reason: SkipReason, features: &[String]) -> String {
+    match reason {
+        SkipReason::WrongType => "its item type is not supported".into(),
+        SkipReason::EncodingOnUserSource => format!("{F_ENCODING}=base64 on a value bwss does not own"),
+        SkipReason::UnknownLocation => format!("unknown {F_LOCATION}"),
+        SkipReason::UnknownEncoding => format!("unknown {F_ENCODING}"),
+        SkipReason::InvalidId => format!("its {F_ID} is not valid"),
+        SkipReason::ReservedId => format!("{REGISTRY_ID} is reserved for the collection registry"),
+        SkipReason::ViewPasswordHidden => "its password is hidden from this account".into(),
+        SkipReason::InvalidBase64 => "value is not valid base64".into(),
+        SkipReason::NewerFormat => format!(
+            "it needs what this bwss does not implement ({}): it is not used until bwss is updated",
+            features.join(", ")
+        ),
+    }
 }
 
-/// `build` over a list of ciphers, owned or borrowed.
-fn build_list<C: Borrow<Value>>(list: &[C], keys: &Keys, previous: Option<&Built>) -> Built {
-    let held: HashMap<&str, &MarkedItem> =
-        previous.map(|p| p.marked.values().map(|m| (m.cipher_id.as_str(), m)).collect()).unwrap_or_default();
-    let mut found = Vec::new();
-    let mut unmarked = HashSet::new();
-    let mut skipped = Vec::new();
-    let mut blobs = std::collections::BTreeSet::new();
+fn uninspectable_text(why: Uninspectable) -> &'static str {
+    match why {
+        Uninspectable::OrganizationNotRead => "organization items are not read",
+        Uninspectable::OrganizationKeyMissing => "its organization key is missing",
+        Uninspectable::ItemKey => "item key cannot be unwrapped",
+        Uninspectable::FieldNames => "field names cannot be decrypted",
+        Uninspectable::Marker => "marker cannot be decrypted",
+        Uninspectable::Value => "a value cannot be decrypted",
+        Uninspectable::NewerFormat => "it uses an encryption format this bwss cannot read",
+        Uninspectable::Blob => "its sealed item cannot be opened",
+        Uninspectable::TooLarge => "it is larger than any item bwss reads",
+    }
+}
+
+/// bwss's item from the core's read (design §3). The label is `bwss:label`,
+/// else the id (ADR 0015); a name, username or URI that does not decrypt is
+/// left out of the derived attributes.
+fn to_marked(m: CoreItem, keys: &CoreKeys) -> MarkedItem {
+    let meta = item_meta(&m, keys);
+    let tool = |name: &str| m.tool_fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+    let mut attributes: Attributes = m
+        .attributes
+        .iter()
+        .filter(|(k, _)| !DERIVED.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    attributes.insert(A_ID.to_owned(), m.id.clone());
+    for (k, v) in [(A_NAME, &meta.name), (A_USERNAME, &meta.username), (A_URI, &meta.uri)] {
+        if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+            attributes.insert(k.to_owned(), v.clone());
+        }
+    }
+    let label = tool(F_LABEL).filter(|l| !l.is_empty()).unwrap_or(&m.id).to_owned();
+    let collection = match tool(F_COLLECTION) {
+        None => LOGIN_COLLECTION.to_owned(),
+        Some(c) => {
+            if c.trim().eq_ignore_ascii_case(SESSION_COLLECTION) {
+                tracing::warn!("{}: {F_COLLECTION}=session is memory only; the item stays in login", m.cipher_id);
+            }
+            normalize_collection(c)
+        }
+    };
+    let content_type = tool(F_CONTENT_TYPE).filter(|c| !c.is_empty()).unwrap_or("text/plain").to_owned();
+    let creation_date = m.creation_date.and_then(|ms| u64::try_from(ms / 1000).ok()).filter(|&d| d != 0);
+    let created = tool(F_CREATED).and_then(|s| s.trim().parse().ok()).or(creation_date).unwrap_or(0);
+    let acl = tool(F_ACL)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let source = match m.source {
+        CoreSource::Field => ValueSource::Field,
+        CoreSource::Notes => ValueSource::BwssNotes,
+        CoreSource::LoginPassword => ValueSource::LoginPassword,
+        CoreSource::NoteBody => ValueSource::NoteBody,
+    };
+    let modified = parse_date(&m.revision_date);
+    MarkedItem {
+        organization: m.organization_id.is_some(),
+        source,
+        mark: m.mark,
+        creation_date,
+        item: ItemData {
+            id: m.id,
+            collection,
+            label,
+            attributes,
+            secret: m.value,
+            content_type,
+            created,
+            modified,
+            acl,
+        },
+        cipher_id: m.cipher_id,
+        revision_date: m.revision_date,
+    }
+}
+
+/// Builds the keyring from a copy of the vault through the core's scan
+/// (design §8.2 step 4, data model §4, §7).
+///
+/// `cache` holds the unmarked ciphers of the last scan, so they are not
+/// decrypted again. `previous` supplies the items to hold: a marked item
+/// whose cipher can no longer be inspected, or whose id a skipped cipher
+/// holds, stays as last read (§4, ADR 0019); one that needs a newer format
+/// is not served (ADR 0020). `bound` keeps an id on the cipher this device
+/// read it from (ADR 0019).
+pub(crate) fn build(
+    sync: &Value,
+    keys: &CoreKeys,
+    previous: Option<&Built>,
+    cache: &mut UnmarkedCache,
+    bound: &Bindings,
+) -> Built {
+    let report = scan_vault_with(sync, &Namespace::BWSS, keys, &Organizations::None, &|_| true, cache, bound);
+    let list = ciphers(sync);
     let mut registry = Registry::default();
     let mut registry_ciphers = Vec::new();
     let mut registry_unreadable = false;
+    let mut skipped = Vec::new();
+    let mut newer = HashSet::new();
 
-    for cipher in list.iter().map(Borrow::borrow) {
-        let cid = cipher.get("id").and_then(Value::as_str).unwrap_or_default();
-        let key = cache_key(cipher);
-        if let (Some(p), Some(k)) = (previous, &key)
-            && p.unmarked.contains(k)
-        {
-            unmarked.insert(k.clone());
-            continue;
-        }
-        match scan(cipher, keys) {
-            Scan::Unmarked => unmarked.extend(key),
-            Scan::Marked(m) if m.item.id == REGISTRY_ID => match read_registry(cipher, keys) {
-                Ok(Some(r)) => {
+    for (cid, reason) in &report.skipped {
+        if *reason == SkipReason::ReservedId {
+            match list.iter().find(|c| cipher_id(c) == cid).map(|c| read_registry(c, keys)) {
+                Some(Ok(Some(r))) => {
                     registry.merge(&r);
-                    registry_ciphers.push(cid.to_owned());
-                }
-                Ok(None) => {
-                    tracing::warn!(cipher = cid, "{REGISTRY_ID} is reserved for the collection registry; skipped");
-                    skipped.push((cid.to_owned(), format!("{cid}: {REGISTRY_ID} is reserved")));
-                }
-                Err(why) => {
-                    tracing::warn!(cipher = cid, "the collection registry cannot be read: {why}");
-                    registry_unreadable = true;
-                    registry_ciphers.push(cid.to_owned());
-                }
-            },
-            Scan::Marked(m) => found.push(*m),
-            Scan::Uninspectable(why) => {
-                // Organization and blob items are never read: not worth a warning
-                // each (blobs are counted once per unlock).
-                if cipher.get("organizationId").is_some_and(|o| !o.is_null()) || is_blob(cipher) {
-                    tracing::debug!("{why}");
-                } else if first_report(("uninspectable", &key)) {
-                    tracing::warn!("{why}");
-                }
-                if cid.is_empty() {
+                    registry_ciphers.push(cid.clone());
                     continue;
                 }
-                if is_blob(cipher) && cipher.get("organizationId").is_none_or(Value::is_null) {
-                    blobs.insert(cid.to_owned());
-                }
-                if let Some(m) = held.get(cid) {
-                    found.push((*m).clone());
-                }
-                if let Some(p) = previous.filter(|p| p.registry_ciphers.iter().any(|c| c == cid)) {
-                    registry.merge(&p.registry);
+                Some(Err(why)) => {
+                    tracing::warn!(cipher = %cid, "the collection registry cannot be read: {why}");
                     registry_unreadable = true;
-                    registry_ciphers.push(cid.to_owned());
+                    registry_ciphers.push(cid.clone());
+                    continue;
                 }
+                _ => {}
             }
-            Scan::Skipped(why) => {
-                tracing::warn!("{why}");
-                skipped.push((cid.to_owned(), why));
-            }
+        }
+        if *reason == SkipReason::NewerFormat {
+            newer.insert(cid.as_str());
+        }
+        let features = report.unknown_features.iter().find(|(c, _)| c == cid).map_or(&[][..], |(_, f)| f.as_slice());
+        let why = format!("{cid}: {}", skip_text(*reason, features));
+        tracing::warn!("skipped: {why}");
+        skipped.push((cid.clone(), why));
+    }
+
+    let mut uninspectable = HashSet::new();
+    for (cid, why) in &report.uninspectable {
+        let text = uninspectable_text(*why);
+        // Organization items are never read: not worth a warning each.
+        if *why == Uninspectable::OrganizationNotRead {
+            tracing::debug!("{cid}: {text}");
+        } else if first_report(("uninspectable", cid, text)) {
+            tracing::warn!("{cid}: {text}");
+        }
+        if cid.is_empty() {
+            continue;
+        }
+        uninspectable.insert(cid.as_str());
+        if let Some(p) = previous.filter(|p| p.registry_ciphers.contains(cid)) {
+            registry.merge(&p.registry);
+            registry_unreadable = true;
+            registry_ciphers.push(cid.clone());
         }
     }
 
-    let (winners, duplicates) = resolve_duplicates(found);
-    for (id, losers) in &duplicates {
-        tracing::warn!(id = %id, losers = ?losers, "several items carry one bwss:id; the oldest is used");
+    for d in &report.duplicates {
+        tracing::warn!(id = %d.id, losers = ?d.left, bound = d.bound_kept, "several items carry one bwss:id; one is used");
+    }
+    let duplicates = report.duplicates.into_iter().map(|d| (d.id, d.left)).collect();
+    let served: HashSet<String> = report.items.iter().map(|m| m.cipher_id.clone()).collect();
+    let mut marked: HashMap<String, MarkedItem> =
+        report.items.into_iter().map(|m| (m.id.clone(), to_marked(m, keys))).collect();
+    for (id, m) in previous.map(|p| &p.marked).into_iter().flatten() {
+        if marked.contains_key(id) || m.cipher_id == QUEUED {
+            continue;
+        }
+        let ciphers = [Some(m.cipher_id.as_str()), bound.get(id).map(String::as_str)];
+        let cannot_read = ciphers.iter().flatten().any(|c| uninspectable.contains(c));
+        let needs_newer = ciphers.iter().flatten().any(|c| newer.contains(c));
+        if (report.held_ids.contains(id) || cannot_read) && !needs_newer {
+            marked.insert(id.clone(), m.clone());
+        }
     }
 
-    let mut items: Vec<ItemData> = winners.iter().map(|m| m.item.clone()).collect();
-    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut next: Bindings =
+        marked.iter().filter(|(_, m)| m.cipher_id != QUEUED).map(|(id, m)| (id.clone(), m.cipher_id.clone())).collect();
+    for (id, cid) in bound {
+        if !next.contains_key(id) && report.present.contains(cid) && !served.contains(cid) {
+            next.insert(id.clone(), cid.clone());
+        }
+    }
+    let shown: HashSet<&str> = marked.values().map(|m| m.cipher_id.as_str()).collect();
+    let held = report.present.iter().filter(|c| !c.is_empty() && !shown.contains(c.as_str())).cloned().collect();
+    let unmarked = list.iter().filter(|c| !report.present.contains(cipher_id(c))).filter_map(cache_key).collect();
 
-    let ciphers = winners.iter().map(|m| (m.item.id.clone(), m.cipher_id.clone())).collect();
+    let mut items: Vec<ItemData> = marked.values().map(|m| m.item.clone()).collect();
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    let ciphers = marked.iter().map(|(id, m)| (id.clone(), m.cipher_id.clone())).collect();
     Built {
-        snapshot: Snapshot { collections: collection_list(&registry, &items), items, ciphers, blobs },
-        marked: winners.into_iter().map(|m| (m.item.id.clone(), m)).collect(),
+        snapshot: Snapshot { collections: collection_list(&registry, &items), items, ciphers, held },
+        marked,
         registry,
         registry_ciphers,
         registry_unreadable,
         duplicates,
         skipped,
         unmarked,
+        bound: next,
     }
+}
+
+/// ADR 0019, no rollback below the cached base: a bound cipher that `sync`
+/// sends with an older `revisionDate` than `base` has keeps the base's copy.
+/// Returns the ids held back, sorted.
+fn hold_rollbacks(base: &Value, sync: &mut Value, bound: &Bindings) -> Vec<String> {
+    let old: HashMap<&str, &Value> = ciphers(base).iter().map(|c| (cipher_id(c), c)).collect();
+    let ids: HashMap<&str, &str> = bound.iter().map(|(id, cid)| (cid.as_str(), id.as_str())).collect();
+    let rev = |c: &Value| c.get("revisionDate").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let mut held = Vec::new();
+    for c in sync.get_mut("ciphers").and_then(Value::as_array_mut).into_iter().flatten() {
+        let cid = cipher_id(c).to_owned();
+        if let (Some(id), Some(was)) = (ids.get(cid.as_str()), old.get(cid.as_str()))
+            && is_rollback(&rev(was), &rev(c))
+        {
+            *c = (*was).clone();
+            held.push((*id).to_owned());
+        }
+    }
+    held.sort();
+    held
 }
 
 /// The collections shown: `login`, the registry's live entries and every
@@ -398,15 +559,13 @@ pub(super) fn registry_with_queue(registry: &Registry, queue: &[Op]) -> Registry
 }
 
 /// The winning marked cipher of every `bwss:id` in `list`, as its index.
-/// A winner that is a queued create has no server cipher and is left out.
-fn marked_positions<C: Borrow<Value>>(
-    list: &[C],
-    keys: &Keys,
-    unmarked: &HashSet<(String, String)>,
-) -> HashMap<String, usize> {
+/// A winner that is a queued create has no server cipher and is left out,
+/// and so is every cipher `built` did not serve: a duplicate it left out,
+/// a held one, one that needs a newer format (ADR 0019, ADR 0020).
+fn marked_positions<C: Borrow<Value>>(list: &[C], keys: &Keys, built: &Built) -> HashMap<String, usize> {
     let mut found = Vec::new();
     for c in list.iter().map(Borrow::borrow) {
-        if cache_key(c).is_some_and(|k| unmarked.contains(&k)) {
+        if cache_key(c).is_some_and(|k| built.unmarked.contains(&k)) || built.snapshot.held.contains(cipher_id(c)) {
             continue;
         }
         if let Scan::Marked(m) = scan(c, keys) {
@@ -428,13 +587,8 @@ fn marked_positions<C: Borrow<Value>>(
 }
 
 /// Index in `list` of the cipher that holds `id` on the server.
-pub(super) fn find_marked<C: Borrow<Value>>(
-    list: &[C],
-    id: &str,
-    keys: &Keys,
-    unmarked: &HashSet<(String, String)>,
-) -> Option<usize> {
-    marked_positions(list, keys, unmarked).get(id).copied()
+pub(super) fn find_marked<C: Borrow<Value>>(list: &[C], id: &str, keys: &Keys, built: &Built) -> Option<usize> {
+    marked_positions(list, keys, built).get(id).copied()
 }
 
 /// The ciphers with every queued op applied, so pending writes stay visible
@@ -445,7 +599,7 @@ pub(super) fn with_queue<'a>(
     queue: &[Op],
     keys: &Keys,
     folder: Option<&str>,
-    unmarked: &HashSet<(String, String)>,
+    built: &Built,
 ) -> Vec<Cow<'a, Value>> {
     let mut list: Vec<Cow<'a, Value>> = ciphers(sync).iter().map(Cow::Borrowed).collect();
     // Positions stay valid across patches, so one scan serves a run of them:
@@ -468,7 +622,7 @@ pub(super) fn with_queue<'a>(
                 Err(e) => tracing::warn!("a queued new item cannot be shown: {e}"),
             },
             Op::Patch(patch) => {
-                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, unmarked));
+                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, built));
                 let Some(&i) = map.get(&patch.id) else { continue };
                 let Some(current) = list.get(i) else { continue };
                 match apply(current, patch, keys) {
@@ -491,7 +645,7 @@ pub(super) fn with_queue<'a>(
                 }
             }
             Op::Delete { id, .. } => {
-                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, unmarked));
+                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, built));
                 if let Some(&i) = map.get(id) {
                     list.remove(i);
                     positions = None;
@@ -505,14 +659,29 @@ pub(super) fn with_queue<'a>(
     list
 }
 
-/// Builds the keyring from the cache with the queue applied.
-fn build_view(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>, previous: Option<&Built>) -> Built {
+/// The keys a build needs: bwss's own for the queued ops (until B5), the
+/// core's for the scan.
+pub(super) struct BuildKeys<'a> {
+    pub legacy: &'a Keys,
+    pub core: &'a CoreKeys,
+}
+
+/// Builds the keyring from the cache with the queue applied, on top of
+/// `previous`.
+fn build_view(
+    sync: &Value,
+    queue: &[Op],
+    keys: BuildKeys<'_>,
+    folder: Option<&str>,
+    previous: &Built,
+    cache: &mut UnmarkedCache,
+) -> Built {
     let mut built = if queue.is_empty() {
-        build(sync, keys, previous)
+        build(sync, keys.core, Some(previous), cache, &previous.bound)
     } else {
-        let none = HashSet::new();
-        let unmarked = previous.map_or(&none, |p| &p.unmarked);
-        build_list(&with_queue(sync, queue, keys, folder, unmarked), keys, previous)
+        let view: Vec<Value> =
+            with_queue(sync, queue, keys.legacy, folder, previous).into_iter().map(Cow::into_owned).collect();
+        build(&json!({ "ciphers": view }), keys.core, Some(previous), cache, &previous.bound)
     };
     if queue.iter().any(|op| matches!(op, Op::Registry { .. })) {
         // `built.registry` stays the server's: only what is shown changes.
@@ -523,16 +692,23 @@ fn build_view(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>, pre
 }
 
 /// Builds the keyring for a freshly loaded cache and queue.
-fn build_fresh(sync: &Value, queue: &[Op], keys: &Keys, folder: Option<&str>) -> Built {
-    let base = build(sync, keys, None);
+fn build_fresh(
+    sync: &Value,
+    queue: &[Op],
+    keys: BuildKeys<'_>,
+    folder: Option<&str>,
+    cache: &mut UnmarkedCache,
+    bound: &Bindings,
+) -> Built {
+    let base = build(sync, keys.core, None, cache, bound);
     if queue.is_empty() {
         return base;
     }
-    build_view(sync, queue, keys, folder, Some(&base))
+    build_view(sync, queue, keys, folder, &base, cache)
 }
 
 /// Id of the keyring folder: the folder named `name`, lowest id first.
-fn keyring_folder(sync: &Value, key: &SymmetricKey, name: &str) -> Option<String> {
+fn keyring_folder(sync: &Value, key: &CoreKey, name: &str) -> Option<String> {
     sync.get("folders")
         .and_then(Value::as_array)
         .into_iter()
@@ -627,7 +803,7 @@ fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<O
 }
 
 pub(super) struct Unlocked {
-    /// Bridge until B4-B6: bwss's own key type, from `core_keys`.
+    /// Bridge until B5-B6: bwss's own key type, from `core_keys`, for writes.
     pub(super) keys: Keys,
     /// The keys dybw-core opened.
     pub(super) core_keys: CoreKeys,
@@ -638,10 +814,14 @@ pub(super) struct Unlocked {
     revision: Option<String>,
     /// The keyring: `sync` with the queue applied.
     pub(super) built: Built,
+    /// The core's scan cache: the unmarked ciphers of the last build.
+    cache: UnmarkedCache,
     pub(super) keyring_folder: Option<String>,
     /// What `bwss status` reports about this unlock.
     notices: Vec<String>,
-    /// Bridge until B4-B6: a COSE user key, which bwss's own code cannot use.
+    /// Ids the server sent older than the cached copy, which is kept (ADR 0019).
+    rollbacks: Vec<String>,
+    /// Bridge until B5-B6: a COSE user key, which bwss's own write code cannot use.
     read_only: bool,
 }
 
@@ -668,6 +848,8 @@ pub(crate) struct Bitwarden {
     device: DeviceInfo,
     /// dybw-core's device state: the KDF pin, the security version, the user key id.
     storage: FileStorage,
+    /// The sealed `BINDINGS` file, written from the worker without awaiting.
+    bindings_path: PathBuf,
     acl_confirmed: PathBuf,
 }
 
@@ -766,6 +948,7 @@ impl Bitwarden {
                 client_version: env!("CARGO_PKG_VERSION").into(),
             },
             storage: FileStorage::new(paths, profile),
+            bindings_path: paths.tool_state.join("core").join(BINDINGS),
             acl_confirmed: paths.acl_confirmed(),
         })
     }
@@ -953,8 +1136,63 @@ impl Bitwarden {
     }
 
     /// Rebuilds the keyring after the cache or the queue changed.
-    pub(super) fn rebuild(state: &mut Unlocked, queue: &[Op]) {
-        state.built = build_view(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), Some(&state.built));
+    pub(super) fn rebuild(&self, state: &mut Unlocked, queue: &[Op]) {
+        let keys = BuildKeys { legacy: &state.keys, core: &state.core_keys };
+        let built =
+            build_view(&state.sync, queue, keys, state.keyring_folder.as_deref(), &state.built, &mut state.cache);
+        if built.bound != state.built.bound {
+            self.save_bindings(&state.core_keys.user, &built.bound);
+        }
+        state.built = built;
+    }
+
+    /// The key the bindings are sealed with, as the queue is (design §8.1).
+    fn bindings_key(user: &CoreKey) -> CoreKey {
+        user.derive_bwss("queue")
+    }
+
+    /// Keeps the bindings, sealed, for the next unlock. A failure is logged:
+    /// the next build writes them again.
+    fn save_bindings(&self, user: &CoreKey, bound: &Bindings) {
+        // Strings only: it always serializes.
+        let json = Zeroizing::new(serde_json::to_vec(bound).unwrap_or_default());
+        let saved = Self::bindings_key(user)
+            .encrypt(&json, &OsRandom)
+            .map_err(|e| e.to_string())
+            .and_then(|sealed| write_private(&self.bindings_path, sealed.as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = saved {
+            tracing::warn!("could not keep which cipher each item is read from: {e}");
+        }
+    }
+
+    /// The bindings the last build kept; none when there is no file or it
+    /// does not open (§7 then decides, as on a new device).
+    fn load_bindings(&self, user: &CoreKey) -> Bindings {
+        let opened = match std::fs::read(&self.bindings_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Bindings::new(),
+            Err(e) => Err(e.to_string()),
+            Ok(raw) => String::from_utf8(raw)
+                .map_err(|e| e.to_string())
+                .and_then(|s| Self::bindings_key(user).decrypt(s.trim()).map_err(|e| e.to_string()))
+                .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string())),
+        };
+        opened.unwrap_or_else(|e| {
+            tracing::warn!("the saved item bindings cannot be read ({e}); duplicates are picked afresh");
+            Bindings::new()
+        })
+    }
+
+    /// Whether `bwss sync --accept-rollback` asked the next sync to take the
+    /// server's versions.
+    async fn accepts_rollback(&self) -> bool {
+        self.storage.load(ACCEPT_ROLLBACK).await.ok().flatten().is_some()
+    }
+
+    /// The accepted sync happened: the next one checks again.
+    async fn rollback_accepted(&self) {
+        if let Err(e) = self.storage.remove(ACCEPT_ROLLBACK).await {
+            tracing::warn!("could not clear the accepted rollback: {e}");
+        }
     }
 
     /// Records what the server did in the cache, so later edits build on it.
@@ -975,7 +1213,7 @@ impl Bitwarden {
         // Keep the offline copy current, so that what was written is still
         // there when the next unlock happens without a network.
         self.save_cache(state);
-        Self::rebuild(state, queue);
+        self.rebuild(state, queue);
     }
 
     /// Keeps the queue on disk and shows it.
@@ -984,7 +1222,7 @@ impl Bitwarden {
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
         // Logged in `save_queue`; the change is already in memory.
         let _ = self.save_queue(queue, &state.keys.user);
-        Self::rebuild(state, queue);
+        self.rebuild(state, queue);
         Ok(())
     }
 }
@@ -1012,21 +1250,43 @@ impl Bitwarden {
             tracing::warn!("{COSE_READ_ONLY}");
             notices.push(COSE_READ_ONLY.into());
         }
-        let profile::Unlocked { keys: core_keys, sync, .. } = unlocked;
+        let profile::Unlocked { keys: core_keys, mut sync, .. } = unlocked;
+        let bound = self.load_bindings(&core_keys.user);
+        let accept = !from_cache && self.accepts_rollback().await;
+        // The offline copy is the base: the server may not go below it.
+        let base = if from_cache || accept { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
+        let rollbacks = base.map(|base| hold_rollbacks(&base.sync, &mut sync, &bound)).unwrap_or_default();
+        report_rollbacks(&rollbacks);
 
         let mut queue = self.queue.lock().await;
         // A COSE account's queue is left as it is, for B6 to open.
         *queue = if read_only { Vec::new() } else { load_queue(&self.queue_path, &keys.user, &self.queue_migrated)? };
-        let folder = keyring_folder(&sync, &keys.user, &self.root);
-        let built = build_fresh(&sync, &queue, &keys, folder.as_deref());
-        if !built.snapshot.blobs.is_empty() {
-            tracing::warn!(
-                "{} Bitwarden item(s) use the newer encryption format and cannot be read",
-                built.snapshot.blobs.len()
-            );
+        let folder = keyring_folder(&sync, &core_keys.user, &self.root);
+        let mut cache = UnmarkedCache::default();
+        let built = build_fresh(
+            &sync,
+            &queue,
+            BuildKeys { legacy: &keys, core: &core_keys },
+            folder.as_deref(),
+            &mut cache,
+            &bound,
+        );
+        if built.bound != bound {
+            self.save_bindings(&core_keys.user, &built.bound);
         }
-        let state =
-            Unlocked { keys, core_keys, kdf, sync, revision, built, keyring_folder: folder, notices, read_only };
+        let state = Unlocked {
+            keys,
+            core_keys,
+            kdf,
+            sync,
+            revision,
+            built,
+            cache,
+            keyring_folder: folder,
+            notices,
+            rollbacks,
+            read_only,
+        };
         if !from_cache {
             self.save_cache(&state);
         }
@@ -1040,6 +1300,9 @@ impl Bitwarden {
         *guard = Some(state);
         drop(guard);
         drop(queue);
+        if accept {
+            self.rollback_accepted().await;
+        }
 
         if !from_cache && let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
@@ -1067,7 +1330,9 @@ impl Bitwarden {
         // Before the first `/sync` of this session (offline unlock), writes
         // cannot name their owner: sync first, flush after.
         let synced = self.can_write().await;
-        if synced {
+        let accept = self.accepts_rollback().await;
+        // An accepted rollback always pulls, so what was held back is taken.
+        if synced && !accept {
             if let Err(e) = self.flush_queue().await {
                 tracing::info!("queued changes stay queued: {e}");
             }
@@ -1078,16 +1343,22 @@ impl Bitwarden {
                 return Ok((state.built.snapshot != before).then(|| state.built.snapshot.clone()));
             }
         }
-        let (revision, sync) = self.fetch().await.map_err(map_api)?;
+        let (revision, mut sync) = self.fetch().await.map_err(map_api)?;
         {
             let queue = self.queue.lock().await;
             let mut guard = self.state.lock().await;
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
-            state.keyring_folder = keyring_folder(&sync, &state.keys.user, &self.root);
+            state.rollbacks =
+                if accept { Vec::new() } else { hold_rollbacks(&state.sync, &mut sync, &state.built.bound) };
+            report_rollbacks(&state.rollbacks);
+            state.keyring_folder = keyring_folder(&sync, &state.core_keys.user, &self.root);
             state.sync = sync;
             state.revision = revision;
             self.save_cache(state);
-            Self::rebuild(state, &queue);
+            self.rebuild(state, &queue);
+        }
+        if accept {
+            self.rollback_accepted().await;
         }
         if let Err(e) = self.flush_queue().await {
             tracing::info!("queued changes stay queued: {e}");
@@ -1150,12 +1421,28 @@ impl Bitwarden {
             self.email, urls.identity, self.root
         );
         if let Some(state) = self.state.lock().await.as_ref() {
-            for line in status_lines(&state.built).into_iter().chain(state.notices.iter().cloned()) {
+            let rollbacks = (!state.rollbacks.is_empty()).then(|| rollback_text(&state.rollbacks));
+            for line in status_lines(&state.built).into_iter().chain(rollbacks).chain(state.notices.iter().cloned()) {
                 out.push('\n');
                 out.push_str(&line);
             }
         }
         out
+    }
+}
+
+/// What `bwss status` says about items the server sent older (ADR 0019).
+fn rollback_text(ids: &[String]) -> String {
+    format!(
+        "older on the server than the copy this device has, which is kept: {}; `bwss sync --accept-rollback` takes \
+         the server's versions",
+        ids.join(", ")
+    )
+}
+
+fn report_rollbacks(ids: &[String]) {
+    if !ids.is_empty() && first_report(("rollback", ids)) {
+        tracing::warn!("{}", rollback_text(ids));
     }
 }
 
@@ -1230,6 +1517,32 @@ mod tests {
     fn keys() -> Keys {
         let user = SymmetricKey::generate();
         Keys { mark: user.derive("value-mark"), user }
+    }
+
+    /// The core's keys for the same user key.
+    fn core(k: &Keys) -> CoreKeys {
+        use dybw_core::crypto::{MarkScheme, Marker};
+        let user = CoreKey::from_bytes(&k.user.to_bytes()).unwrap();
+        CoreKeys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: BTreeMap::new(), security_version: 0 }
+    }
+
+    /// `super::build` with a fresh scan cache, bound as `previous` was.
+    fn build(sync: &Value, k: &Keys, previous: Option<&Built>) -> Built {
+        let bound = previous.map(|p| p.bound.clone()).unwrap_or_default();
+        super::build(sync, &core(k), previous, &mut UnmarkedCache::default(), &bound)
+    }
+
+    fn build_list(view: &[Cow<'_, Value>], k: &Keys, previous: Option<&Built>) -> Built {
+        build(&json!({ "ciphers": view }), k, previous)
+    }
+
+    fn build_fresh(sync: &Value, queue: &[Op], k: &Keys, folder: Option<&str>) -> Built {
+        let keys = BuildKeys { legacy: k, core: &core(k) };
+        super::build_fresh(sync, queue, keys, folder, &mut UnmarkedCache::default(), &Bindings::new())
+    }
+
+    fn read_registry(cipher: &Value, k: &Keys) -> Result<Option<Registry>, RegistryError> {
+        super::read_registry(cipher, &core(k))
     }
 
     fn fields(k: &Keys, fields: &[(&str, &str)]) -> Value {
@@ -1317,14 +1630,16 @@ mod tests {
 
     #[test]
     fn unchanged_unmarked_ciphers_are_not_rescanned() {
-        let k = keys();
-        let first = build(&sync(vec![login(&k, "c9", &[("other", "x")])]), &k, None);
+        let (k, mut cache) = (keys(), UnmarkedCache::default());
+        let none = Bindings::new();
+        let first = super::build(&sync(vec![login(&k, "c9", &[("other", "x")])]), &core(&k), None, &mut cache, &none);
         let cached = ("c9".to_owned(), format!("\"{REV}\""));
         assert!(first.unmarked.contains(&cached));
         let mut garbled = login(&k, "c9", &[]);
         garbled["fields"] = json!([{ "type": 0, "name": "2.bad|bad|bad", "value": "2.bad|bad|bad" }]);
         let s = sync(vec![garbled]);
-        let again = build(&s, &k, Some(&first));
+        // The core's cache lives with the keyring: the same cipher is not opened again.
+        let again = super::build(&s, &core(&k), Some(&first), &mut cache, &none);
         assert!(again.unmarked.contains(&cached));
         // Rescanned, the same cipher cannot be read.
         assert!(!build(&s, &k, None).unmarked.contains(&cached));
@@ -1391,7 +1706,7 @@ mod tests {
             login(&k, "c3", &[("bwss:id", "c")]),
         ]);
         let queue = [Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) }];
-        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        let view = with_queue(&s, &queue, &k, None, &Built::default());
         let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
         assert_eq!(ids, ["c1", "c3"]);
         assert!(view.iter().all(|c| matches!(c, Cow::Borrowed(_))), "nothing was copied");
@@ -1446,8 +1761,8 @@ mod tests {
             { "id": "f1", "name": k.user.encrypt_str("secret-service") },
             { "id": "f0", "name": k.user.encrypt_str("other") },
         ]);
-        assert_eq!(keyring_folder(&s, &k.user, "secret-service").as_deref(), Some("f1"));
-        assert_eq!(keyring_folder(&s, &k.user, "nope"), None);
+        assert_eq!(keyring_folder(&s, &core(&k).user, "secret-service").as_deref(), Some("f1"));
+        assert_eq!(keyring_folder(&s, &core(&k).user, "nope"), None);
     }
 
     #[test]
@@ -1579,6 +1894,52 @@ mod tests {
     }
 
     #[test]
+    fn skipped_and_uninspectable_items_say_why() {
+        use dybw_core::vault::SkipReason as S;
+        use dybw_core::vault::Uninspectable as U;
+        let features = ["bwss:future".to_owned(), "dybw:x".to_owned()];
+        for (reason, text) in [
+            (S::WrongType, "its item type is not supported"),
+            (S::EncodingOnUserSource, "bwss:encoding=base64 on a value bwss does not own"),
+            (S::UnknownLocation, "unknown bwss:location"),
+            (S::UnknownEncoding, "unknown bwss:encoding"),
+            (S::InvalidId, "its bwss:id is not valid"),
+            (S::ReservedId, "_collections is reserved for the collection registry"),
+            (S::ViewPasswordHidden, "its password is hidden from this account"),
+            (S::InvalidBase64, "value is not valid base64"),
+            (
+                S::NewerFormat,
+                "it needs what this bwss does not implement (bwss:future, dybw:x): it is not used until bwss is updated",
+            ),
+        ] {
+            assert_eq!(skip_text(reason, &features), text);
+        }
+        let all = [
+            U::OrganizationNotRead,
+            U::OrganizationKeyMissing,
+            U::ItemKey,
+            U::FieldNames,
+            U::Marker,
+            U::Value,
+            U::NewerFormat,
+            U::Blob,
+            U::TooLarge,
+        ];
+        let texts: HashSet<&str> = all.into_iter().map(uninspectable_text).collect();
+        assert_eq!(texts.len(), all.len(), "one text each");
+    }
+
+    #[test]
+    fn a_value_in_the_notes_and_a_session_collection_are_read_as_before() {
+        let k = keys();
+        let c = note(&k, "c1", &[("bwss:id", "n"), ("bwss:location", "notes"), ("bwss:collection", " Session ")], "v");
+        let b = build(&sync(vec![c]), &k, None);
+        assert_eq!(b.marked["n"].source, ValueSource::BwssNotes);
+        assert_eq!(&*b.marked["n"].item.secret, b"v");
+        assert_eq!(b.marked["n"].item.collection, LOGIN_COLLECTION, "session is memory only");
+    }
+
+    #[test]
     fn registry_errors_say_why() {
         for (why, text) in [
             (RegistryError::Key, "its item key does not decrypt"),
@@ -1698,7 +2059,7 @@ mod tests {
             Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) },
             label_patch("c", "c1"),
         ];
-        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        let view = with_queue(&s, &queue, &k, None, &Built::default());
         let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
         assert_eq!(ids, ["c1", "c3", ""], "b is gone, d is queued, nothing else moved");
         assert_eq!(
@@ -1722,9 +2083,10 @@ mod tests {
         // A field value over the limit of a Bitwarden custom field.
         big.attributes.insert("blob".into(), "x".repeat(5_000));
         let queue = [Op::Create { id: "n".into(), collection: "login".into(), item: big }];
-        let view = with_queue(&s, &queue, &k, None, &HashSet::new());
+        let view = with_queue(&s, &queue, &k, None, &Built::default());
         assert_eq!(view.len(), 1);
-        assert_eq!(view_labels(&view, &k), [("a".to_owned(), "name c1".to_owned())]);
+        // ADR 0015: without bwss:label the label is the id, not the item name.
+        assert_eq!(view_labels(&view, &k), [("a".to_owned(), "a".to_owned())]);
     }
 
     #[test]

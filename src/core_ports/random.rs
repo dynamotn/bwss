@@ -1,6 +1,5 @@
 use dybw_core::ports::{PortError, Random};
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the core encrypts with it from B5 (writes)"))]
 pub struct OsRandom;
 
 impl Random for OsRandom {

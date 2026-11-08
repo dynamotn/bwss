@@ -66,9 +66,14 @@ fn perf_budgets() {
     });
     assert_eq!(marked, 10_000);
     let sync = serde_json::json!({ "ciphers": ciphers });
-    let built = time("build-10000-items", 5_000, || build(&sync, &keys, None));
+    let user = dybw_core::crypto::SymmetricKey::from_bytes(&keys.user.to_bytes()).unwrap();
+    let marker = dybw_core::crypto::Marker::new(&user, dybw_core::crypto::MarkScheme::Bwss);
+    let core = dybw_core::vault::Keys { user, marker, orgs: Default::default(), security_version: 0 };
+    let mut cache = dybw_core::vault::UnmarkedCache::default();
+    let none = Default::default();
+    let built = time("build-10000-items", 5_000, || build(&sync, &core, None, &mut cache, &none));
     assert_eq!(built.snapshot.items.len(), 10_000);
-    time("rescan-10000-unchanged", 5_000, || build(&sync, &keys, Some(&built)));
+    time("rescan-10000-unchanged", 5_000, || build(&sync, &core, Some(&built), &mut cache, &built.bound));
     let decoded = built.snapshot.items;
 
     let mut k = Keyring::new(None, None);

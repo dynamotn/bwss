@@ -233,10 +233,6 @@ pub(super) fn status_lines(built: &Built) -> Vec<String> {
     for (_, why) in &built.skipped {
         lines.push(format!("skipped: {why}"));
     }
-    let blobs = built.snapshot.blobs.len();
-    if blobs > 0 {
-        lines.push(format!("{blobs} Bitwarden item(s) use the newer encryption format and cannot be read"));
-    }
     if built.registry_unreadable {
         lines.push(REGISTRY_UNREADABLE.to_owned());
     }
@@ -318,7 +314,7 @@ enum Target {
 /// `cipher_id` is the cipher the op was read from, when the op records it.
 fn locate(state: &Unlocked, id: &str, cipher_id: Option<&str>) -> Target {
     let list = ciphers(&state.sync);
-    if let Some(cipher) = find_marked(list, id, &state.keys, &state.built.unmarked).and_then(|i| list.get(i)) {
+    if let Some(cipher) = find_marked(list, id, &state.keys, &state.built).and_then(|i| list.get(i)) {
         return Target::Found(cipher.clone());
     }
     // An item held as last read (§3.4) is still there.
@@ -430,9 +426,8 @@ impl Bitwarden {
 
     async fn run_create(&self, item: &ItemData) -> Result<Effect, Failure> {
         // Accepted before (for example just before a lock): never twice.
-        let exists = self
-            .with_state(|s| Ok(find_marked(ciphers(&s.sync), &item.id, &s.keys, &s.built.unmarked).is_some()))
-            .await?;
+        let exists =
+            self.with_state(|s| Ok(find_marked(ciphers(&s.sync), &item.id, &s.keys, &s.built).is_some())).await?;
         if exists {
             return Ok(Effect::Nothing);
         }
@@ -560,7 +555,7 @@ impl Bitwarden {
                     let Some(note) = note.filter(live) else { return Ok(RegistryPlan::Create) };
                     let cid = id_of(&note).to_owned();
                     let (mark, revision, source, mut merged) =
-                        match (scan(&note, &state.keys), read_registry(&note, &state.keys)) {
+                        match (scan(&note, &state.keys), read_registry(&note, &state.core_keys)) {
                             (Scan::Marked(m), Ok(Some(r))) if m.item.id == REGISTRY_ID => {
                                 (m.mark, m.revision_date, m.source, r)
                             }
@@ -709,7 +704,7 @@ impl Bitwarden {
             undo.apply(queue);
             return Err(BackendError::Unavailable(format!("the change cannot be queued on disk: {e}")));
         }
-        Self::rebuild(state, queue);
+        self.rebuild(state, queue);
         Ok(())
     }
 
@@ -927,10 +922,8 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
     match op {
         Op::Create { item, .. } => new_note(item, None, &state.keys).map(|_| ()).or_else(queueable),
         Op::Patch(p) => {
-            let list =
-                with_queue(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), &state.built.unmarked);
-            let Some(cipher) = find_marked(&list, &p.id, &state.keys, &state.built.unmarked).and_then(|i| list.get(i))
-            else {
+            let list = with_queue(&state.sync, queue, &state.keys, state.keyring_folder.as_deref(), &state.built);
+            let Some(cipher) = find_marked(&list, &p.id, &state.keys, &state.built).and_then(|i| list.get(i)) else {
                 return Ok(());
             };
             // Only the sizes are checked here: compare the value against the
@@ -953,7 +946,7 @@ fn check_queueable(state: &Unlocked, queue: &[Op], op: &Op) -> Result<(), Backen
 mod tests {
     use super::*;
 
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap};
 
     use zeroize::Zeroizing;
 
@@ -1293,7 +1286,7 @@ mod tests {
             registry_unreadable: true,
             duplicates: vec![("a".into(), vec!["c2".into(), "c3".into()])],
             skipped: vec![("c4".into(), "c4: item type 3 is not supported".into())],
-            unmarked: HashSet::new(),
+            ..Built::default()
         };
         assert_eq!(
             status_lines(&built),

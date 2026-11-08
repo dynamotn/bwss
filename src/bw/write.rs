@@ -11,8 +11,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto::{CryptoError, SymmetricKey};
 use super::fields::{
-    F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LOCATION, F_PASSWORD, Location,
-    PREFIX, field_names,
+    F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND, F_LABEL, F_LOCATION, F_PASSWORD,
+    Location, PREFIX, field_names,
 };
 use super::items::{MAX_NOTES_ENC, MAX_PASSWORD_ENC, RESPONSE_ONLY, format_date, item_key};
 use super::scan::{Keys, Scan, ValueSource, normalize_collection, scan};
@@ -452,6 +452,10 @@ pub fn new_note(item: &ItemData, folder_id: Option<&str>, keys: &Keys) -> Result
     }
     if normalize_collection(&item.collection) != LOGIN_COLLECTION {
         fields.set(F_COLLECTION, &item.collection, false);
+    }
+    // ADR 0015: a label is read from `bwss:label`, else it is the id.
+    if !item.label.is_empty() && item.label != item.id {
+        fields.set(F_LABEL, &item.label, false);
     }
     if item.content_type != "text/plain" {
         fields.set(F_CONTENT_TYPE, &item.content_type, false);
@@ -1134,7 +1138,7 @@ mod tests {
         assert!(!body.contains_key("lastKnownRevisionDate"));
         assert_eq!(
             names(&body, &k.user),
-            ["bwss:id", "bwss:password", "bwss:attr:service", "bwss:acl", "bwss:created"]
+            ["bwss:id", "bwss:password", "bwss:attr:service", "bwss:label", "bwss:acl", "bwss:created"]
         );
         assert_eq!(field(&body, &k.user, "bwss:id"), Some(("abc123".into(), 0)));
         assert_eq!(field(&body, &k.user, "bwss:password"), Some(("s".into(), 1)));
@@ -1162,6 +1166,7 @@ mod tests {
                 "bwss:encoding",
                 "bwss:attr:service",
                 "bwss:collection",
+                "bwss:label",
                 "bwss:content-type",
                 "bwss:created"
             ]

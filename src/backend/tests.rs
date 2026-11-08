@@ -641,7 +641,7 @@ async fn a_change_that_cannot_be_kept_on_disk_is_refused() {
         "{result:?}"
     );
     assert_eq!(v.queued().await, 0, "a change not on disk is not kept in memory either");
-    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+    assert_eq!(v.item_offline("gh").await.label, "gh");
     assert!(!queue.exists());
 }
 
@@ -857,7 +857,7 @@ async fn status_lists_duplicates() {
     let v = vault(vec![hand_marked(&k, "c1", "gh"), clone, twin], k).await;
     let status = v.backend.describe().await;
     assert!(status.contains("duplicate id gh: 1 items ignored"), "{status}");
-    assert!(status.contains("possible duplicates: GitHub (gh), GitHub (twin)"), "{status}");
+    assert!(status.contains("possible duplicates: gh (gh), twin (twin)"), "{status}");
 }
 
 #[tokio::test]
@@ -1115,7 +1115,7 @@ async fn a_server_that_refuses_a_write_is_not_asked_again() {
         assert!(matches!(&err, BackendError::Rejected(m) if m.contains(&shown)), "{err}");
         assert_eq!(v.queue_sizes().await, (0, 0), "{status}");
         assert!(!v.names("c1").iter().any(|n| n == "bwss:label"), "{status}: nothing was written");
-        assert_eq!(v.item_offline("gh").await.label, "GitHub", "{status}: the refused change is not shown");
+        assert_eq!(v.item_offline("gh").await.label, "gh", "{status}: the refused change is not shown");
     }
 }
 
@@ -1143,7 +1143,7 @@ async fn a_refused_write_shows_the_server_copy_again() {
     v.fake.fault("GET", "/api/ciphers/c1", 500, 1);
     let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
     assert!(matches!(v.backend.put_item(&item).await, Err(BackendError::Rejected(_))));
-    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+    assert_eq!(v.item_offline("gh").await.label, "gh");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1350,10 +1350,11 @@ async fn blob_ciphers_are_listed_after_an_unlock_and_counted_in_the_status() {
     v.backend.unlock(PASSWORD).await.unwrap();
     let snap = v.snapshot().await;
     assert!(snap.items.is_empty());
-    assert_eq!(snap.blobs.into_iter().collect::<Vec<_>>(), ["c1"]);
+    // B4: the core reads blobs; one that does not open is held like any
+    // uninspectable cipher, and the old blob count left the status.
+    assert_eq!(snap.held.into_iter().collect::<Vec<_>>(), ["c1"]);
     let status = v.backend.describe().await;
-    assert!(status.contains("1 Bitwarden item(s) use the newer encryption format"), "{status}");
-    assert!(!status.contains("c1"), "the count only");
+    assert!(!status.contains("newer encryption format") && !status.contains("c1"), "{status}");
 }
 
 #[tokio::test]
@@ -1391,7 +1392,7 @@ async fn a_queued_write_the_server_refuses_is_dropped_and_the_view_goes_back() {
 
     // The vault did not change, but what is shown did: the change is gone.
     let shown = v.backend.refresh().await.unwrap().expect("the view changed");
-    assert_eq!(shown.items[0].label, "GitHub");
+    assert_eq!(shown.items[0].label, "gh");
     assert_eq!(v.queue_sizes().await, (0, 0));
     assert_eq!(v.fake.count("PUT", "/api/ciphers/c1") - puts, 1, "refused once, not sent again");
     assert!(!v.names("c1").iter().any(|n| n == "bwss:label"));
@@ -1691,7 +1692,7 @@ async fn status_lists_items_that_are_not_supported() {
     card["type"] = json!(3);
     let v = vault(vec![hand_marked(&k, "c1", "gh"), card], k).await;
     let status = v.backend.describe().await;
-    assert!(status.contains("\nskipped: c4: item type 3 is not supported"), "{status}");
+    assert!(status.contains("\nskipped: c4: its item type is not supported"), "{status}");
 }
 
 #[tokio::test]
@@ -1746,7 +1747,7 @@ async fn a_server_answer_without_an_id_is_not_recorded() {
     v.backend.put_item(&item).await.unwrap();
     let cached = v.backend.state.lock().await.as_ref().unwrap().sync["ciphers"].as_array().unwrap().len();
     assert_eq!(cached, 1, "nothing was added to the cached vault");
-    assert_eq!(v.item_offline("gh").await.label, "GitHub");
+    assert_eq!(v.item_offline("gh").await.label, "gh");
 }
 
 #[tokio::test]
@@ -2123,15 +2124,31 @@ fn cose_v2() -> (Value, String) {
 
 #[tokio::test]
 async fn a_cose_v2_account_unlocks() {
-    let (sync, password) = cose_v2();
+    use base64::Engine as _;
+    let (mut sync, password) = cose_v2();
+    // B4: an item under the COSE user key is read through the core.
+    let account: Value = serde_json::from_str(include_str!("../../tests/fixtures/accounts/cose-v2.json")).unwrap();
+    let raw = base64::engine::general_purpose::STANDARD.decode(account["userKey"].as_str().unwrap()).unwrap();
+    let user = dybw_core::crypto::SymmetricKey::from_bytes(&raw).unwrap();
+    let enc = |s: &str| user.encrypt_str(s, &crate::core_ports::random::OsRandom).unwrap();
+    sync["ciphers"] = json!([{
+        "id": "c1", "type": 1, "organizationId": null, "revisionDate": REV, "creationDate": REV, "deletedDate": null,
+        "name": enc("Cose login"), "notes": null,
+        "login": { "username": null, "password": enc("cose pw"), "uris": null },
+        "fields": [{ "type": 0, "name": enc("bwss:id"), "value": enc("cose") }],
+    }]);
     let (fake, config, creds, paths, dir) = serve(sync);
     let b = Bitwarden::new(&config, creds, &paths).unwrap();
-    assert!(b.unlock(&password).await.unwrap().items.is_empty());
+    let snap = b.unlock(&password).await.unwrap();
+    assert_eq!(
+        snap.items.iter().map(|i| (i.id.as_str(), &**i.secret)).collect::<Vec<_>>(),
+        [("cose", &b"cose pw"[..])]
+    );
     assert_eq!(fake.count("POST", "/identity/accounts/prelogin"), 0, "source 1 needs no prelogin");
     let core = dir.path().join("tool-state/core");
     assert_eq!(std::fs::read_to_string(core.join("security-version")).unwrap(), "2");
     assert!(core.join("user-key-id").exists());
-    // Until the core builds the keyring (B4) and writes (B5), nothing is written to it.
+    // Until the core writes (B5), nothing is written to it.
     let err = b.put_item(&new_item("n1", "login")).await.unwrap_err();
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("COSE")), "{err}");
     assert!(b.create_collection("Work").await.is_err());
@@ -2268,4 +2285,235 @@ async fn a_write_racing_a_cose_unlock_is_refused() {
             assert_eq!(b.queue.lock().await.len(), 0, "nothing queued under it either");
         })
         .await;
+}
+
+/// A personal blob cipher (ADR 0021) under `k`: a login whose whole item is
+/// sealed in `data`, marked with `fields`.
+fn blob(k: &SymmetricKey, cid: &str, fields: &[(&str, &str)], password: &str) -> Value {
+    use base64::Engine as _;
+    use dybw_core::crypto::{Cbor, EnvelopeNamespace, SymmetricKey as CoreKey, seal_envelope};
+    let rng = crate::core_ports::random::OsRandom;
+    let t = Cbor::text;
+    let fields = fields.iter().map(|(n, v)| Cbor::Map(vec![(t("name"), t(n)), (t("value"), t(v))])).collect();
+    let content = Cbor::Map(vec![
+        (t("name"), t("Blob")),
+        (t("notes"), Cbor::Null),
+        (
+            t("typeData"),
+            Cbor::Map(vec![(t("type"), t("login")), (t("username"), t("me")), (t("password"), t(password))]),
+        ),
+        (t("fields"), Cbor::Array(fields)),
+    ]);
+    let sealed = Cbor::Map(vec![(t("version"), t("1")), (t("content"), content)]);
+    let user = CoreKey::from_bytes(&k.to_bytes()).unwrap();
+    let item = CoreKey::generate(&rng).unwrap();
+    let (envelope, cek) = seal_envelope(&sealed, EnvelopeNamespace::VaultItem, &rng).unwrap();
+    let data = json!({
+        "format_version": 1,
+        "wrapped_cek": item.encrypt(&CoreKey::Cose(cek).to_bytes(), &rng).unwrap(),
+        "envelope": base64::engine::general_purpose::STANDARD.encode(envelope),
+    });
+    json!({
+        "id": cid, "type": 1, "organizationId": null, "folderId": null, "revisionDate": REV, "creationDate": REV,
+        "deletedDate": null, "name": null, "notes": null, "login": null, "fields": null, "passwordHistory": null,
+        "key": user.encrypt(&item.to_bytes(), &rng).unwrap(), "data": data.to_string(),
+    })
+}
+
+#[tokio::test]
+async fn blob_items_are_served() {
+    let k = SymmetricKey::generate();
+    let marked = blob(&k, "c1", &[("bwss:id", "b"), ("bwss:attr:service", "blobby")], "sealed pw");
+    let unmarked = blob(&k, "c2", &[("other", "x")], "never read");
+    let v = vault(vec![marked, unmarked], k).await;
+    let item = v.item("b").await;
+    assert_eq!(&*item.secret, b"sealed pw");
+    assert_eq!(item.attributes["service"], "blobby");
+    assert_eq!(item.attributes["bwss:name"], "Blob", "the name comes from inside the blob");
+    let snap = v.snapshot().await;
+    assert_eq!(snap.items.len(), 1);
+    assert!(snap.held.is_empty(), "{:?}", snap.held);
+    assert!(!v.backend.describe().await.contains("newer encryption format"));
+}
+
+#[tokio::test]
+async fn a_held_item_keeps_its_last_value() {
+    let v = github().await;
+    assert_eq!(&*v.item("gh").await.secret, b"pw");
+    // Another client gives it a value source this bwss cannot read: skipped,
+    // and the id it holds keeps serving what was read last.
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| {
+        c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("bwss:location"),
+            "value": k.encrypt_str("somewhere-new") }));
+        c["login"]["password"] = json!(k.encrypt_str("changed"));
+    });
+    let snap = v.snapshot().await;
+    assert_eq!(snap.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["gh"], "never deleted while held");
+    assert_eq!(&*v.item("gh").await.secret, b"pw", "the last good value");
+    assert!(v.backend.describe().await.contains("skipped: c1: unknown bwss:location"));
+    // The binding stays on the held cipher.
+    assert_eq!(snap.ciphers["gh"], "c1");
+}
+
+#[tokio::test]
+async fn a_newer_format_item_is_not_served_and_is_listed() {
+    let v = github().await;
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| {
+        c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("dybw:requires"),
+            "value": k.encrypt_str("bwss:future\nother:thing") }));
+    });
+    let snap = v.snapshot().await;
+    assert!(snap.items.is_empty(), "ADR 0020: not served, not even as last read");
+    assert_eq!(snap.held.iter().collect::<Vec<_>>(), ["c1"], "not deleted: the locked index keeps it");
+    let status = v.backend.describe().await;
+    assert!(status.contains("skipped: c1: it needs what this bwss does not implement (bwss:future)"), "{status}");
+    // After a restart it is still not served.
+    v.backend.lock().await;
+    assert!(v.backend.unlock(PASSWORD).await.unwrap().items.is_empty());
+}
+
+#[tokio::test]
+async fn label_falls_back_to_the_id() {
+    let k = SymmetricKey::generate();
+    let mut labelled = hand_marked(&k, "c2", "lab");
+    labelled["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("bwss:label"),
+        "value": k.encrypt_str("My label") }));
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), labelled], k).await;
+    // ADR 0015: the item name ("GitHub") is no label.
+    assert_eq!(v.item("gh").await.label, "gh");
+    assert_eq!(v.item("lab").await.label, "My label");
+    // Derived attributes are still shown until B7 turns them off by default.
+    assert_eq!(v.item("gh").await.attributes["bwss:name"], "GitHub");
+}
+
+/// The fake's copy of `cid` replaced by `cipher` as it was, as a server
+/// restored from a backup sends it.
+fn roll_back(v: &Vault, cid: &str, cipher: Value) {
+    v.fake.with(|s| {
+        s.rev += 1;
+        *s.find(cid).unwrap() = cipher;
+    });
+}
+
+#[tokio::test]
+async fn a_rolled_back_item_keeps_its_cached_value() {
+    let v = github().await;
+    let old = v.fake.cipher("c1");
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    assert_eq!(&*v.item("gh").await.secret, b"new");
+
+    roll_back(&v, "c1", old);
+    assert_eq!(&*v.item("gh").await.secret, b"new", "ADR 0019: never below the cached base");
+    let status = v.backend.describe().await;
+    assert!(status.contains("older on the server than the copy this device has, which is kept: gh"), "{status}");
+    assert!(status.contains("`bwss sync --accept-rollback`"), "{status}");
+
+    // A restart compares with the offline copy.
+    v.backend.lock().await;
+    let snap = v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!(&*snap.items[0].secret, b"new");
+    assert!(v.backend.describe().await.contains("which is kept: gh"));
+}
+
+#[tokio::test]
+async fn accept_rollback_takes_the_server_version() {
+    let v = github().await;
+    let old = v.fake.cipher("c1");
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    v.snapshot().await;
+    roll_back(&v, "c1", old);
+    assert_eq!(&*v.item("gh").await.secret, b"new");
+
+    let accepted = v.dir.join("tool-state/core/accept-rollback");
+    std::fs::write(&accepted, "").unwrap();
+    // Taken even when the account did not change since: it always pulls.
+    assert_eq!(&*v.item("gh").await.secret, b"pw");
+    assert!(!accepted.exists(), "for one sync only");
+    assert!(!v.backend.describe().await.contains("which is kept"));
+
+    // The server's version is the base now: nothing to report next time.
+    assert_eq!(&*v.item("gh").await.secret, b"pw");
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(!v.backend.describe().await.contains("which is kept"));
+
+    // Accepted at an unlock too.
+    let k = v.keys.user.clone();
+    let base = v.fake.cipher("c1");
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("newer")));
+    v.snapshot().await;
+    v.backend.lock().await;
+    roll_back(&v, "c1", base);
+    std::fs::write(&accepted, "").unwrap();
+    assert_eq!(&*v.backend.unlock(PASSWORD).await.unwrap().items[0].secret, b"pw");
+    assert!(!accepted.exists());
+}
+
+#[tokio::test]
+async fn a_bound_winner_stays_after_a_restart() {
+    let k = SymmetricKey::generate();
+    let (fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
+    let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
+    b.unlock(PASSWORD).await.unwrap();
+    let bindings = dir.path().join("tool-state/core/bindings");
+    let sealed = std::fs::read_to_string(&bindings).unwrap();
+    assert!(!sealed.contains("c1") && !sealed.contains("gh"), "sealed, never plain");
+    b.lock().await;
+    drop(b);
+
+    // A clone with an older creation date: §7 alone would pick it.
+    let mut clone = hand_marked(&k, "c0", "gh");
+    clone["creationDate"] = json!("2020-01-01T00:00:00Z");
+    clone["login"]["password"] = json!(k.encrypt_str("clone"));
+    fake.with(|s| s.sync["ciphers"].as_array_mut().unwrap().push(clone));
+
+    let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
+    let snap = b.unlock(PASSWORD).await.unwrap();
+    assert_eq!(&*snap.items[0].secret, b"pw", "ADR 0019: the bound cipher keeps its id");
+    assert_eq!(snap.ciphers["gh"], "c1");
+    assert!(b.describe().await.contains("duplicate id gh: 1 items ignored"));
+    b.lock().await;
+
+    // Without the bindings (a new device), §7 decides.
+    std::fs::remove_file(&bindings).unwrap();
+    let b = Bitwarden::new(&config, creds, &paths).unwrap();
+    assert_eq!(&*b.unlock(PASSWORD).await.unwrap().items[0].secret, b"clone");
+    // Bindings that do not open are ignored the same way.
+    b.lock().await;
+    std::fs::write(&bindings, "2.garbage").unwrap();
+    assert_eq!(&*b.unlock(PASSWORD).await.unwrap().items[0].secret, b"clone");
+}
+
+#[tokio::test]
+async fn bindings_that_cannot_be_read_or_kept_do_not_stop_the_unlock() {
+    let k = SymmetricKey::generate();
+    let (_fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
+    // A directory where the file should be: reading and replacing it fail.
+    let bindings = dir.path().join("tool-state/core/bindings");
+    std::fs::create_dir_all(&bindings).unwrap();
+    let b = Bitwarden::new(&config, creds, &paths).unwrap();
+    assert_eq!(b.unlock(PASSWORD).await.unwrap().items.len(), 1);
+    assert!(bindings.is_dir(), "left as it was");
+}
+
+#[tokio::test]
+async fn an_accepted_rollback_that_cannot_be_cleared_is_still_taken() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let v = github().await;
+    let old = v.fake.cipher("c1");
+    let k = v.keys.user.clone();
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    v.snapshot().await;
+    roll_back(&v, "c1", old);
+    let core = v.dir.join("tool-state/core");
+    std::fs::write(core.join("accept-rollback"), "").unwrap();
+    // The flag cannot be removed (for a user other than root).
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let secret = v.item("gh").await.secret;
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(&*secret, b"pw");
 }

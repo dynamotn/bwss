@@ -77,7 +77,12 @@ enum Command {
     /// Lock the keyring and forget the keys.
     Lock,
     /// Pull changes from Bitwarden now.
-    Sync,
+    Sync {
+        /// Take the server's versions of the items it sent older than the
+        /// copy on this device (ADR 0019), for this one sync.
+        #[arg(long)]
+        accept_rollback: bool,
+    },
     /// Show whether the keyring is unlocked.
     Status,
     /// Save the API key of the profile bwss serves, bound to its server.
@@ -502,7 +507,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("locked");
             Ok(())
         }
-        Command::Sync => {
+        Command::Sync { accept_rollback } => {
+            if accept_rollback {
+                // The daemon's next sync reads and clears it; a locked one, at its unlock.
+                answering()?.0.save(backend::bitwarden::ACCEPT_ROLLBACK, b"yes").await?;
+            }
             control().await?.call::<_, _, ()>("Sync", &()).await?;
             Ok(())
         }

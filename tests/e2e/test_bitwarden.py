@@ -303,7 +303,8 @@ def test_marked_login_is_found_and_written_back(account):
         assert d.tool("lookup", "bwss:username", "octocat").stdout == "gh-old"
         assert d.tool("lookup", "bwss:uri", "https://github.com").stdout == "gh-old"
 
-        d.tool("store", "--label=GitHub", "bwss:name", "GitHub", input="gh-new")
+        # ADR 0015: without bwss:label the label is the id, so storing under it writes no label field.
+        d.tool("store", "--label=gh", "bwss:name", "GitHub", input="gh-new")
         it = account.item(c["id"])
         assert it["password"] == "gh-new"
         assert it["history"][0] == "gh-old"
@@ -405,6 +406,20 @@ def test_unmarking_removes_from_keyring(account):
         assert sync_lookup(d, "bwss:id", "um").stdout == ""
         it = account.item(c["id"])
         assert not it["deleted"] and it["password"] == "pw-um"
+    finally:
+        d.stop()
+
+
+def test_sync_can_accept_a_rollback_once(account):
+    d = bitwarden_daemon(account).start()
+    try:
+        unlock(d, account)
+        account.add_login(None, "Rolled", "rb-pw", {"bwss:id": "rb"})
+        flag = d.state / "tools" / "bwss" / "core" / "accept-rollback"
+        d.cli("sync", "--accept-rollback")
+        assert not flag.exists(), "taken by that one sync"
+        assert d.tool("lookup", "bwss:id", "rb").stdout == "rb-pw"
+        assert "older on the server" not in d.cli("status").stdout
     finally:
         d.stop()
 

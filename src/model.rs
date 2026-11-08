@@ -62,9 +62,10 @@ pub struct Snapshot {
     pub items: Vec<ItemData>,
     /// Item id to the id of the cipher it was read from.
     pub ciphers: std::collections::BTreeMap<String, String>,
-    /// Ids of the non-trashed personal ciphers in Bitwarden's blob format:
-    /// they cannot be inspected, so what the locked index knows of them is held.
-    pub blobs: std::collections::BTreeSet<String>,
+    /// Ids of the ciphers that are there but not served: they cannot be
+    /// inspected, are skipped, or lost a duplicate id. What the locked index
+    /// knows of them is held, never read as deleted.
+    pub held: std::collections::BTreeSet<String>,
 }
 
 pub fn now() -> u64 {

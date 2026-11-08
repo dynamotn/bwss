@@ -19,13 +19,24 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
-use crate::backend::bitwarden::build;
+use crate::backend::bitwarden::Built;
 use crate::bw::api::normalize_keys;
 use crate::bw::crypto::SymmetricKey;
 use crate::bw::items::item_key;
 use crate::bw::scan::{Keys, Scan, ValueSource, scan};
 use crate::bw::write::{Patch, ValueChange, WriteError, apply, has_foreign_content, new_note, strip};
 use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, now};
+
+/// bwss's snapshot build over the core's scan (B4), with a vector's legacy keys.
+// shortcut: converts bwss's own keys per call; B9 makes this adapter take the core's keys.
+fn build(sync: &Value, keys: &Keys, previous: Option<&Built>) -> Built {
+    use dybw_core::crypto::{MarkScheme, Marker, SymmetricKey as CoreKey};
+    let Ok(user) = CoreKey::from_bytes(&keys.user.to_bytes()) else { return Built::default() };
+    let marker = Marker::new(&user, MarkScheme::Bwss);
+    let core = dybw_core::vault::Keys { user, marker, orgs: BTreeMap::new(), security_version: 0 };
+    let bound = previous.map(|p| p.bound.clone()).unwrap_or_default();
+    crate::backend::bitwarden::build(sync, &core, previous, &mut Default::default(), &bound)
+}
 
 const NAMESPACE: &str = "bwss";
 const NOT_FOUND: &str = "conformance vectors not found: set DYBW_VECTORS_DIR";

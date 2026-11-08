@@ -109,7 +109,7 @@ some.
 
 For a marked item:
 
-- **Label**: `bwss:label` if non-empty, else the item name.
+- **Label**: `bwss:label` if non-empty, else the `bwss:id` (ADR 0015).
 - **Secret** (spec §5), from the first **present** source:
   1. the `bwss:password` field, when it exists, even with an empty value;
   2. the notes, when `bwss:location=notes`;
@@ -202,8 +202,8 @@ else passes through unchanged.
   personal (`organizationId: null`), named after the label, with empty
   notes and no login, and the fields `bwss:id` (new UUID), `bwss:password`
   (hidden, never the notes), `bwss:attr:*`, `bwss:collection` (unless
-  `login`), `bwss:content-type` (unless `text/plain`), `bwss:acl` (the
-  creator) and `bwss:created`.
+  `login`), `bwss:label` (unless it is the id), `bwss:content-type` (unless
+  `text/plain`), `bwss:acl` (the creator) and `bwss:created`.
 - `replace=true` looks for an item in the same collection with exactly the
   same `bwss:attr:*` attributes (derived attributes do not count) and
   updates it instead.
