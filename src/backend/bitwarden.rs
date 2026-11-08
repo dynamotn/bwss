@@ -1096,7 +1096,7 @@ impl Bitwarden {
             return;
         }
         let vault = self.clone();
-        let task = tokio::task::spawn_local(async move { vault.follow_hub().await });
+        let task = tokio::task::spawn_local(async move { vault.follow_hub(generation).await });
         if let Some(old) = self.hub.lock().ok().and_then(|mut h| h.replace(task.abort_handle())) {
             old.abort();
         }
@@ -1118,7 +1118,8 @@ impl Bitwarden {
         unlocked
     }
 
-    async fn follow_hub(&self) {
+    /// Follows the hub until the unlock of `generation` is over.
+    pub(super) async fn follow_hub(&self, generation: u64) {
         // The URL carries the access token: it is never logged.
         // shortcut: an expired token is renewed by the next periodic refresh, not here; until then the hub's
         // reconnects back off. Renew here if that gap shows in practice.
@@ -1127,7 +1128,8 @@ impl Bitwarden {
             Some(hub_url(&self.urls.notifications, client.as_ref()?.access_token()?))
         };
         let mut hub = Hub::new(HubOptions::default(), self.device.identifier.clone());
-        run_hub(&WsEvents, &SystemClock, url, &mut hub, || self.changes.send_replace(()), || false).await;
+        let locked = || self.lock_generation.load(Ordering::SeqCst) != generation;
+        run_hub(&WsEvents, &SystemClock, url, &mut hub, || self.changes.send_replace(()), locked).await;
     }
 
     /// A client of the server, not logged in yet.
@@ -1777,8 +1779,8 @@ impl BitwardenBackend {
     }
 
     #[cfg(test)]
-    pub(super) async fn panic_for_test(&self) -> Result<(), BackendError> {
-        self.0.call(Command::Panic).await
+    pub(super) async fn panic_for_test(&self, again: bool) -> Result<(), BackendError> {
+        self.0.call(|r| Command::Panic(again, r)).await
     }
 
     #[cfg(test)]

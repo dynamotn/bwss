@@ -542,6 +542,25 @@ def test_accept_rollback_is_refused_while_locked_or_with_nothing_held(account):
         d.stop()
 
 
+def test_accept_rollback_lists_what_it_accepts_for_the_next_sync(account):
+    # The list the daemon keeps of what it holds back (plain JSON, ADR 0019),
+    # planted as it would be after a rollback Vaultwarden cannot produce.
+    # Nothing changes in the vault meanwhile, so no sync rewrites it first.
+    d = bitwarden_daemon(account).start()
+    try:
+        unlock(d, account)
+        core = d.state / "tools" / "bwss" / "core"
+        held = [{"id": "held", "cipher": "c-held", "revision": "2026-01-01T00:00:00Z"}]
+        (core / "rollbacks-held").write_text(json.dumps(held))
+        r = d.cli("sync", "--accept-rollback")
+        assert r.stdout == "accepting the server's version of held (cipher c-held, revision 2026-01-01T00:00:00Z)\n", r.stdout
+        # The sync that followed used the record: it is never applied again.
+        assert not (core / "accept-rollback").exists()
+        assert not (core / "rollbacks-held").exists()
+    finally:
+        d.stop()
+
+
 def test_clone_does_not_change_what_apps_see(account):
     d = bitwarden_daemon(account).start()
     try:

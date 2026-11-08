@@ -2349,7 +2349,7 @@ async fn lock_during_a_flush_wins() {
 #[tokio::test]
 async fn a_panicking_worker_fails_calls_instead_of_hanging() {
     let (_fake, b, _dir) = handle(vec![]).await;
-    let panicked = tokio::time::timeout(std::time::Duration::from_secs(10), b.panic_for_test()).await;
+    let panicked = tokio::time::timeout(std::time::Duration::from_secs(10), b.panic_for_test(false)).await;
     assert!(matches!(panicked, Ok(Err(BackendError::Unavailable(m))) if m == STOPPED));
     // The worker is still there for the next call.
     assert!(b.describe().await.starts_with("Bitwarden "));
@@ -2373,7 +2373,7 @@ async fn a_panicking_worker_fails_calls_instead_of_hanging() {
 async fn calls_after_a_restart_see_a_locked_vault() {
     let (_fake, b, _dir) = handle(vec![]).await;
     assert!(b.acl_trust().await.is_ok());
-    assert!(b.panic_for_test().await.is_err());
+    assert!(b.panic_for_test(false).await.is_err());
     assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
     assert!(matches!(b.refresh().await, Err(BackendError::Locked)));
     b.unlock(PASSWORD).await.unwrap();
@@ -3299,4 +3299,89 @@ async fn notifications_off_starts_no_hub() {
             assert!(vault.hub.lock().unwrap().is_none());
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_hub_whose_unlock_is_over_ends_by_itself() {
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
+    let (_fake, config, creds, paths, _dir) = server(vec![], &user);
+    let vault = Bitwarden::new(&config, creds, &paths).unwrap();
+    let generation = vault.lock_generation.load(std::sync::atomic::Ordering::SeqCst);
+    vault.lock().await;
+    // Not left to the abort alone: it returns before it connects.
+    tokio::time::timeout(std::time::Duration::from_secs(5), vault.follow_hub(generation)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_panic_while_locking_after_a_panic_keeps_the_worker() {
+    let (_fake, b, _dir) = handle(vec![]).await;
+    assert!(matches!(b.panic_for_test(true).await, Err(BackendError::Unavailable(m)) if m == STOPPED));
+    // That lock never ran; the worker serves the next call, and a lock still works.
+    assert!(b.acl_trust().await.is_ok());
+    b.lock().await;
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+}
+
+/// The record is turned into a directory while the sync that uses it runs:
+/// it cannot be removed, by root either.
+#[tokio::test]
+async fn an_accept_record_that_cannot_be_removed_is_used_once_and_reported() {
+    let v = github().await;
+    v.rolled_back("c1", "new").await;
+    v.accept_rollbacks().await;
+    let accepted = v.dir.join("tool-state/core/accept-rollback");
+    let mut gate = Gate::hold(&v.fake, "GET", "/api/sync?excludeDomains=true");
+    let backend = v.backend.clone();
+    let local = tokio::task::LocalSet::new();
+    let running = local.spawn_local(async move { backend.refresh().await });
+    local.run_until(gate.arrived()).await;
+    std::fs::remove_file(&accepted).unwrap();
+    std::fs::create_dir_all(accepted.join("stuck")).unwrap();
+    gate.open();
+    local.run_until(running).await.unwrap().unwrap();
+    assert_eq!(&*v.item("gh").await.secret, b"pw", "the server's version was taken");
+    let status = v.backend.describe().await;
+    assert!(status.contains("the accepted rollbacks could not be cleared"), "{status}");
+    // Spent: the next sync, with a rollback again, holds it back.
+    v.rolled_back("c1", "again").await;
+    v.backend.refresh().await.unwrap();
+    assert_eq!(&*v.item("gh").await.secret, b"again");
+    assert!(accepted.is_dir());
+}
+
+#[tokio::test]
+async fn a_held_rollback_list_that_cannot_be_kept_does_not_stop_a_sync() {
+    let v = github().await;
+    let held = v.dir.join("tool-state/core/rollbacks-held");
+    std::fs::create_dir_all(held.join("stuck")).unwrap();
+    let k = core_key(&v.keys.user);
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new", &OsRandom).unwrap()));
+    v.backend.refresh().await.unwrap();
+    assert_eq!(&*v.item("gh").await.secret, b"new");
+    assert!(held.is_dir());
+}
+
+#[tokio::test]
+async fn a_cache_without_a_cipher_list_records_no_server_answer() {
+    let v = github().await;
+    let queue = v.backend.queue.lock().await;
+    let mut guard = v.backend.state.lock().await;
+    let state = guard.as_mut().unwrap();
+    state.sync.as_object_mut().unwrap().remove("ciphers");
+    v.backend.absorb(state, &queue, Effect::Trashed("c1".into()));
+    assert!(state.sync.get("ciphers").is_none(), "no list is made up");
+    assert!(state.built.snapshot.items.is_empty());
+}
+
+#[tokio::test]
+async fn a_queued_new_registry_note_the_server_refuses_is_dropped() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    v.backend.create_collection("Work").await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.fake.fault("POST", "/api/ciphers", 400, 1);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert!(!v.snapshot().await.collections.iter().any(|c| c.id == "work"), "the view goes back");
+    assert!(!v.fake.with(|s| s.sync["ciphers"].as_array().unwrap().iter().any(|c| c["type"] == 2)), "no note");
 }

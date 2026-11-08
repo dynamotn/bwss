@@ -123,8 +123,13 @@ pub(crate) mod test_hub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (seen, events) = mpsc::unbounded_channel();
+        // Listens until the test drops the receiver.
         tokio::spawn(async move {
-            while let Ok((tcp, _)) = listener.accept().await {
+            loop {
+                let tcp = tokio::select! {
+                    Ok((tcp, _)) = listener.accept() => tcp,
+                    () = seen.closed() => break,
+                };
                 let seen = seen.clone();
                 tokio::spawn(async move {
                     let opened = seen.clone();
@@ -234,5 +239,16 @@ mod tests {
         let err = WsEvents.connect(&url).await.err().unwrap();
         assert!(err.0.contains("timed out"), "{err}");
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn the_test_hub_stops_listening_once_its_test_lets_go() {
+        let (base, seen) = test_hub::serve(0, Duration::ZERO).await;
+        let addr = base.trim_start_matches("http://").to_owned();
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_ok());
+        drop(seen);
+        // One runtime thread: the listener's task runs during the sleep.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_err(), "the listener is gone");
     }
 }

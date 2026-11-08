@@ -28,8 +28,15 @@ pub(crate) enum Command {
     DeleteItem(ItemData, Reply<()>),
     AclTrust(Reply<AclTrust>),
     Describe(oneshot::Sender<String>),
+    /// Panics; with `true`, so does the lock that follows.
     #[cfg(test)]
-    Panic(oneshot::Sender<()>),
+    Panic(bool, oneshot::Sender<()>),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by `Command::Panic(true, _)`: the lock after that panic panics too.
+    static PANIC_AGAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn stopped() -> BackendError {
@@ -94,7 +101,14 @@ impl Worker {
                     let task = tokio::task::spawn_local(serve(vault.clone(), command));
                     if task.await.is_err_and(|e| e.is_panic()) {
                         tracing::error!("a vault command panicked; the keyring is locked");
-                        if tokio::task::spawn_local(async move { vault.lock().await }).await.is_err() {
+                        let locking = async move {
+                            #[cfg(test)]
+                            if PANIC_AGAIN.take() {
+                                panic!("a test made the lock after a panic panic too");
+                            }
+                            vault.lock().await;
+                        };
+                        if tokio::task::spawn_local(locking).await.is_err() {
                             tracing::error!("locking the keyring after a panic panicked too");
                         }
                     }
@@ -142,6 +156,9 @@ async fn serve(vault: Rc<Bitwarden>, command: Command) {
             let _ = reply.send(vault.describe().await);
         }
         #[cfg(test)]
-        Command::Panic(_reply) => panic!("a test made the vault worker panic"),
+        Command::Panic(again, _reply) => {
+            PANIC_AGAIN.set(again);
+            panic!("a test made the vault worker panic")
+        }
     }
 }

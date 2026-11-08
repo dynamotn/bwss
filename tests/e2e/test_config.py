@@ -195,6 +195,10 @@ def test_derived_attributes_need_a_confirmation_on_a_terminal():
 
     # Off needs no question.
     assert "derived attributes are off" in d.cli("derive", "off").stdout
+    # Without a session bus the flag is still set, for the daemon's next sync.
+    no_bus = {**d.env, "DBUS_SESSION_BUS_ADDRESS": f"unix:path={d.home}/no-bus"}
+    r = subprocess.run([BWSS, "derive", "off"], env=no_bus, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and "a running daemon applies it at its next sync" in r.stdout, r.stdout + r.stderr
     assert not flag.exists()
 
     # `bwss index derived` is an alias with a deprecation notice; an old flag is read as derive-on.
