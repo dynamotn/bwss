@@ -675,3 +675,28 @@ def test_always_allow_here_needs_no_confirmation_after_a_restart(account):
         assert confirms(d) == before, "granted on this device, so no confirmation"
     finally:
         d.stop()
+
+
+def test_a_change_in_the_vault_arrives_without_waiting_for_the_timer(account):
+    # The timer at 300 s: only the notifications hub can bring the change within 10 s.
+    d = Daemon({"backend": "bitwarden", "folder": FOLDER},
+               profile={"server_url": URL, "email": account.email, "sync_interval_seconds": 300}, acl_off=True)
+    d.cli("login", "--client-id", account.client_id, "--client-secret-stdin", input=account.client_secret + "\n")
+    d.start()
+    try:
+        unlock(d, account)
+        time.sleep(1)  # the hub connects right after the unlock; a change before that waits for the timer
+        c = account.add_login(FOLDER, "Live", "first", {"bwss:id": "live", "bwss:attr:service": "live"})
+        arrived = lambda want: d.tool("lookup", "service", "live", check=False).stdout == want  # noqa: E731
+        deadline = time.monotonic() + 10
+        while not arrived("first"):
+            assert time.monotonic() < deadline, "a new item did not arrive within 10 s"
+            time.sleep(0.25)
+        # A remote edit arrives the same way, now that the hub is up.
+        account.set_password(c["id"], "second")
+        deadline = time.monotonic() + 10
+        while not arrived("second"):
+            assert time.monotonic() < deadline, "a remote edit did not arrive within 10 s"
+            time.sleep(0.25)
+    finally:
+        d.stop()

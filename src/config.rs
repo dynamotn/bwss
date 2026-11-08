@@ -32,7 +32,7 @@ pub const TOP_LEVEL_KEYS: &[&str] =
 pub const PROFILE_KEYS: &[&str] =
     &["server_url", "email", "auth", "lock_timeout_minutes", "sync_interval_seconds", "pinentry"];
 /// The keys of `[bwss]` (ADR 0008).
-pub const BWSS_KEYS: &[&str] = &["profile", "folder", "backend", "memory_password"];
+pub const BWSS_KEYS: &[&str] = &["profile", "folder", "backend", "memory_password", "notifications"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +72,8 @@ pub struct Settings {
     pub sync_interval_seconds: u64,
     /// As written: a program name or an absolute path.
     pub pinentry: String,
+    /// Follow the server's notifications hub (`[bwss] notifications`).
+    pub notifications: bool,
 }
 
 /// What the daemon runs with.
@@ -93,6 +95,9 @@ pub struct Config {
     pub sync_interval_seconds: u64,
     /// Master password of the memory backend (tests and demos only).
     pub memory_password: String,
+    /// Refresh when the server's notifications hub reports a change; the
+    /// `sync_interval_seconds` timer runs either way.
+    pub notifications: bool,
 }
 
 impl Default for Config {
@@ -108,6 +113,7 @@ impl Default for Config {
             lock_timeout_minutes: DEFAULT_LOCK_TIMEOUT_MINUTES,
             sync_interval_seconds: DEFAULT_SYNC_INTERVAL_SECONDS,
             memory_password: DEFAULT_MEMORY_PASSWORD.into(),
+            notifications: true,
         }
     }
 }
@@ -343,6 +349,11 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
     };
     let folder = string(bwss, "folder", "[bwss]")?.unwrap_or(DEFAULT_FOLDER).to_owned();
     let memory_password = string(bwss, "memory_password", "[bwss]")?.unwrap_or(DEFAULT_MEMORY_PASSWORD).to_owned();
+    let notifications = match bwss.get("notifications") {
+        None => true,
+        Some(Value::Boolean(on)) => *on,
+        Some(_) => bail!("`notifications` in [bwss] must be true or false"),
+    };
 
     let name = match string(bwss, "profile", "[bwss]")? {
         Some(name) => Some(name),
@@ -387,6 +398,7 @@ pub fn resolve(doc: &Table) -> anyhow::Result<Settings> {
         lock_timeout_minutes: number("lock_timeout_minutes", DEFAULT_LOCK_TIMEOUT_MINUTES),
         sync_interval_seconds: number("sync_interval_seconds", DEFAULT_SYNC_INTERVAL_SECONDS),
         pinentry: text("pinentry", DEFAULT_PINENTRY),
+        notifications,
     })
 }
 
@@ -629,6 +641,7 @@ pub fn load(paths: &Paths, trust: &Trust) -> anyhow::Result<Config> {
         lock_timeout_minutes: s.lock_timeout_minutes,
         sync_interval_seconds: s.sync_interval_seconds,
         memory_password: s.memory_password,
+        notifications: s.notifications,
     })
 }
 
@@ -906,6 +919,16 @@ mod tests {
         // The memory backend needs no account.
         let s = resolve(&doc("[bwss]\nbackend = \"memory\"\nmemory_password = \"open\"\n")).unwrap();
         assert_eq!((s.backend, s.account, s.memory_password.as_str()), (BackendKind::Memory, None, "open"));
+        assert!(s.notifications, "on by default");
+    }
+
+    #[test]
+    fn notifications_can_be_turned_off_in_the_bwss_section() {
+        let base = format!("default = \"personal\"\n{ACCOUNT}");
+        assert!(!resolve(&doc(&format!("{base}[bwss]\nnotifications = false\n"))).unwrap().notifications);
+        assert!(resolve(&doc(&format!("{base}[bwss]\nnotifications = true\n"))).unwrap().notifications);
+        let e = err(&format!("{base}[bwss]\nnotifications = \"no\"\n"));
+        assert!(e.contains("`notifications` in [bwss] must be true or false"), "{e}");
     }
 
     #[test]

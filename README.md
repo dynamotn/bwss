@@ -193,7 +193,7 @@ password.
 | `bwss unlock` | Unlock through the daemon's own pinentry; no password crosses the bus. |
 | `bwss unlock --password-stdin` | For scripts and login hooks: send the password read from stdin (see Security below). |
 | `bwss lock` | Lock the keyring and forget the keys. |
-| `bwss sync` | Pull changes from Bitwarden now (otherwise every `sync_interval_seconds`). |
+| `bwss sync` | Pull changes from Bitwarden now (otherwise on a notification from the server, and every `sync_interval_seconds`). |
 | `bwss sync --accept-rollback` | When `bwss status` lists items the server sent older than the copy on this device (kept until then), take the server's versions in this one sync, for example after restoring the server from a backup. |
 | `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the value change. The daemon asks you to confirm `login` and `separate` in its pinentry first. Then sync. |
 | `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
@@ -215,7 +215,11 @@ key. In short:
   `sync_interval_seconds` (default 300) and `pinentry`. A profile may
   override the shared keys.
 - **`[bwss]`**: `profile`, `folder` for new items (default `secret-service`),
-  and `backend` (`bitwarden`, or `memory` for tests and demos).
+  `backend` (`bitwarden`, or `memory` for tests and demos), and
+  `notifications` (default `true`): while unlocked, bwss follows the
+  server's notifications hub and pulls about two seconds after a change made
+  on another device. The `sync_interval_seconds` timer keeps running as the
+  fallback; `notifications = false` leaves only the timer.
 - An unknown key in the top level, the served profile or `[bwss]` stops bwss,
   so typos fail loudly. Other tools' sections are ignored.
 

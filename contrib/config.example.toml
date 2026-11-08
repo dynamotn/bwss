@@ -28,3 +28,7 @@ profile = "personal"
 # any folder are used too.
 folder = "secret-service"
 backend = "bitwarden"            # or "memory" for tests and demos (with memory_password)
+# Follow the server's notifications hub while unlocked, and pull within a
+# few seconds of a change made elsewhere. sync_interval_seconds keeps
+# running as the fallback; false leaves only that timer.
+notifications = true

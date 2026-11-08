@@ -56,7 +56,6 @@ solves the same problem for Obsidian:
 - Cards, identities and SSH key items.
 - A PAM module, the Flatpak secret portal, `ChangeLock`, and aliases other
   than `default`.
-- Real-time sync through the notifications hub (polling stays).
 
 ### Anti-goals
 
@@ -745,8 +744,15 @@ sequenceDiagram
 
 ### 8.4 Refreshing
 
-Every `sync_interval_seconds` (default 300), on `bwss sync`, and right after
-an unlock:
+Every `sync_interval_seconds` (default 300), on `bwss sync`, right after
+an unlock, and two seconds after the notifications hub reports a change
+(every report within those two seconds folds into the one refresh). While
+unlocked, and unless `[bwss] notifications = false`, the vault worker keeps
+one connection to the server's hub (SignalR over a WebSocket, dybw-core's
+`api::hub`, which skips this device's own changes and paces reconnects); a
+lock closes it. A notification only triggers this refresh, it is never read
+for content, so the timer stays the fallback when the hub is down. The hub
+URL carries the access token and is never logged.
 
 1. Flush the queue (§8.3). A transient failure stops the flush; the rest
    stays queued. When the flush sent anything, the vault is read again.
@@ -769,8 +775,9 @@ No sync happens while locked: the user key and the API token are gone.
 - Everything apps can see lives in the item: id, label, attributes,
   collection, content type, ACL, and the secret. Two devices that have
   both synced therefore show the same keyring.
-- Until the next refresh, a device does not see another device's changes
-  (up to `sync_interval_seconds`).
+- Until the next refresh, a device does not see another device's changes:
+  a few seconds with the notifications hub, up to `sync_interval_seconds`
+  without it.
 - Two devices creating the same item while apart produce two items with
   different ids, and apps searching by attributes see two matches. bwss
   does not merge them; `bwss status` lists items with identical collection

@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use dybw_core::api::{ApiError as CoreApiError, ApiKey as CoreApiKey, Client, DeviceInfo, ServerUrls};
+use dybw_core::api::{
+    ApiError as CoreApiError, ApiKey as CoreApiKey, Client, DeviceInfo, Hub, HubOptions, ServerUrls, hub_url, run_hub,
+};
 use dybw_core::crypto::{AwsLcRsa, KdfParams, MarkScheme, Marker, SymmetricKey as CoreKey};
 use dybw_core::ports::Storage;
 use dybw_core::profile::{self, CachedSync, ProfileError, SecurityFault, UnlockWarning};
@@ -28,7 +30,7 @@ use dybw_core::vault::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use zeroize::Zeroizing;
 
 use super::ops::{
@@ -48,7 +50,7 @@ use crate::bw::items::parse_date;
 use crate::bw::scan::{MarkedItem, ValueSource, normalize_collection};
 use crate::config::{Config, Credentials, Paths};
 use crate::core_ports::{
-    clock::SystemClock, http::HttpPort, kdf::BlockingArgon2, random::OsRandom, storage::FileStorage,
+    clock::SystemClock, events::WsEvents, http::HttpPort, kdf::BlockingArgon2, random::OsRandom, storage::FileStorage,
 };
 use crate::fsutil::{write_json_private, write_private};
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
@@ -947,7 +949,7 @@ pub(crate) struct Bitwarden {
     /// installs its keys.
     lock_generation: AtomicU64,
     /// Where dybw-core's client goes, and as which device.
-    urls: ServerUrls,
+    pub(super) urls: ServerUrls,
     device: DeviceInfo,
     /// dybw-core's device state: the KDF pin, the security version, the user key id.
     storage: FileStorage,
@@ -963,6 +965,12 @@ pub(crate) struct Bitwarden {
     derive_on: PathBuf,
     /// Present while `derive_on` was carried over from `bwss index derived`.
     derive_carried: PathBuf,
+    /// Whether to follow the notifications hub (`[bwss] notifications`).
+    notifications: bool,
+    /// Told when the hub reports a change made elsewhere; the daemon refreshes.
+    pub(super) changes: watch::Sender<()>,
+    /// The hub task of this unlock, stopped by `lock`.
+    pub(super) hub: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 /// The online half of an unlock.
@@ -1061,7 +1069,36 @@ impl Bitwarden {
             acl_confirmed: paths.acl_confirmed(),
             derive_on: paths.derive_on(),
             derive_carried: paths.derive_carried(),
+            notifications: config.notifications,
+            changes: watch::channel(()).0,
+            hub: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Follows the server's notifications hub until the next lock (owner's
+    /// decision 3), on the worker's `LocalSet`. The core's [`Hub`] decides
+    /// the reconnect timing; the periodic refresh runs either way.
+    pub(super) fn start_hub(self: &std::rc::Rc<Self>) {
+        if !self.notifications {
+            return;
+        }
+        let vault = self.clone();
+        let task = tokio::task::spawn_local(async move { vault.follow_hub().await });
+        if let Some(old) = self.hub.lock().ok().and_then(|mut h| h.replace(task.abort_handle())) {
+            old.abort();
+        }
+    }
+
+    async fn follow_hub(&self) {
+        // The URL carries the access token: it is never logged.
+        // shortcut: an expired token is renewed by the next periodic refresh, not here; until then the hub's
+        // reconnects back off. Renew here if that gap shows in practice.
+        let url = async || {
+            let client = self.client.lock().await;
+            Some(hub_url(&self.urls.notifications, client.as_ref()?.access_token()?))
+        };
+        let mut hub = Hub::new(HubOptions::default(), self.device.identifier.clone());
+        run_hub(&WsEvents, &SystemClock, url, &mut hub, || self.changes.send_replace(()), || false).await;
     }
 
     /// A client of the server, not logged in yet.
@@ -1509,6 +1546,9 @@ impl Bitwarden {
 
     pub(crate) async fn lock(&self) {
         self.lock_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(hub) = self.hub.lock().ok().and_then(|mut h| h.take()) {
+            hub.abort();
+        }
         *self.state.lock().await = None;
         // A flush in progress clears the queue itself when it finds the
         // keyring locked; never wait for its network calls here.
@@ -1693,12 +1733,20 @@ fn report_rollbacks(ids: &[Rollback]) {
 }
 
 /// What the daemon sees: a handle on the worker thread that owns the vault.
-pub struct BitwardenBackend(WorkerHandle);
+pub struct BitwardenBackend(WorkerHandle, watch::Receiver<()>);
 
 impl BitwardenBackend {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
         let (config, paths) = (config.clone(), paths.clone());
-        Worker::spawn(move || Bitwarden::new(&config, creds, &paths)).map(Self)
+        let (changes, follow) = watch::channel(());
+        let init = move || Ok(Bitwarden { changes, ..Bitwarden::new(&config, creds, &paths)? });
+        Worker::spawn(init).map(|worker| Self(worker, follow))
+    }
+
+    /// Marked changed whenever the notifications hub reports a change made
+    /// elsewhere while unlocked.
+    pub fn changes(&self) -> watch::Receiver<()> {
+        self.1.clone()
     }
 
     #[cfg(test)]
@@ -1708,7 +1756,7 @@ impl BitwardenBackend {
 
     #[cfg(test)]
     pub(super) fn stopped_for_test() -> Self {
-        Self(WorkerHandle::stopped())
+        Self(WorkerHandle::stopped(), watch::channel(()).1)
     }
 }
 

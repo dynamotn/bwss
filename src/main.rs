@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use tokio::sync::watch;
 use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 use zeroize::Zeroizing;
@@ -459,6 +460,18 @@ fn spawn_sync(d: Arc<Daemon>, period: Duration) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Pulls from the backend when `changes` is marked: the first mark waits
+/// `window`, and every mark within it folds into that one pull.
+fn spawn_live(d: Arc<Daemon>, mut changes: watch::Receiver<()>, window: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            tokio::time::sleep(window).await;
+            changes.mark_unchanged();
+            d.refresh().await;
+        }
+    })
+}
+
 /// Locks the keyring once it has been idle for more than `limit`, checking
 /// every `poll`.
 fn spawn_idle_lock(d: Arc<Daemon>, limit: Duration, poll: Duration) -> tokio::task::JoinHandle<()> {
@@ -482,8 +495,8 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     for dir in [&paths.cache, &paths.state, &paths.tool_state] {
         fsutil::ensure_private_dir(dir).with_context(|| format!("{}", dir.display()))?;
     }
-    let (backend, index): (Arc<dyn Backend>, _) = match config.backend {
-        BackendKind::Memory => (Arc::new(MemoryBackend::new(config.memory_password.clone())), None),
+    let (backend, index, changes): (Arc<dyn Backend>, _, _) = match config.backend {
+        BackendKind::Memory => (Arc::new(MemoryBackend::new(config.memory_password.clone())), None, None),
         BackendKind::Bitwarden => {
             let profile = config.profile.as_deref().context("bwss serves no profile")?;
             for dir in [paths.profile_dir(profile), paths.devices(profile)] {
@@ -492,7 +505,8 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
             let creds = config::load_credentials(&paths.credentials(profile), &trust.user, &origin)?;
             let b = BitwardenBackend::new(&config, creds, &paths)?;
-            (Arc::new(b), Some(paths.locked_index()))
+            let changes = b.changes();
+            (Arc::new(b), Some(paths.locked_index()), Some(changes))
         }
     };
     let prompter = guarded_prompter(&config.pinentry, trust);
@@ -507,6 +521,10 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
 
     // Periodic pull from Bitwarden.
     spawn_sync(daemon.clone(), Duration::from_secs(config.sync_interval_seconds.max(30)));
+    // Live pulls when the notifications hub reports a change; the timer above stays the fallback.
+    if let Some(changes) = changes {
+        spawn_live(daemon.clone(), changes, Duration::from_secs(2));
+    }
     // Idle lock.
     if config.lock_timeout_minutes > 0 {
         let limit = Duration::from_secs(config.lock_timeout_minutes.saturating_mul(60));
@@ -884,6 +902,62 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(100)).await;
         assert_eq!(pulls(), 2);
         task.abort();
+    }
+
+    /// A daemon whose every pull is counted: its backend is locked under an
+    /// unlocked keyring, so each pull logs a failure.
+    async fn counted_pulls() -> (Arc<Daemon>, impl Fn() -> usize, impl Drop) {
+        let (out, guard) = capture_logs();
+        let (d, backend) = unlocked_daemon().await;
+        backend.lock().await;
+        (d, move || text(&out).matches("refresh failed").count(), guard)
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_messages_refreshes_once() {
+        use crate::core_ports::events::{WsEvents, test_hub};
+        use dybw_core::api::{Hub, HubOptions, hub_url, run_hub};
+        let (d, pulls, _guard) = counted_pulls().await;
+        let (base, _seen) = test_hub::serve(5).await;
+        let (changes, follow) = watch::channel(());
+        let live = spawn_live(d, follow, Duration::from_millis(300));
+        // The core may report the burst more than once this fast; the window folds it.
+        let mut hub = Hub::new(HubOptions { settle_ms: 1, min_interval_ms: 1, ..HubOptions::default() }, "me".into());
+        let url = async || Some(hub_url(&base, "token"));
+        let notify = || changes.send_replace(());
+        let hub = run_hub(&WsEvents, &crate::core_ports::clock::SystemClock, url, &mut hub, notify, || false);
+        tokio::select! {
+            () = hub => unreachable!("the hub runs until dropped"),
+            () = tokio::time::sleep(Duration::from_millis(1500)) => {}
+        }
+        assert_eq!(pulls(), 1);
+        // The backend gone (its sender dropped), the task ends.
+        drop(changes);
+        live.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_hub_falls_back_to_the_timer() {
+        use crate::core_ports::events::WsEvents;
+        use dybw_core::api::{Hub, HubOptions, hub_url, run_hub};
+        let (d, pulls, _guard) = counted_pulls().await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (changes, follow) = watch::channel(());
+        let live = spawn_live(d.clone(), follow, Duration::from_secs(2));
+        let timer = spawn_sync(d, Duration::from_secs(300));
+        let mut hub = Hub::new(HubOptions::default(), "me".into());
+        let url = async || Some(hub_url(&dead, "token"));
+        let notify = || changes.send_replace(());
+        let hub = run_hub(&WsEvents, &crate::core_ports::clock::SystemClock, url, &mut hub, notify, || false);
+        tokio::select! {
+            () = hub => unreachable!("the hub keeps trying"),
+            () = tokio::time::sleep(Duration::from_secs(301)) => {}
+        }
+        assert_eq!(pulls(), 1, "the timer pulled once; the dead hub reported nothing");
+        live.abort();
+        timer.abort();
     }
 
     #[tokio::test(start_paused = true)]

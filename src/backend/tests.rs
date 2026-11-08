@@ -3173,3 +3173,50 @@ async fn bindings_have_a_key_of_their_own() {
         b.lock().await;
     }
 }
+
+#[tokio::test]
+async fn the_hub_stops_on_lock() {
+    use crate::core_ports::events::test_hub::{Seen, serve as serve_hub};
+    let user = SymmetricKey::generate();
+    let (_fake, config, creds, paths, _dir) = server(vec![], &user);
+    let (hub, mut seen) = serve_hub(1).await;
+    let mut b = Bitwarden::new(&config, creds, &paths).unwrap();
+    b.urls.notifications = hub;
+    let vault = std::rc::Rc::new(b);
+    let mut changes = vault.changes.subscribe();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            vault.unlock(PASSWORD).await.unwrap();
+            vault.start_hub();
+            let Some(Seen::Open(uri)) = seen.recv().await else { panic!("the hub never connected") };
+            assert!(uri.starts_with("/hub?access_token=") && uri.len() > "/hub?access_token=".len(), "{uri}");
+            // Started again (a second unlock): the first connection goes, one stays.
+            vault.start_hub();
+            let two = [seen.recv().await.unwrap(), seen.recv().await.unwrap()];
+            assert!(two.contains(&Seen::Closed) && two.iter().any(|s| matches!(s, Seen::Open(_))), "{two:?}");
+            // The change the hub announced reaches the daemon's side.
+            tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed()).await.unwrap().unwrap();
+            vault.lock().await;
+            assert!(vault.hub.lock().unwrap().is_none());
+            assert_eq!(seen.recv().await, Some(Seen::Closed));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(seen.try_recv().is_err(), "no reconnect after the lock");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn notifications_off_starts_no_hub() {
+    let user = SymmetricKey::generate();
+    let (_fake, mut config, creds, paths, _dir) = server(vec![], &user);
+    config.notifications = false;
+    let vault = std::rc::Rc::new(Bitwarden::new(&config, creds, &paths).unwrap());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            vault.unlock(PASSWORD).await.unwrap();
+            vault.start_hub();
+            assert!(vault.hub.lock().unwrap().is_none());
+        })
+        .await;
+}
