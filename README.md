@@ -155,6 +155,13 @@ never puts them on the bus.
   login password alone. Binary secrets never go into your login password or
   note text: bwss adds a hidden `bwss:password` with `bwss:encoding=base64`
   instead.
+- **Your password history is protected** (ADR 0016). The first time an app
+  writes to a login password from this device, and whenever a write would push
+  out of a full history a password this device did not write, the pinentry
+  asks first: write to the login, keep the app's value separate (in a hidden
+  `bwss:password`, the value source from then on), or cancel. A queued change
+  that meets such a question waits; `bwss status` lists it and
+  `bwss answer` answers it.
 - **New items** that apps create are personal secure notes in the `folder`
   from your config (default `secret-service`), with the secret in
   `bwss:password`. A very large secret uses the new note's own notes.
@@ -184,6 +191,7 @@ password.
 | `bwss lock` | Lock the keyring and forget the keys. |
 | `bwss sync` | Pull changes from Bitwarden now (otherwise every `sync_interval_seconds`). |
 | `bwss sync --accept-rollback` | When `bwss status` lists items the server sent older than the copy on this device (kept until then), take the server's versions in this one sync, for example after restoring the server from a backup. |
+| `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the change. Then sync. |
 | `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
 | `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
 | `bwss index derived on` / `off` | Put item names, usernames, URIs and ids in the locked index on this device, or take them out (the default). |

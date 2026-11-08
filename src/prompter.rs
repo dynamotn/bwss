@@ -5,6 +5,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use dybw_core::vault::write::HistoryAnswer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use zeroize::Zeroizing;
@@ -246,6 +247,30 @@ impl Prompter {
         .map_err(|_| PromptError::Timeout)?
     }
 
+    /// Asks a history question (ADR 0016) with its three answers: "Write to
+    /// the login" (OK), "Keep the app's value separate" (not OK) and
+    /// "Cancel". `None` is the user's cancel.
+    pub async fn history(&self, description: &str) -> Result<Option<HistoryAnswer>, PromptError> {
+        tokio::time::timeout(self.timeout, async {
+            let mut c = self.start().await?;
+            c.set("SETTITLE", "Keyring write").await?;
+            c.set("SETDESC", description).await?;
+            c.set("SETOK", "Write to the login").await?;
+            c.set("SETNOTOK", "Keep the app's value separate").await?;
+            c.set("SETCANCEL", "Cancel").await?;
+            let reply = c.command("CONFIRM").await?;
+            c.finish().await;
+            match reply {
+                Reply::Ok(_) => Ok(Some(HistoryAnswer::WriteToLogin)),
+                Reply::Err(e) if err_code(&e) == ERR_NOT_CONFIRMED => Ok(Some(HistoryAnswer::KeepSeparate)),
+                Reply::Err(e) if err_code(&e) == ERR_CANCELED => Ok(None),
+                Reply::Err(e) => Err(PromptError::Protocol(format!("CONFIRM: {e}"))),
+            }
+        })
+        .await
+        .map_err(|_| PromptError::Timeout)?
+    }
+
     /// Asks whether an application may use an item. Without `offer_always`
     /// there is no second question: the answer is `Once` or `Deny`.
     pub async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError> {
@@ -392,10 +417,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_history_question_has_three_answers() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let answering = |reply: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(format!("pinentry-{}", reply.len()));
+            let body = format!(
+                "#!/bin/sh\necho OK\nwhile IFS= read -r l; do\n  printf '%s\\n' \"$l\" >> \"$0.log\"\n  case \"$l\" in\n    CONFIRM*) echo '{reply}' ;;\n    BYE*) echo OK; exit 0 ;;\n    *) echo OK ;;\n  esac\ndone\n"
+            );
+            std::fs::write(&path, body).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap_or_else(|e| panic!("{e}"));
+            (Prompter::new(path.to_string_lossy(), LONG), path)
+        };
+        let (p, path) = answering("OK");
+        assert_eq!(p.history("d").await.ok().flatten(), Some(HistoryAnswer::WriteToLogin));
+        let log = std::fs::read_to_string(path.with_extension("log")).unwrap_or_default();
+        for line in ["SETOK Write to the login", "SETNOTOK Keep the app's value separate", "SETCANCEL Cancel"] {
+            assert!(log.lines().any(|l| l == line), "{line}: {log}");
+        }
+        let (p, _) = answering("ERR 83886194 Not confirmed");
+        assert_eq!(p.history("d").await.ok().flatten(), Some(HistoryAnswer::KeepSeparate));
+        let (p, _) = answering("ERR 83886179 Operation cancelled");
+        assert!(matches!(p.history("d").await, Ok(None)));
+        let (p, _) = answering("ERR 1 no tty");
+        assert_eq!(error_of(p.history("d").await).as_deref(), Some("prompter protocol error: CONFIRM: 1 no tty"));
+    }
+
+    #[tokio::test]
     async fn a_pinentry_that_never_answers_times_out() {
         let p = scripted("silent.sh", Duration::from_millis(200));
         assert_eq!(error_of(p.password("d", None).await).as_deref(), Some("the prompt timed out"));
         assert_eq!(error_of(p.confirm("d", true).await).as_deref(), Some("the prompt timed out"));
+        assert_eq!(error_of(p.history("d").await).as_deref(), Some("the prompt timed out"));
     }
 
     #[test]

@@ -36,7 +36,10 @@ use zeroize::Zeroizing;
 use dybw_core::ports::Storage;
 use dybw_core::profile;
 
-use crate::backend::bitwarden::{ACCEPT_ROLLBACK, KDF_OFFERED, ROLLBACKS_HELD, kdf_offer, ran_kdf, rollbacks};
+use crate::backend::bitwarden::{
+    ACCEPT_ROLLBACK, Answer, Asked, HISTORY_ANSWERS, HISTORY_QUESTIONS, KDF_OFFERED, ROLLBACKS_HELD, asked, kdf_offer,
+    ran_kdf, rollbacks,
+};
 use crate::backend::{Backend, bitwarden::BitwardenBackend, kdf_text, memory::MemoryBackend};
 use crate::bw::api::identity_origin;
 use crate::config::{BackendKind, Credentials, Paths, Trust};
@@ -118,6 +121,35 @@ enum Command {
         #[command(subcommand)]
         command: SecurityCommand,
     },
+    /// Answer the question a queued change waits on, as `bwss status` lists
+    /// it (ADR 0016), then sync.
+    Answer {
+        /// The item's id.
+        id: String,
+        #[arg(value_enum)]
+        answer: AnswerArg,
+    },
+}
+
+/// The answers to a history question.
+#[derive(Clone, Copy, ValueEnum)]
+enum AnswerArg {
+    /// Write the app's value to the login password.
+    Login,
+    /// Keep the app's value in a hidden field of its own.
+    Separate,
+    /// Drop the change.
+    Cancel,
+}
+
+impl From<AnswerArg> for Answer {
+    fn from(a: AnswerArg) -> Self {
+        match a {
+            AnswerArg::Login => Answer::Login,
+            AnswerArg::Separate => Answer::Separate,
+            AnswerArg::Cancel => Answer::Cancel,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -263,6 +295,27 @@ async fn accept_rollbacks(unlocked: bool, storage: &impl Storage) -> anyhow::Res
         .iter()
         .map(|r| format!("accepting the server's version of {} (cipher {}, revision {})", r.id, r.cipher, r.revision))
         .collect())
+}
+
+/// `bwss answer`: answers, for the next sync of the unlocked keyring, the
+/// question the queued change of `id` waits on, as `bwss status` lists it
+/// (ADR 0016). Returns what it recorded, to show.
+async fn answer_history(unlocked: bool, storage: &impl Storage, id: &str, answer: Answer) -> anyhow::Result<String> {
+    if !unlocked {
+        bail!("the keyring is locked: unlock it, check what `bwss status` lists, then answer; nothing was answered");
+    }
+    let Some(question) = asked(storage, HISTORY_QUESTIONS).await.into_iter().find(|q| q.id == id) else {
+        bail!("no queued change of {id} waits for an answer; nothing was answered");
+    };
+    let mut answers: Vec<Asked> = asked(storage, HISTORY_ANSWERS).await.into_iter().filter(|a| a.id != id).collect();
+    answers.push(Asked { answer: Some(answer), ..question.clone() });
+    storage.save(HISTORY_ANSWERS, &serde_json::to_vec(&answers)?).await?;
+    let what = match answer {
+        Answer::Login => "write it to the login password",
+        Answer::Separate => "keep the app's value in a field of its own",
+        Answer::Cancel => "drop the change",
+    };
+    Ok(format!("answering {} for {id}: {what}", question.question.code()))
 }
 
 /// The pinentry the daemon and the answering commands ask through, checked
@@ -539,6 +592,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             control.call::<_, _, ()>("Sync", &()).await?;
             Ok(())
         }
+        Command::Answer { id, answer } => {
+            let control = control().await?;
+            let (unlocked, _, _): (bool, u32, String) =
+                control.call("Status", &()).await.context("the bwss daemon cannot be reached; nothing was answered")?;
+            println!("{}", answer_history(unlocked, &answering()?.0, &id, answer.into()).await?);
+            control.call::<_, _, ()>("Sync", &()).await?;
+            Ok(())
+        }
         Command::Status => {
             let (unlocked, items, backend): (bool, u32, String) = control().await?.call("Status", &()).await?;
             for line in status_lines(unlocked, items, &backend) {
@@ -658,6 +719,34 @@ mod tests {
         let none = accept_rollbacks(true, &storage).await.unwrap_err().to_string();
         assert!(none.contains("nothing to accept"), "{none}");
         assert_eq!(storage.load(ACCEPT_ROLLBACK).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_needs_an_unlocked_daemon_and_a_question() {
+        use dybw_core::vault::write::HistoryQuestion;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().as_os_str().to_owned();
+        let storage = FileStorage::new(&Paths::with(|v| (v == "HOME").then(|| home.clone())), "p");
+        let asked_now = br#"[{"id":"gh","question":"EvictsForeign"}]"#;
+        storage.save(HISTORY_QUESTIONS, asked_now).await.unwrap();
+        let locked = answer_history(false, &storage, "gh", Answer::Login).await.unwrap_err().to_string();
+        assert!(locked.contains("the keyring is locked") && locked.contains("nothing was answered"), "{locked}");
+        let none = answer_history(true, &storage, "other", Answer::Login).await.unwrap_err().to_string();
+        assert!(none.contains("no queued change of other"), "{none}");
+        assert_eq!(storage.load(HISTORY_ANSWERS).await.unwrap(), None, "nothing recorded");
+
+        let shown = answer_history(true, &storage, "gh", Answer::Separate).await.unwrap();
+        assert_eq!(shown, "answering evicts-foreign-history for gh: keep the app's value in a field of its own");
+        // A second answer replaces the first.
+        answer_history(true, &storage, "gh", Answer::Cancel).await.unwrap();
+        let recorded = asked(&storage, HISTORY_ANSWERS).await;
+        assert_eq!(
+            recorded,
+            [Asked { id: "gh".into(), question: HistoryQuestion::EvictsForeign, answer: Some(Answer::Cancel) }]
+        );
+        assert!(matches!(Answer::from(AnswerArg::Login), Answer::Login));
+        assert!(matches!(Answer::from(AnswerArg::Separate), Answer::Separate));
+        assert!(matches!(Answer::from(AnswerArg::Cancel), Answer::Cancel));
     }
 
     #[test]

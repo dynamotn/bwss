@@ -5,6 +5,7 @@
 
 use std::rc::Rc;
 
+use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -21,7 +22,7 @@ pub(crate) enum Command {
     Refresh(Reply<Option<Snapshot>>),
     CreateCollection(String, Reply<CollectionData>),
     DeleteCollection(String, Vec<String>, Reply<()>),
-    PutItem(ItemData, Reply<()>),
+    PutItem(ItemData, Option<(HistoryQuestion, HistoryAnswer)>, Reply<()>),
     DeleteItem(ItemData, Reply<()>),
     AclTrust(Reply<AclTrust>),
     Describe(oneshot::Sender<String>),
@@ -120,8 +121,8 @@ async fn serve(vault: Rc<Bitwarden>, command: Command) {
         Command::DeleteCollection(id, items, reply) => {
             let _ = reply.send(vault.delete_collection(&id, &items).await);
         }
-        Command::PutItem(item, reply) => {
-            let _ = reply.send(vault.put_item(&item).await);
+        Command::PutItem(item, answer, reply) => {
+            let _ = reply.send(vault.put_item_answered(&item, answer).await);
         }
         Command::DeleteItem(item, reply) => {
             let _ = reply.send(vault.delete_item(&item).await);

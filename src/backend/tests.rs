@@ -12,15 +12,17 @@ use zeroize::Zeroizing;
 use super::Backend;
 use super::BackendError;
 use super::bitwarden::{Bitwarden, BitwardenBackend};
-use super::ops::{Loaded, Op, QUEUE_FORMAT, read_formats, unseal};
+use super::ops::{Loaded, QUEUE_FORMAT, new_item_of, read_formats, unseal};
 use super::registry::Registry;
 use super::runner::Effect;
 use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
 use crate::bw::fields::field_names;
 use crate::bw::scan::{Keys, Scan, scan};
-use crate::bw::write::{Patch, ValueChange};
 use crate::config::{Config, Credentials, Paths};
 use crate::model::{Attributes, ItemData, Snapshot};
+use dybw_core::ports::Storage;
+use dybw_core::sync::Op;
+use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion, Patch, ValueChange, WriteRecord};
 
 const EMAIL: &str = "a@b.c";
 const PASSWORD: &str = "pw";
@@ -423,10 +425,27 @@ impl Vault {
     /// The ops in queue.json, opened with the queue key.
     fn queue_file(&self) -> usize {
         match read_formats(&self.dir.join("state/queue.json"), "legacy", &[QUEUE_FORMAT]) {
-            Loaded::Ok(v) => unseal(&v, &super::bitwarden::queue_key(&self.keys.user)).unwrap().len(),
+            Loaded::Ok(v) => unseal(&v, &super::bitwarden::queue_key(&core_key(&self.keys.user))).unwrap().len(),
             Loaded::Missing => 0,
             _ => panic!("queue.json cannot be read"),
         }
+    }
+}
+
+/// The core's copy of a key of bwss's own.
+fn core_key(k: &SymmetricKey) -> dybw_core::crypto::SymmetricKey {
+    dybw_core::crypto::SymmetricKey::from_bytes(&k.to_bytes()).unwrap()
+}
+
+impl Vault {
+    /// Records that this device already confirmed its first write back to
+    /// the login password of `id`, in cipher `cid` (ADR 0016).
+    async fn confirm_write_back(&self, id: &str, cid: &str) {
+        let mut guard = self.backend.state.lock().await;
+        let state = guard.as_mut().unwrap();
+        let record = WriteRecord { written: vec![], confirmed: true, cipher_id: Some(cid.into()) };
+        state.records.insert(id.into(), record);
+        self.backend.save_records(&state.records, &super::bitwarden::queue_key(&state.core_keys.user));
     }
 }
 
@@ -448,6 +467,7 @@ fn new_item(id: &str, collection: &str) -> ItemData {
 async fn writes_change_only_bwss_fields_and_the_value_source() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.confirm_write_back("gh", "c1").await;
     let mut item = v.item("gh").await;
     item.secret = Zeroizing::new(b"rotated".to_vec());
     item.label = "GitHub token".into();
@@ -500,6 +520,7 @@ async fn deleting_strips_and_trashes_only_bare_items() {
 async fn out_of_date_writes_reapply_and_value_conflicts_fail() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    v.confirm_write_back("gh", "c1").await;
 
     // Another device renamed the item: bwss's label lands on the fresh copy.
     let renamed = k.encrypt_str("Renamed elsewhere");
@@ -525,6 +546,7 @@ async fn out_of_date_writes_reapply_and_value_conflicts_fail() {
 async fn offline_writes_queue_merge_and_replay() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
     item.secret = Zeroizing::new(b"one".to_vec());
@@ -565,6 +587,7 @@ async fn offline_writes_queue_merge_and_replay() {
 async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
     item.secret = Zeroizing::new(b"queued".to_vec());
@@ -596,6 +619,7 @@ async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
 async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
     item.secret = Zeroizing::new(b"ours".to_vec());
@@ -662,6 +686,7 @@ async fn queued_changes_wait_for_unreadable_items_and_drop_for_gone_ones() {
         "passwordHistory": null, "fields": enc_fields(&k, &[("bwss:id", "x"), ("bwss:password", "s")]),
     });
     let v = vault(vec![hand_marked(&k, "c1", "gh"), other], k).await;
+    v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
     item.secret = Zeroizing::new(b"queued".to_vec());
@@ -684,16 +709,17 @@ async fn queued_changes_wait_for_unreadable_items_and_drop_for_gone_ones() {
     });
     v.backend.refresh().await.unwrap();
     v.backend.refresh().await.unwrap();
-    assert_eq!(v.queued().await, 2, "a change to an item that cannot be read waits");
-    assert_eq!(v.queue_file(), 2);
+    // Only that item's ops wait (the core's queue): the delete of the item
+    // that is gone is done.
+    assert_eq!(v.queued().await, 1, "a change to an item that cannot be read waits");
+    assert_eq!(v.queue_file(), 1);
     // Also after a new unlock, when nothing is held yet.
     v.backend.lock().await;
     v.backend.unlock(PASSWORD).await.unwrap();
     v.backend.refresh().await.unwrap();
-    assert_eq!((v.queued().await, v.queue_file()), (2, 2));
+    assert_eq!((v.queued().await, v.queue_file()), (1, 1));
 
-    // Readable again: the change goes through; the delete of a gone item is
-    // dropped.
+    // Readable again: the change goes through.
     v.fake.with(|s| {
         s.rev += 1;
         let rev = s.revision();
@@ -748,8 +774,10 @@ async fn an_accepted_create_leaves_the_queue_even_when_the_keyring_locks() {
         s.pause = Some(("POST".into(), "/api/ciphers".into(), reached_tx, release_rx));
     });
     let backend = v.backend.clone();
-    let flush = tokio::spawn(async move { backend.refresh().await });
-    tokio::task::spawn_blocking(move || reached.recv().unwrap()).await.unwrap();
+    let local = tokio::task::LocalSet::new();
+    // The core's futures are not `Send`: the flush runs on this thread.
+    let flush = local.spawn_local(async move { backend.refresh().await });
+    local.run_until(tokio::task::spawn_blocking(move || reached.recv().unwrap())).await.unwrap();
     // `lock` drops the keys at once, then waits for the request in flight
     // to log out.
     let backend = v.backend.clone();
@@ -762,7 +790,7 @@ async fn an_accepted_create_leaves_the_queue_even_when_the_keyring_locks() {
     .await
     .expect("lock drops the keys");
     release.send(()).unwrap();
-    let _ = flush.await.unwrap();
+    let _ = local.run_until(flush).await.unwrap();
     locking.await.unwrap();
 
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
@@ -864,6 +892,7 @@ async fn status_lists_duplicates() {
 async fn a_write_read_from_the_server_replaces_a_queued_one() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k.clone()).await;
+    v.confirm_write_back("gh", "c1").await;
     // A delete that cannot be sent keeps the queue blocked, so the change
     // below stays queued across refreshes.
     v.fake.with(|s| s.fail_puts = true);
@@ -988,6 +1017,248 @@ async fn acl_decisions_are_keyed_by_a_key_of_their_own() {
     assert!(matches!(v.backend.acl_trust().await, Err(BackendError::Locked)));
 }
 
+// --- ADR 0016: the password history ------------------------------------------
+
+#[tokio::test]
+async fn keep_separate_moves_the_value_to_a_field() {
+    let k = SymmetricKey::generate();
+    let mut login = hand_marked(&k, "c1", "gh");
+    // A full history of passwords this device never wrote.
+    let history: Vec<Value> =
+        (1..=5).map(|n| json!({ "password": k.encrypt_str(&format!("old{n}")), "lastUsedDate": REV })).collect();
+    login["passwordHistory"] = json!(history);
+    let v = vault(vec![login], k).await;
+    let puts = v.fake.count("PUT", "/api/ciphers/");
+    let item = ItemData { secret: Zeroizing::new(b"app".to_vec()), ..v.item_offline("gh").await };
+    // The eviction is asked, over the first write-back.
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(err, BackendError::Ask(HistoryQuestion::EvictsForeign)), "{err}");
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/"), puts, "nothing was written");
+    assert_eq!(v.queued().await, 0, "nothing was queued");
+    // An answer to another question does not cover it.
+    let other = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
+    let err = v.backend.put_item_answered(&item, Some(other)).await.unwrap_err();
+    assert!(matches!(err, BackendError::Ask(HistoryQuestion::EvictsForeign)), "{err}");
+
+    let answer = (HistoryQuestion::EvictsForeign, HistoryAnswer::KeepSeparate);
+    v.backend.put_item_answered(&item, Some(answer)).await.unwrap();
+    let c = v.fake.cipher("c1");
+    assert_eq!(v.dec(&c["login"]["password"]), "pw", "the login password stays");
+    assert_eq!(c["passwordHistory"].as_array().unwrap().len(), 5);
+    assert_eq!(v.dec(&c["passwordHistory"][4]["password"]), "old5", "and its history");
+    let field = c["fields"].as_array().unwrap().iter().find(|f| v.dec(&f["name"]) == "bwss:password").unwrap();
+    assert_eq!((field["type"].as_u64(), v.dec(&field["value"])), (Some(1), "app".to_owned()), "hidden");
+    let m = v.marked("c1");
+    assert_eq!((m.source, m.item.secret.as_slice()), (crate::bw::scan::ValueSource::Field, &b"app"[..]));
+    // From then on the field is the value source: no more questions.
+    v.backend.put_item(&ItemData { secret: Zeroizing::new(b"again".to_vec()), ..item }).await.unwrap();
+    assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "pw");
+}
+
+#[tokio::test]
+async fn a_queued_question_waits_for_bwss_answer() {
+    use crate::backend::bitwarden::{Answer, HISTORY_ANSWERS, HISTORY_QUESTIONS, asked};
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x"), hand_marked(&k, "c3", "y")], k).await;
+    // Offline since the unlock: a live write would ask through the pinentry instead.
+    v.fake.with(|s| s.down = true);
+    *v.backend.client.lock().await = None;
+    for id in ["gh", "x", "y"] {
+        let item = ItemData { secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline(id).await };
+        v.backend.put_item(&item).await.unwrap();
+    }
+    assert_eq!(v.queue_sizes().await, (3, 3));
+
+    // Sent, the first write-back of each login needs an answer: both wait.
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (3, 3), "the changes wait, never dropped");
+    assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "pw");
+    let status = v.backend.describe().await;
+    assert!(status.contains("waits for your answer: the first change from this device"), "{status}");
+    assert!(status.contains("`bwss answer gh login|separate|cancel`"), "{status}");
+    assert_eq!(asked(&v.storage(), HISTORY_QUESTIONS).await.len(), 3);
+
+    // An answer to another question than the one asked counts for nothing.
+    let stale = br#"[{"id":"gh","question":"EvictsForeign","answer":"login"}]"#;
+    v.storage().save(HISTORY_ANSWERS, stale).await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (3, 3));
+    assert_eq!(v.storage().load(HISTORY_ANSWERS).await.unwrap(), None, "an answer is used once");
+
+    // `bwss answer`: gh goes to the login, x is cancelled, y keeps its own field.
+    crate::answer_history(true, &v.storage(), "gh", Answer::Login).await.unwrap();
+    crate::answer_history(true, &v.storage(), "x", Answer::Cancel).await.unwrap();
+    crate::answer_history(true, &v.storage(), "y", Answer::Separate).await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    let c = v.fake.cipher("c1");
+    assert_eq!(
+        (v.dec(&c["login"]["password"]), v.dec(&c["passwordHistory"][0]["password"])),
+        ("queued".into(), "pw".into())
+    );
+    assert_eq!(v.dec(&v.fake.cipher("c2")["login"]["password"]), "pw", "the cancelled change is gone");
+    assert_eq!(v.dec(&v.fake.cipher("c3")["login"]["password"]), "pw", "the login stays");
+    assert_eq!(&*v.marked("c3").item.secret, b"queued", "the value is in its own field");
+    assert!(!v.backend.describe().await.contains("waits for your answer"));
+    assert_eq!(v.storage().load(HISTORY_QUESTIONS).await.unwrap(), None);
+
+    // The write is recorded: the next one to gh asks nothing, even after a restart.
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    let item = ItemData { secret: Zeroizing::new(b"later".to_vec()), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "later");
+}
+
+#[tokio::test]
+async fn acl_lines_union_after_an_out_of_date_retry() {
+    let v = github().await;
+    // Another device grants its own app while this one grants another.
+    let (name, value) = (v.keys.user.encrypt_str("bwss:acl"), v.keys.user.encrypt_str("/usr/bin/theirs"));
+    v.fake.with(|s| {
+        s.before_put = Some(Box::new(move |c: &mut Value| {
+            c["fields"].as_array_mut().unwrap().push(json!({ "type": 1, "name": name, "value": value }));
+        }))
+    });
+    let mut item = v.item_offline("gh").await;
+    item.acl.push("/usr/bin/mine".into());
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1"), 2, "out of date once, then sent again");
+    assert_eq!(v.marked("c1").item.acl, ["/usr/bin/theirs", "/usr/bin/mine"], "both lines are kept");
+    assert_eq!(v.item_offline("gh").await.acl, ["/usr/bin/theirs", "/usr/bin/mine"]);
+
+    // Queued, the union is made with what the server holds when it is sent.
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    let mut item = v.item_offline("gh").await;
+    item.acl.push("/usr/bin/mine".into());
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.add_field("c1", "bwss:acl", "/usr/bin/theirs");
+    v.edit_elsewhere("c1", |_| {});
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.marked("c1").item.acl, ["/usr/bin/theirs", "/usr/bin/mine"]);
+}
+
+#[tokio::test]
+async fn a_write_record_belongs_to_its_cipher() {
+    let v = github().await;
+    // A record of another cipher (the item was recreated elsewhere) counts for nothing here.
+    v.backend.state.lock().await.as_mut().unwrap().records.get_mut("gh").unwrap().cipher_id = Some("c9".into());
+    let item = ItemData { secret: Zeroizing::new(b"new".to_vec()), ..v.item_offline("gh").await };
+    let err = v.backend.put_item(&item).await.unwrap_err();
+    assert!(matches!(err, BackendError::Ask(HistoryQuestion::FirstWriteBack)), "{err}");
+    let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
+    v.backend.put_item_answered(&item, Some(answer)).await.unwrap();
+    let records = v.backend.state.lock().await.as_ref().unwrap().records["gh"].clone();
+    assert_eq!((records.cipher_id.as_deref(), records.confirmed, records.written.len()), (Some("c1"), true, 1));
+}
+
+#[tokio::test]
+async fn records_and_questions_that_cannot_be_kept_ask_again() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    // Directories where the files go: writing them fails, for any user.
+    std::fs::create_dir_all(v.dir.join("state/write-records/x")).unwrap();
+    std::fs::create_dir_all(v.dir.join("tool-state/core/history-questions/x")).unwrap();
+    v.fake.with(|s| s.down = true);
+    *v.backend.client.lock().await = None;
+    let item = ItemData { secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    // Still asked and listed: only `bwss answer` cannot see it.
+    assert!(v.backend.describe().await.contains("waits for your answer"));
+    // The records do not open after a restart: the next write asks again.
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(v.backend.state.lock().await.as_ref().unwrap().records.is_empty());
+}
+
+#[tokio::test]
+async fn a_queued_change_of_an_item_never_readable_is_listed() {
+    let v = github().await;
+    v.backend.state.lock().await.as_mut().unwrap().stuck =
+        vec![("gh".into(), dybw_core::vault::Uninspectable::TooLarge)];
+    let status = v.backend.describe().await;
+    assert!(status.contains("a queued change of gh (gh) waits: it is larger than any item bwss reads"), "{status}");
+}
+
+#[tokio::test]
+async fn a_live_op_without_a_session_waits() {
+    let v = github().await;
+    *v.backend.client.lock().await = None;
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    let Op::Patch(p) =
+        super::runner::plan_put(Some(&v.backend.state.lock().await.as_ref().unwrap().built.marked["gh"]), &item)
+    else {
+        panic!("a patch")
+    };
+    let failed = v.backend.run(&Op::Patch(p)).await.unwrap_err();
+    assert!(format!("{failed:?}").contains("not logged in"), "{failed:?}");
+}
+
+#[tokio::test]
+async fn a_delete_of_an_item_the_cache_no_longer_holds_sends_nothing() {
+    let v = github().await;
+    v.backend.state.lock().await.as_mut().unwrap().sync["ciphers"] = json!([]);
+    let puts = v.fake.count("PUT", "/api/");
+    v.backend.delete_item(&v.item_offline("gh").await).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/"), puts);
+}
+
+#[tokio::test]
+async fn collection_changes_queue_behind_item_changes() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    // The server is back, but the item change is still queued: nothing jumps ahead.
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.queue_sizes().await, (2, 2));
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
+    // A collection change that cannot be kept on disk is refused.
+    let queue = v.dir.join("state/queue.json");
+    std::fs::create_dir_all(crate::fsutil::temp_path(&queue)).unwrap();
+    let err = v.backend.create_collection("Home").await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be queued on disk")), "{err}");
+    assert_eq!(v.queued().await, 2);
+    std::fs::remove_dir(crate::fsutil::temp_path(&queue)).unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert!(v.snapshot().await.collections.iter().any(|c| c.id == "work"));
+}
+
+#[tokio::test]
+async fn a_queued_collection_change_the_server_refuses_is_dropped() {
+    let v = with_registry().await;
+    v.fake.with(|s| s.down = true);
+    v.backend.create_collection("Work").await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.fake.fault("PUT", "/api/ciphers/r1", 400, 1);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert!(!v.snapshot().await.collections.iter().any(|c| c.id == "work"), "the view goes back");
+}
+
+#[tokio::test]
+async fn a_vault_that_cannot_be_read_after_a_flush_is_read_at_the_next_sync() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    // The flush is sent; the read right after it fails once.
+    v.fake.fault("GET", "/api/sync", 500, 1);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.item_offline("gh").await.label, "Queued");
+    assert!(v.logged_in().await, "a failed read keeps the session");
+}
+
 // --- what goes wrong on the server ---------------------------------------------
 
 impl Vault {
@@ -996,7 +1267,7 @@ impl Vault {
     }
 
     async fn logged_in(&self) -> bool {
-        self.backend.api.lock().await.is_logged_in()
+        self.backend.client.lock().await.is_some()
     }
 
     /// Another device adds a field to `cid`. The server's revision stays
@@ -1054,15 +1325,17 @@ impl Gate {
 
 /// Holds the request `method path`, locks the keyring while it is in flight,
 /// and then lets the request go. Returns what `op` returned.
-async fn lock_during<T: Send + 'static>(
+async fn lock_during<T: 'static>(
     v: &Vault,
     method: &str,
     path: &str,
-    op: impl std::future::Future<Output = T> + Send + 'static,
+    op: impl std::future::Future<Output = T> + 'static,
 ) -> T {
     let mut gate = Gate::hold(&v.fake, method, path);
-    let running = tokio::spawn(op);
-    gate.arrived().await;
+    // The core's futures are not `Send`: `op` runs on this thread.
+    let local = tokio::task::LocalSet::new();
+    let running = local.spawn_local(op);
+    local.run_until(gate.arrived()).await;
     // `lock` drops the keys at once, then waits for the request in flight to
     // log out.
     let backend = v.backend.clone();
@@ -1075,14 +1348,18 @@ async fn lock_during<T: Send + 'static>(
     .await
     .expect("lock drops the keys");
     gate.open();
-    let out = running.await.unwrap();
+    let out = local.run_until(running).await.unwrap();
     locking.await.unwrap();
     out
 }
 
+/// A vault with the login `gh` (cipher `c1`), whose first write back this
+/// device already confirmed (ADR 0016).
 async fn github() -> Vault {
     let k = SymmetricKey::generate();
-    vault(vec![hand_marked(&k, "c1", "gh")], k).await
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.confirm_write_back("gh", "c1").await;
+    v
 }
 
 #[tokio::test]
@@ -1284,7 +1561,11 @@ async fn a_delete_gives_way_to_what_another_device_did_to_the_item() {
     v.fake.fault_reply("GET", "/api/ciphers/c1", 200, no_revision);
     let item = v.item_offline("gh").await;
     let err = v.backend.delete_item(&item).await.unwrap_err();
-    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("no revisionDate")), "{err}");
+    // The core reads a copy without a revision as one it cannot read now.
+    assert!(
+        matches!(&err, BackendError::Unavailable(m) if m.starts_with("c1: ") && m.ends_with("try again later")),
+        "{err}"
+    );
     assert_eq!(v.names("c1"), MARKS, "nothing was stripped");
 }
 
@@ -1371,9 +1652,12 @@ async fn writes_to_an_item_that_cannot_be_read_wait() {
     );
     assert_eq!(v.queued().await, 0);
 
+    let err = v.backend.delete_item(&item).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be read now")), "{err}");
+
     // With the session gone and the server down, it is queued, to be applied
     // once the item can be read.
-    v.backend.api.lock().await.logout();
+    *v.backend.client.lock().await = None;
     v.fake.with(|s| s.down = true);
     v.backend.put_item(&item).await.unwrap();
     assert_eq!(v.queue_sizes().await, (1, 1));
@@ -1406,19 +1690,21 @@ async fn ops_that_were_done_before_send_nothing() {
     let (posts, puts) = (v.fake.count("POST", "/api/ciphers"), v.fake.count("PUT", "/api/ciphers"));
 
     // A queued create that was accepted before (just before a lock).
-    let create = Op::Create { id: "n1".into(), collection: "login".into(), item };
+    let create = Op::Create(new_item_of(&item, None));
     let effect = v.backend.run(&create).await.unwrap();
     assert!(matches!(effect, Effect::Nothing), "{effect:?}");
 
     // A patch with no change.
     let empty = Op::Patch(Patch {
         id: "n1".into(),
+        cipher_id: None,
+        organization_id: None,
         base_revision: REV.into(),
         set: vec![],
         remove: vec![],
-        acl_add: vec![],
+        append_lines: vec![],
         value: ValueChange::Keep,
-        cipher_id: None,
+        answer: None,
     });
     let effect = v.backend.run(&empty).await.unwrap();
     assert!(matches!(effect, Effect::Nothing), "{effect:?}");
@@ -1559,6 +1845,17 @@ async fn a_registry_note_changed_elsewhere_into_something_else_is_handled() {
     );
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
 
+    // It is no longer of the registry's kind: a new registry note is started.
+    let v = with_registry().await;
+    let (name, other) = (v.keys.user.encrypt_str("bwss:kind"), v.keys.user.encrypt_str("something-else"));
+    v.fake.with(|s| {
+        // The second field is `bwss:kind`.
+        s.before_put =
+            Some(Box::new(move |c: &mut Value| c["fields"][1] = json!({ "type": 0, "name": name, "value": other })))
+    });
+    v.backend.create_collection("Work").await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+
     // It lost its marks: a new registry note is started, with what is known.
     let v = with_registry().await;
     v.fake.with(|s| s.before_put = Some(Box::new(|c: &mut Value| c["fields"] = json!([]))));
@@ -1621,12 +1918,13 @@ async fn a_registry_found_unreadable_while_its_folder_is_made_is_not_written() {
     let v = vault(vec![], SymmetricKey::generate()).await;
     let mut gate = Gate::hold(&v.fake, "POST", "/api/folders");
     let backend = v.backend.clone();
-    let creating = tokio::spawn(async move { backend.create_collection("Work").await });
-    gate.arrived().await;
+    let local = tokio::task::LocalSet::new();
+    let creating = local.spawn_local(async move { backend.create_collection("Work").await });
+    local.run_until(gate.arrived()).await;
     // The keyring is rebuilt meanwhile, and the registry is now unreadable.
     v.backend.state.lock().await.as_mut().unwrap().built.registry_unreadable = true;
     gate.open();
-    let err = creating.await.unwrap().unwrap_err();
+    let err = local.run_until(creating).await.unwrap().unwrap_err();
     assert!(
         matches!(&err, BackendError::Unavailable(m) if m.starts_with("the collection registry cannot be read")),
         "{err}"
@@ -1758,7 +2056,8 @@ async fn a_vault_sync_without_a_cipher_list_still_takes_writes() {
         s.sync.as_object_mut().unwrap().remove("ciphers");
     });
     v.backend.refresh().await.unwrap();
-    assert!(v.backend.state.lock().await.as_ref().unwrap().sync.get("ciphers").is_none());
+    // The core's client reads a missing list as an empty one.
+    assert_eq!(v.backend.state.lock().await.as_ref().unwrap().sync["ciphers"], json!([]));
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
     // The server's answer had nowhere to go in the cache: the next sync shows the item.
@@ -1870,7 +2169,8 @@ const STOPPED: &str = "bwss's vault worker stopped; it was restarted locked";
 async fn commands_round_trip() {
     let (_fake, b, _dir) = handle(vec![]).await;
     assert!(matches!(b.unlock("wrong").await, Err(BackendError::WrongPassword)));
-    b.put_item(&new_item("n1", "login")).await.unwrap();
+    let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
+    b.put_item_answered(&new_item("n1", "login"), answer).await.unwrap();
     let work = b.create_collection("Work").await.unwrap();
     assert_eq!(work.id, "work");
     // The writes are already shown: nothing new on the server.
@@ -2148,14 +2448,19 @@ async fn a_cose_v2_account_unlocks() {
     let core = dir.path().join("tool-state/core");
     assert_eq!(std::fs::read_to_string(core.join("security-version")).unwrap(), "2");
     assert!(core.join("user-key-id").exists());
-    // Until the core writes (B5), nothing is written to it.
-    let err = b.put_item(&new_item("n1", "login")).await.unwrap_err();
-    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("COSE")), "{err}");
-    assert!(b.create_collection("Work").await.is_err());
-    assert!(b.delete_collection("work", &[]).await.is_err());
-    assert!(b.delete_item(&new_item("n1", "login")).await.is_err());
-    assert_eq!(fake.count("POST", "/api/"), 0);
-    assert!(b.describe().await.contains("COSE"));
+    // B5: the core writes to it; a new item is a blob (ADR 0021).
+    b.put_item(&new_item("n1", "work")).await.unwrap();
+    let created = fake.with(|s| s.sync["ciphers"][1].clone());
+    assert!(created["data"].is_string() && created["fields"].is_null(), "{created}");
+    let shown = b.state.lock().await.as_ref().unwrap().built.marked["n1"].item.clone();
+    assert_eq!((shown.secret.as_slice(), shown.collection.as_str()), (&b"tok"[..], "work"));
+    b.create_collection("Home").await.unwrap();
+    b.refresh().await.unwrap();
+    let collections = b.state.lock().await.as_ref().unwrap().built.snapshot.collections.clone();
+    assert!(collections.iter().any(|c| c.id == "home"), "{collections:?}");
+    b.delete_item(&shown).await.unwrap();
+    assert!(fake.cipher(created["id"].as_str().unwrap())["deletedDate"].is_string());
+    assert!(!b.describe().await.contains("COSE"));
 
     // ADR 0019: a version below the one this device saw stops the unlock until accepted.
     b.lock().await;
@@ -2252,7 +2557,7 @@ async fn a_key_change_that_cannot_reset_says_so() {
 }
 
 #[tokio::test]
-async fn a_write_racing_a_cose_unlock_is_refused() {
+async fn a_write_racing_a_cose_unlock_waits_for_it_and_is_sent() {
     use std::rc::Rc;
     use std::time::Duration;
     let (sync, password) = cose_v2();
@@ -2279,10 +2584,10 @@ async fn a_write_racing_a_cose_unlock_is_refused() {
             tokio::time::sleep(Duration::from_millis(300)).await;
             drop(held);
             unlocking.await.unwrap().unwrap();
-            let err = writing.await.unwrap().unwrap_err();
-            assert!(matches!(&err, BackendError::Rejected(m) if m.contains("COSE")), "{err}");
-            assert_eq!(fake.count("POST", "/api/"), 0, "nothing sent under the stand-in key");
-            assert_eq!(b.queue.lock().await.len(), 0, "nothing queued under it either");
+            writing.await.unwrap().unwrap();
+            assert_eq!(fake.count("POST", "/api/ciphers"), 1, "sent under the account's own key");
+            assert!(fake.with(|s| s.sync["ciphers"][0]["data"].is_string()), "as a blob");
+            assert_eq!(b.queue.lock().await.len(), 0, "nothing queued");
         })
         .await;
 }
@@ -2433,6 +2738,33 @@ impl Vault {
         roll_back(self, cid, old);
         self.snapshot().await;
     }
+}
+
+#[tokio::test]
+async fn a_write_to_a_rolled_back_item_waits_until_the_rollback_is_settled() {
+    let v = github().await;
+    v.rolled_back("c1", "new").await;
+    let puts = v.fake.count("PUT", "/api/ciphers/c1");
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    // Never sent over the server's older copy: kept queued, and listed.
+    v.backend.put_item(&item).await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1"), puts, "nothing was sent");
+    assert_eq!(v.item_offline("gh").await.label, "Mine", "the change is shown");
+    let status = v.backend.describe().await;
+    assert!(
+        status.contains("queued changes wait while the server holds an older copy than this device: gh"),
+        "{status}"
+    );
+
+    // Accepted: the change goes to the server's version.
+    v.accept_rollbacks().await;
+    v.backend.refresh().await.unwrap();
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    assert_eq!(v.marked("c1").item.label, "Mine");
+    assert_eq!(&*v.marked("c1").item.secret, b"pw", "on the server's version");
 }
 
 #[tokio::test]

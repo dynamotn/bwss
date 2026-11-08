@@ -6,21 +6,22 @@
 //!   so the keyring unlocks and reads without a network; writes are queued,
 //!   shown at once, and replayed in order on the next successful refresh.
 //!
-//! Writes go through the op runner (`runner.rs`): bwss changes only its own
-//! fields and the value source of an item (design §5).
+//! Writes go through the op runner (`runner.rs`) and dybw-core: bwss changes
+//! only its own fields and the value source of an item (design §5).
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use dybw_core::api::{ApiKey as CoreApiKey, Client, DeviceInfo, ServerUrls};
-use dybw_core::crypto::{AwsLcRsa, KdfParams, SymmetricKey as CoreKey};
+use dybw_core::api::{ApiError as CoreApiError, ApiKey as CoreApiKey, Client, DeviceInfo, ServerUrls};
+use dybw_core::crypto::{AwsLcRsa, KdfParams, MarkScheme, Marker, SymmetricKey as CoreKey};
 use dybw_core::ports::Storage;
 use dybw_core::profile::{self, CachedSync, ProfileError, SecurityFault, UnlockWarning};
-use dybw_core::sync::is_rollback;
+use dybw_core::sync::{Op, is_rollback};
 use dybw_core::vault::fields as core_fields;
+use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion, NewItem, WriteRecord, new_item};
 use dybw_core::vault::{
     Keys as CoreKeys, MarkedItem as CoreItem, Namespace, Organizations, SkipReason, Uninspectable, UnmarkedCache,
     ValueSource as CoreSource, item_meta, scan_vault_with,
@@ -31,21 +32,19 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use super::ops::{
-    FORMAT as LEGACY_QUEUE_FORMAT, Loaded, Op, QUEUE_FORMAT, read_formats, read_versioned, seal, set_aside, unseal,
+    FORMAT as LEGACY_QUEUE_FORMAT, Loaded, QUEUE_FORMAT, Queue, read_formats, read_versioned, seal, set_aside, unseal,
 };
 use super::registry::{REGISTRY_ID, Registry};
-use super::runner::{Effect, status_lines};
+use super::runner::{Effect, apply_shown, queue_lines, status_lines};
 use super::worker::{Command, Worker, WorkerHandle};
 use super::{AclTrust, Backend, BackendError, kdf_text};
-use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
 use crate::bw::crypto::SymmetricKey;
 use crate::bw::fields::{
     A_ID, A_NAME, A_URI, A_USERNAME, DERIVED, F_ACL, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND,
     F_LABEL, F_LOCATION,
 };
 use crate::bw::items::parse_date;
-use crate::bw::scan::{Keys, MarkedItem, Scan, ValueSource, normalize_collection, resolve_duplicates, scan};
-use crate::bw::write::{apply, new_note};
+use crate::bw::scan::{MarkedItem, ValueSource, normalize_collection};
 use crate::config::{Config, Credentials, Paths};
 use crate::core_ports::{
     clock::SystemClock, http::HttpPort, kdf::BlockingArgon2, random::OsRandom, storage::FileStorage,
@@ -71,6 +70,42 @@ pub(crate) const ROLLBACKS_HELD: &str = "rollbacks-held";
 /// Storage key of the rollbacks `bwss sync --accept-rollback` accepted, for
 /// the next sync only.
 pub(crate) const ACCEPT_ROLLBACK: &str = "accept-rollback";
+/// Storage key of the history questions queued changes wait on (ADR 0016),
+/// which `bwss answer` answers.
+pub(crate) const HISTORY_QUESTIONS: &str = "history-questions";
+/// Storage key of the answers `bwss answer` gave, for the next sync only.
+pub(crate) const HISTORY_ANSWERS: &str = "history-answers";
+
+/// The core's client, as bwss runs it.
+pub(crate) type CoreClient = Client<HttpPort, SystemClock>;
+
+/// An answer to a history question, as `bwss answer` gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Answer {
+    /// Write to the login password.
+    Login,
+    /// Keep the app's value in a field of its own.
+    Separate,
+    /// Drop the change.
+    Cancel,
+}
+
+/// A queued change of item `id` that waits on `question`, with the answer
+/// `bwss answer` gave, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Asked {
+    pub id: String,
+    pub question: HistoryQuestion,
+    #[serde(default)]
+    pub answer: Option<Answer>,
+}
+
+/// A list of questions kept in `key`; none when it is missing or unreadable.
+pub(crate) async fn asked(storage: &impl Storage, key: &str) -> Vec<Asked> {
+    let raw = storage.load(key).await.ok().flatten();
+    raw.and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+}
 
 /// A version the server sent older than this device's copy (ADR 0019): it is
 /// held back, and accepted only as exactly this cipher at this revision.
@@ -87,9 +122,6 @@ pub(crate) async fn rollbacks(storage: &impl Storage, key: &str) -> Vec<Rollback
     let raw = storage.load(key).await.ok().flatten();
     raw.and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
 }
-/// Why a COSE account takes no writes yet.
-const COSE_READ_ONLY: &str =
-    "this account's user key is a COSE key: this bwss reads its items but cannot write to it yet, and writes nothing";
 
 /// KDF parameters as `sync.json` has always stored them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,19 +195,15 @@ pub(crate) async fn ran_kdf(storage: &impl Storage) -> Option<KdfParams> {
     }
 }
 
-/// Bridge until B5-B6: bwss's own code writes with its own key type, which
-/// holds a legacy key only. A COSE key gets a random stand-in that opens
-/// nothing, and the keyring takes no writes (`true`); reads use the core's keys.
-fn bridge_keys(user: &dybw_core::crypto::SymmetricKey) -> Result<(Keys, bool), BackendError> {
-    let (user, read_only) = match SymmetricKey::from_bytes(&user.to_bytes()) {
-        Ok(user) => (user, false),
-        Err(_) => {
-            let mut bytes = Zeroizing::new([0u8; 64]);
-            rand::fill(bytes.as_mut_slice());
-            (SymmetricKey::from_bytes(bytes.as_ref()).map_err(|e| BackendError::Rejected(e.to_string()))?, true)
-        }
-    };
-    Ok((Keys { mark: user.derive("value-mark"), user }, read_only))
+/// A copy of the keys, for a write that waits on the server while the
+/// keyring may lock: the core's keys have no `Clone`, so they wipe on drop.
+pub(crate) fn copy_keys(keys: &CoreKeys) -> CoreKeys {
+    let copy = |k: &CoreKey| CoreKey::from_bytes(&k.to_bytes());
+    // The bytes come from a key that exists: they always make one again.
+    #[expect(clippy::expect_used, reason = "a key's own bytes always make a key")]
+    let user = copy(&keys.user).expect("a key's own bytes");
+    let orgs = keys.orgs.iter().filter_map(|(id, k)| copy(k).ok().map(|k| (id.clone(), k))).collect();
+    CoreKeys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs, security_version: keys.security_version }
 }
 
 /// `sync.json`: the last `/sync` response, still ciphertext. The `format`
@@ -225,9 +253,6 @@ pub(crate) struct Built {
     pub duplicates: Vec<(String, Vec<String>)>,
     /// `(cipher id, reason)` of marked items that are not supported.
     pub skipped: Vec<(String, String)>,
-    /// Scan cache of the write path: `(cipher id, raw revisionDate)` of
-    /// unmarked ciphers.
-    pub unmarked: HashSet<(String, String)>,
     /// The bindings after this build: every item served from the server,
     /// and every held id whose cipher is still there.
     pub bound: Bindings,
@@ -241,13 +266,6 @@ fn first_report(what: impl std::hash::Hash) -> bool {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     what.hash(&mut h);
     SEEN.get_or_init(Default::default).lock().map_or(true, |mut seen| seen.insert(h.finish()))
-}
-
-/// Scan-cache key of a cipher; `None` when it has no revision to compare.
-pub(super) fn cache_key(cipher: &Value) -> Option<(String, String)> {
-    let id = cipher.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
-    let rev = cipher.get("revisionDate").filter(|r| !r.is_null())?;
-    Some((id.to_owned(), rev.to_string()))
 }
 
 pub(super) fn ciphers(sync: &Value) -> &[Value] {
@@ -324,7 +342,7 @@ fn skip_text(reason: SkipReason, features: &[String]) -> String {
     }
 }
 
-fn uninspectable_text(why: Uninspectable) -> &'static str {
+pub(super) fn uninspectable_text(why: Uninspectable) -> &'static str {
     match why {
         Uninspectable::OrganizationNotRead => "organization items are not read",
         Uninspectable::OrganizationKeyMissing => "its organization key is missing",
@@ -500,7 +518,6 @@ pub(crate) fn build(
     }
     let shown: HashSet<&str> = marked.values().map(|m| m.cipher_id.as_str()).collect();
     let held = report.present.iter().filter(|c| !c.is_empty() && !shown.contains(c.as_str())).cloned().collect();
-    let unmarked = list.iter().filter(|c| !report.present.contains(cipher_id(c))).filter_map(cache_key).collect();
 
     let mut items: Vec<ItemData> = marked.values().map(|m| m.item.clone()).collect();
     items.sort_by(|a, b| a.id.cmp(&b.id));
@@ -513,7 +530,6 @@ pub(crate) fn build(
         registry_unreadable,
         duplicates,
         skipped,
-        unmarked,
         bound: next,
     }
 }
@@ -580,85 +596,55 @@ fn collection_list(registry: &Registry, items: &[ItemData]) -> Vec<CollectionDat
 }
 
 /// The registry with the queued collection changes applied.
-pub(super) fn registry_with_queue(registry: &Registry, queue: &[Op]) -> Registry {
+pub(super) fn registry_with_queue(registry: &Registry, queue: &Queue) -> Registry {
     let mut shown = registry.clone();
-    for op in queue {
-        if let Op::Registry { collection, entry } = op {
-            shown.put(collection, entry.clone());
-        }
+    for op in &queue.registry {
+        shown.put(&op.collection, op.entry.clone());
     }
     shown
 }
 
-/// The winning marked cipher of every `bwss:id` in `list`, as its index.
-/// A winner that is a queued create has no server cipher and is left out,
-/// and so is every cipher `built` did not serve: a duplicate it left out,
-/// a held one, one that needs a newer format (ADR 0019, ADR 0020).
-fn marked_positions<C: Borrow<Value>>(list: &[C], keys: &Keys, built: &Built) -> HashMap<String, usize> {
-    let mut found = Vec::new();
-    for c in list.iter().map(Borrow::borrow) {
-        if cache_key(c).is_some_and(|k| built.unmarked.contains(&k)) || built.snapshot.held.contains(cipher_id(c)) {
-            continue;
-        }
-        if let Scan::Marked(m) = scan(c, keys) {
-            found.push(*m);
-        }
-    }
-    let (winners, _) = resolve_duplicates(found);
-    let mut by_cipher: HashMap<&str, usize> = HashMap::new();
-    for (i, c) in list.iter().map(Borrow::borrow).enumerate() {
-        if let Some(cid) = c.get("id").and_then(Value::as_str) {
-            by_cipher.entry(cid).or_insert(i);
-        }
-    }
-    winners
-        .into_iter()
-        .filter(|m| m.cipher_id != QUEUED)
-        .filter_map(|m| by_cipher.get(m.cipher_id.as_str()).map(|&i| (m.item.id, i)))
-        .collect()
-}
-
-/// Index in `list` of the cipher that holds `id` on the server.
-pub(super) fn find_marked<C: Borrow<Value>>(list: &[C], id: &str, keys: &Keys, built: &Built) -> Option<usize> {
-    marked_positions(list, keys, built).get(id).copied()
-}
-
-/// The ciphers with every queued op applied, so pending writes stay visible
-/// (design §8.2 step 3). Only the ciphers the ops touch are copied; the rest
-/// stay borrowed from `sync`.
+/// The ciphers with every queued item op applied, so pending writes stay
+/// visible (design §8.2 step 3). Only the ciphers the ops touch are copied;
+/// the rest stay borrowed from `sync`. A patch goes to the cipher `built`
+/// served its item from (the bound winner, ADR 0019), or to the item's
+/// queued create; a duplicate, held or newer-format cipher is never written.
 pub(super) fn with_queue<'a>(
     sync: &'a Value,
-    queue: &[Op],
-    keys: &Keys,
+    queue: &Queue,
+    keys: &CoreKeys,
     folder: Option<&str>,
     built: &Built,
 ) -> Vec<Cow<'a, Value>> {
-    let mut list: Vec<Cow<'a, Value>> = ciphers(sync).iter().map(Cow::Borrowed).collect();
-    // Positions stay valid across patches, so one scan serves a run of them:
-    // `apply` edits only bwss's own fields and the value source, so a patch
-    // never changes `bwss:id`, and the patched cipher keeps its id and dates
-    // (restored below), so it still wins its `bwss:id` at the same index.
-    // Organization ciphers are never `Marked` (`scan` refuses to read them),
-    // so they are never in the map and never patched. A create appends a
-    // cipher that may win or lose a duplicate id, and a delete shifts every
-    // later index, so both drop the map and the next op scans again.
-    let mut positions: Option<HashMap<String, usize>> = None;
-    for op in queue {
+    let mut list: Vec<Option<Cow<'a, Value>>> = ciphers(sync).iter().map(|c| Some(Cow::Borrowed(c))).collect();
+    // `bwss:id` to the place of its queued create in `list`.
+    let mut created: HashMap<String, usize> = HashMap::new();
+    let place = |list: &[Option<Cow<'a, Value>>], created: &HashMap<String, usize>, id: &str| {
+        if let Some(&i) = created.get(id) {
+            return Some(i);
+        }
+        let cid = built.marked.get(id).map(|m| m.cipher_id.as_str()).filter(|c| *c != QUEUED)?;
+        list.iter().position(|c| c.as_deref().is_some_and(|c| cipher_id(c) == cid))
+    };
+    for op in &queue.ops {
         match op {
-            Op::Create { item, .. } => match new_note(item, folder, keys) {
-                Ok(mut body) => {
-                    body.insert("id".into(), json!(QUEUED));
-                    list.push(Cow::Owned(Value::Object(body)));
-                    positions = None;
-                }
-                Err(e) => tracing::warn!("a queued new item cannot be shown: {e}"),
-            },
-            Op::Patch(patch) => {
-                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, built));
-                let Some(&i) = map.get(&patch.id) else { continue };
-                let Some(current) = list.get(i) else { continue };
-                match apply(current, patch, keys) {
+            Op::Create(item) => {
+                let item = NewItem { folder_id: item.folder_id.clone().or(folder.map(str::to_owned)), ..item.clone() };
+                match new_item(&item, &Namespace::BWSS, keys, &OsRandom) {
                     Ok(mut body) => {
+                        body.insert("id".into(), json!(QUEUED));
+                        created.insert(item.id.clone(), list.len());
+                        list.push(Some(Cow::Owned(Value::Object(body))));
+                    }
+                    Err(e) => tracing::warn!("a queued new item cannot be shown: {e}"),
+                }
+            }
+            Op::Patch(patch) => {
+                let Some(i) = place(&list, &created, &patch.id) else { continue };
+                let Some(Some(current)) = list.get(i) else { continue };
+                match apply_shown(current, patch, keys) {
+                    Ok(outcome) => {
+                        let Some(mut body) = outcome.body else { continue };
                         body.remove("lastKnownRevisionDate");
                         for k in ["id", "revisionDate", "creationDate"] {
                             if let Some(v) = current.get(k) {
@@ -666,7 +652,7 @@ pub(super) fn with_queue<'a>(
                             }
                         }
                         if let Some(slot) = list.get_mut(i) {
-                            *slot = Cow::Owned(Value::Object(body));
+                            *slot = Some(Cow::Owned(Value::Object(body)));
                         }
                     }
                     Err(e) => {
@@ -677,45 +663,36 @@ pub(super) fn with_queue<'a>(
                 }
             }
             Op::Delete { id, .. } => {
-                let map = positions.get_or_insert_with(|| marked_positions(&list, keys, built));
-                if let Some(&i) = map.get(id) {
-                    list.remove(i);
-                    positions = None;
+                if let Some(i) = place(&list, &created, id)
+                    && let Some(slot) = list.get_mut(i)
+                {
+                    *slot = None;
+                    created.remove(id);
                 }
             }
-            // Shown through `build_view`: the registry note is merged, never
-            // rewritten here.
-            Op::Registry { .. } => {}
         }
     }
-    list
-}
-
-/// The keys a build needs: bwss's own for the queued ops (until B5), the
-/// core's for the scan.
-pub(super) struct BuildKeys<'a> {
-    pub legacy: &'a Keys,
-    pub core: &'a CoreKeys,
+    list.into_iter().flatten().collect()
 }
 
 /// Builds the keyring from the cache with the queue applied, on top of
 /// `previous`.
 fn build_view(
     sync: &Value,
-    queue: &[Op],
-    keys: BuildKeys<'_>,
+    queue: &Queue,
+    keys: &CoreKeys,
     folder: Option<&str>,
     previous: &Built,
     cache: &mut UnmarkedCache,
 ) -> Built {
-    let mut built = if queue.is_empty() {
-        build(sync, keys.core, Some(previous), cache, &previous.bound)
+    let mut built = if queue.ops.is_empty() {
+        build(sync, keys, Some(previous), cache, &previous.bound)
     } else {
         let view: Vec<Value> =
-            with_queue(sync, queue, keys.legacy, folder, previous).into_iter().map(Cow::into_owned).collect();
-        build(&json!({ "ciphers": view }), keys.core, Some(previous), cache, &previous.bound)
+            with_queue(sync, queue, keys, folder, previous).into_iter().map(Cow::into_owned).collect();
+        build(&json!({ "ciphers": view }), keys, Some(previous), cache, &previous.bound)
     };
-    if queue.iter().any(|op| matches!(op, Op::Registry { .. })) {
+    if !queue.registry.is_empty() {
         // `built.registry` stays the server's: only what is shown changes.
         let shown = registry_with_queue(&built.registry, queue);
         built.snapshot.collections = collection_list(&shown, &built.snapshot.items);
@@ -726,13 +703,13 @@ fn build_view(
 /// Builds the keyring for a freshly loaded cache and queue.
 fn build_fresh(
     sync: &Value,
-    queue: &[Op],
-    keys: BuildKeys<'_>,
+    queue: &Queue,
+    keys: &CoreKeys,
     folder: Option<&str>,
     cache: &mut UnmarkedCache,
     bound: &Bindings,
 ) -> Built {
-    let base = build(sync, keys.core, None, cache, bound);
+    let base = build(sync, keys, None, cache, bound);
     if queue.is_empty() {
         return base;
     }
@@ -769,8 +746,8 @@ fn load_cache(path: &Path, email: &str) -> Result<Option<Cache>, BackendError> {
 /// A same-user process can get text of its choice encrypted under the user
 /// key itself (any field of an item it creates), so that key must never open
 /// the queue once this device moved to the queue key (design §8.1).
-pub(super) fn queue_key(user: &SymmetricKey) -> SymmetricKey {
-    user.derive("queue")
+pub(crate) fn queue_key(user: &CoreKey) -> CoreKey {
+    user.derive_bwss("queue")
 }
 
 /// Sets the flag that closes the one-time migration window.
@@ -786,7 +763,7 @@ fn end_migration(flag: &Path) {
 /// (sealed with the user key itself by an older bwss) is opened with the
 /// user key only while `migrated` is absent, and is then resealed and the
 /// flag set. Anything that does not open is set aside, never replayed.
-fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<Op>, BackendError> {
+fn load_queue(path: &Path, user: &CoreKey, migrated: &Path) -> Result<Queue, BackendError> {
     let refuse = |e: std::io::Error| {
         unavailable(format!("cannot read the write queue {}: {e}; it is left untouched", path.display()))
     };
@@ -803,7 +780,8 @@ fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<O
                 Ok(ops) if legacy => {
                     // When the reseal fails, the file stays as it was and the
                     // window stays open for the next unlock.
-                    match write_json_private(path, &seal(&ops, &key)) {
+                    let resealed = seal(&ops, &key, &OsRandom).map_err(std::io::Error::other);
+                    match resealed.and_then(|file| write_json_private(path, &file)) {
                         Ok(()) => end_migration(migrated),
                         Err(e) => tracing::warn!(path = %path.display(), "could not reseal the write queue: {e}"),
                     }
@@ -817,26 +795,24 @@ fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<O
                     tracing::warn!(path = %path.display(), "the write queue cannot be opened ({why}); setting it aside");
                     match set_aside(path, "unsealable") {
                         Loaded::Unreadable(e) => Err(refuse(e)),
-                        _ => Ok(Vec::new()),
+                        _ => Ok(Queue::default()),
                     }
                 }
             }
         }
         Loaded::Missing => {
             end_migration(migrated);
-            Ok(Vec::new())
+            Ok(Queue::default())
         }
         Loaded::SetAside(to) => {
             tracing::warn!(moved_to = %to.display(), "changes queued by an older version are not replayed");
-            Ok(Vec::new())
+            Ok(Queue::default())
         }
         Loaded::Unreadable(e) => Err(refuse(e)),
     }
 }
 
 pub(super) struct Unlocked {
-    /// Bridge until B5-B6: bwss's own key type, from `core_keys`, for writes.
-    pub(super) keys: Keys,
     /// The keys dybw-core opened.
     pub(super) core_keys: CoreKeys,
     kdf: Option<KdfParams>,
@@ -852,17 +828,23 @@ pub(super) struct Unlocked {
     /// What `bwss status` reports about this unlock.
     notices: Vec<String>,
     /// Ids the server sent older than the cached copy, which is kept (ADR 0019).
-    rollbacks: Vec<Rollback>,
-    /// Bridge until B5-B6: a COSE user key, which bwss's own write code cannot use.
-    read_only: bool,
+    pub(super) rollbacks: Vec<Rollback>,
+    /// What this device wrote to login passwords, by `bwss:id` (ADR 0016).
+    pub(super) records: BTreeMap<String, WriteRecord>,
+    /// The history questions queued changes wait on, from the last flush.
+    pub(super) questions: Vec<(String, HistoryQuestion)>,
+    /// Queued changes whose own cipher this bwss can never read.
+    pub(super) stuck: Vec<(String, Uninspectable)>,
 }
 
 pub(crate) struct Bitwarden {
     email: String,
     /// Name of the keyring folder.
     pub(super) root: String,
-    pub(super) api: Mutex<Api>,
-    key: ApiKey,
+    /// The core's client, logged in and synced; `None` until then, and
+    /// after a lock or an ended session.
+    pub(super) client: Mutex<Option<CoreClient>>,
+    key: CoreApiKey,
     pub(super) state: Mutex<Option<Unlocked>>,
     cache_path: PathBuf,
     queue_path: PathBuf,
@@ -871,7 +853,7 @@ pub(crate) struct Bitwarden {
     queue_migrated: PathBuf,
     /// Queued ops; loaded at unlock (it is sealed with the queue key) and
     /// dropped at lock. Lock order: `queue`, then `state`.
-    pub(super) queue: Mutex<Vec<Op>>,
+    pub(super) queue: Mutex<Queue>,
     /// Bumped by every `lock`: an unlock that started before one never
     /// installs its keys.
     lock_generation: AtomicU64,
@@ -882,6 +864,9 @@ pub(crate) struct Bitwarden {
     storage: FileStorage,
     /// The sealed `BINDINGS` file, written from the worker without awaiting.
     bindings_path: PathBuf,
+    /// This device's write records (ADR 0016), sealed with the queue key.
+    // shortcut: a file beside the queue; B6 keeps them in the format-4 queue.
+    records_path: PathBuf,
     /// An accept record a sync used but could not remove: never used again.
     spent_accept: std::sync::Mutex<Option<Vec<Rollback>>>,
     acl_confirmed: PathBuf,
@@ -893,7 +878,7 @@ pub(crate) struct Bitwarden {
     reason = "one per unlock; a Box would leave a copy of the keys unwiped on the heap"
 )]
 enum Online {
-    Opened(profile::Unlocked, Option<String>),
+    Opened(profile::Unlocked, Option<String>, CoreClient),
     /// The network is down: the offline copy may be used.
     Unreachable(String),
 }
@@ -902,11 +887,7 @@ fn unavailable(e: impl std::fmt::Display) -> BackendError {
     BackendError::Unavailable(e.to_string())
 }
 
-fn map_api(e: ApiError) -> BackendError {
-    if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
-}
-
-fn map_core_api(e: dybw_core::api::ApiError) -> BackendError {
+fn map_core_api(e: CoreApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
 }
 
@@ -940,7 +921,6 @@ fn map_profile(e: ProfileError) -> BackendError {
 
 impl Bitwarden {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
-        let urls = resolve_server_urls(&config.server_url).map_err(anyhow::Error::msg)?;
         let profile = config.profile.as_deref().ok_or_else(|| anyhow::anyhow!("no profile to serve"))?;
         let core_urls = dybw_core::api::resolve_server_urls(&config.server_url)?;
         let device_path = paths.device_id(profile);
@@ -960,8 +940,8 @@ impl Bitwarden {
         Ok(Bitwarden {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
-            api: Mutex::new(Api::new(urls, device_id.clone())?),
-            key: ApiKey {
+            client: Mutex::new(None),
+            key: CoreApiKey {
                 origin: creds.identity_origin,
                 client_id: creds.client_id,
                 client_secret: creds.client_secret,
@@ -970,7 +950,7 @@ impl Bitwarden {
             cache_path: paths.cache.join("sync.json"),
             queue_path,
             queue_migrated: paths.queue_key_migrated(),
-            queue: Mutex::new(Vec::new()),
+            queue: Mutex::new(Queue::default()),
             lock_generation: AtomicU64::new(0),
             urls: core_urls,
             // As bwss's own client announces itself.
@@ -983,37 +963,34 @@ impl Bitwarden {
             },
             storage: FileStorage::new(paths, profile),
             bindings_path: paths.tool_state.join("core").join(BINDINGS),
+            records_path: paths.state.join("write-records"),
             spent_accept: std::sync::Mutex::new(None),
             acl_confirmed: paths.acl_confirmed(),
         })
     }
 
-    fn core_key(&self) -> CoreApiKey {
-        CoreApiKey {
-            origin: self.key.origin.clone(),
-            client_id: self.key.client_id.clone(),
-            client_secret: self.key.client_secret.clone(),
-        }
+    /// A client of the server, not logged in yet.
+    fn new_client(&self) -> Result<CoreClient, CoreApiError> {
+        let http = HttpPort::new().map_err(|e| CoreApiError::Network(e.0))?;
+        Client::new(http, SystemClock, self.urls.clone(), self.device.clone())
     }
 
     /// `profile::unlock` with bwss's ports. A network that is down is not
     /// an error here: the caller falls back to the offline copy.
     async fn open_online(&self, password: Zeroizing<String>) -> Result<Online, BackendError> {
-        // Bridge until B5: bwss's own client still writes, so it logs in and
-        // reads the revision (before `/sync`, as it always did) here.
-        let revision = match self.ensure_login().await {
-            Ok(()) => self.api.lock().await.revision_date().await.ok(),
+        let mut client = self.new_client().map_err(map_core_api)?;
+        // The revision is read before `/sync`, as bwss always did: a change
+        // between the two is then seen by the next refresh.
+        let revision = match client.login(&self.key).await {
+            Ok(()) => client.revision_date().await.ok(),
             Err(e) if e.is_transient() => return Ok(Online::Unreachable(e.to_string())),
-            Err(e) => return Err(map_api(e)),
+            Err(e) => return Err(map_core_api(e)),
         };
-        let http = HttpPort::new().map_err(unavailable)?;
-        let mut client =
-            Client::new(http, SystemClock, self.urls.clone(), self.device.clone()).map_err(map_core_api)?;
         let (ns, orgs) = (&Namespace::BWSS, &Organizations::None);
         let opened = profile::unlock(
             &mut client,
             &self.storage,
-            &self.core_key(),
+            &self.key,
             &self.email,
             password,
             &BlockingArgon2,
@@ -1023,10 +1000,7 @@ impl Bitwarden {
         )
         .await;
         match opened {
-            Ok(unlocked) => {
-                self.api.lock().await.synced(&unlocked.sync);
-                Ok(Online::Opened(unlocked, revision))
-            }
+            Ok(unlocked) => Ok(Online::Opened(unlocked, revision, client)),
             Err(ProfileError::Api(e)) if e.is_transient() => Ok(Online::Unreachable(e.to_string())),
             Err(e) => Err(self.refused(e).await),
         }
@@ -1035,10 +1009,13 @@ impl Bitwarden {
     /// Opens the user key online, else from the offline copy when the network
     /// is down: the unlocked profile, the account revision and whether it came
     /// from the copy.
-    async fn open(&self, password: &str) -> Result<(profile::Unlocked, Option<String>, bool), BackendError> {
+    async fn open(
+        &self,
+        password: &str,
+    ) -> Result<(profile::Unlocked, Option<String>, Option<CoreClient>), BackendError> {
         let password = Zeroizing::new(password.to_owned());
         let why = match self.open_online(password.clone()).await? {
-            Online::Opened(unlocked, revision) => return Ok((unlocked, revision, false)),
+            Online::Opened(unlocked, revision, client) => return Ok((unlocked, revision, Some(client))),
             Online::Unreachable(why) => why,
         };
         let Cache { kdf, email, revision, sync } = load_cache(&self.cache_path, &self.email)?
@@ -1050,7 +1027,7 @@ impl Bitwarden {
         match profile::unlock_cached(cached, &self.storage, origin, password, &BlockingArgon2, &AwsLcRsa, ns, orgs)
             .await
         {
-            Ok(unlocked) => Ok((unlocked, revision, true)),
+            Ok(unlocked) => Ok((unlocked, revision, None)),
             Err(e) => Err(self.refused(e).await),
         }
     }
@@ -1119,33 +1096,40 @@ impl Bitwarden {
         notices
     }
 
-    /// Bridge until B4-B6: a COSE account takes no writes.
-    async fn writable(&self) -> Result<(), BackendError> {
-        match self.state.lock().await.as_ref() {
-            Some(state) if state.read_only => Err(BackendError::Rejected(COSE_READ_ONLY.into())),
-            _ => Ok(()),
+    /// `/accounts/revision-date` (when it answers), then `/sync`. A client
+    /// that is not logged in logs in first; the client is kept once synced.
+    async fn fetch(&self) -> Result<(Option<String>, Value), CoreApiError> {
+        let mut guard = self.client.lock().await;
+        let synced = guard.is_some();
+        let mut client = match guard.take() {
+            Some(client) => client,
+            None => {
+                let mut client = self.new_client()?;
+                client.login(&self.key).await?;
+                client
+            }
+        };
+        let revision = client.revision_date().await.ok();
+        match client.sync().await {
+            Ok(sync) => {
+                *guard = Some(client);
+                Ok((revision, sync))
+            }
+            Err(e) => {
+                // An ended session logs in again next time; any other failure
+                // keeps a client that was synced before.
+                let ended = matches!(e, CoreApiError::Http { status: 401, .. } | CoreApiError::NotLoggedIn);
+                if synced && !ended {
+                    *guard = Some(client);
+                }
+                Err(e)
+            }
         }
-    }
-
-    async fn ensure_login(&self) -> Result<(), ApiError> {
-        let mut api = self.api.lock().await;
-        if !api.is_logged_in() {
-            api.login(&self.key).await?;
-        }
-        Ok(())
-    }
-
-    /// `/accounts/revision-date` (when it answers), then `/sync`.
-    async fn fetch(&self) -> Result<(Option<String>, Value), ApiError> {
-        self.ensure_login().await?;
-        let mut api = self.api.lock().await;
-        let revision = api.revision_date().await.ok();
-        Ok((revision, api.sync().await?))
     }
 
     /// Whether writes can go to the server now: logged in and synced.
     pub(super) async fn can_write(&self) -> bool {
-        self.ensure_login().await.is_ok() && self.api.lock().await.has_profile()
+        self.client.lock().await.is_some()
     }
 
     fn save_cache(&self, state: &Unlocked) {
@@ -1161,20 +1145,84 @@ impl Bitwarden {
         }
     }
 
-    /// Writes the queue, sealed with the queue key of `user`.
-    pub(super) fn save_queue(&self, queue: &[Op], user: &SymmetricKey) -> std::io::Result<()> {
-        let saved = write_json_private(&self.queue_path, &seal(queue, &queue_key(user)));
+    /// Writes the queue, sealed with `key` (the queue key).
+    pub(super) fn save_queue(&self, queue: &Queue, key: &CoreKey) -> std::io::Result<()> {
+        let saved = seal(queue, key, &OsRandom)
+            .map_err(std::io::Error::other)
+            .and_then(|file| write_json_private(&self.queue_path, &file));
         if let Err(e) = &saved {
             tracing::warn!("could not write the offline queue: {e}");
         }
         saved
     }
 
+    /// Keeps this device's write records, sealed with `key` (the queue key).
+    /// A failure is logged: a write that is not recorded asks again.
+    pub(super) fn save_records(&self, records: &BTreeMap<String, WriteRecord>, key: &CoreKey) {
+        // Plain data: it always serializes.
+        let json = Zeroizing::new(serde_json::to_vec(records).unwrap_or_default());
+        let saved = key
+            .encrypt(&json, &OsRandom)
+            .map_err(|e| e.to_string())
+            .and_then(|sealed| write_private(&self.records_path, sealed.as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = saved {
+            tracing::warn!("could not keep what this device wrote to login passwords: {e}");
+        }
+    }
+
+    /// The write records the last write kept; none when there is no file or
+    /// it does not open (the next write to a login asks again).
+    fn load_records(&self, key: &CoreKey) -> BTreeMap<String, WriteRecord> {
+        let raw = match std::fs::read(&self.records_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+            other => other.map_err(|e| e.to_string()),
+        };
+        let records = raw
+            .and_then(|raw| String::from_utf8(raw).map_err(|e| e.to_string()))
+            .and_then(|s| key.decrypt(s.trim()).map_err(|e| e.to_string()))
+            .and_then(|json| serde_json::from_slice(&json).map_err(|e| e.to_string()));
+        records.unwrap_or_else(|e| {
+            tracing::warn!("what this device wrote to login passwords cannot be read ({e}): writes ask again");
+            BTreeMap::new()
+        })
+    }
+
+    /// The answers `bwss answer` left, taken: they are used once.
+    pub(super) async fn answers(&self) -> Vec<Asked> {
+        let answers = asked(&self.storage, HISTORY_ANSWERS).await;
+        if !answers.is_empty()
+            && let Err(e) = self.storage.remove(HISTORY_ANSWERS).await
+        {
+            tracing::warn!("could not clear the answers to history questions: {e}");
+        }
+        answers
+    }
+
+    /// Keeps the questions queued changes wait on, for `bwss answer`.
+    pub(super) async fn keep_questions(&self, questions: &[(String, HistoryQuestion)]) {
+        let list: Vec<Asked> =
+            questions.iter().map(|(id, q)| Asked { id: id.clone(), question: *q, answer: None }).collect();
+        let kept = if list.is_empty() {
+            self.storage.remove(HISTORY_QUESTIONS).await
+        } else {
+            // Plain data: it always serializes.
+            self.storage.save(HISTORY_QUESTIONS, &serde_json::to_vec(&list).unwrap_or_default()).await
+        };
+        if let Err(e) = kept {
+            tracing::warn!("could not keep the history questions for `bwss answer`: {e}");
+        }
+    }
+
     /// Rebuilds the keyring after the cache or the queue changed.
-    pub(super) fn rebuild(&self, state: &mut Unlocked, queue: &[Op]) {
-        let keys = BuildKeys { legacy: &state.keys, core: &state.core_keys };
-        let built =
-            build_view(&state.sync, queue, keys, state.keyring_folder.as_deref(), &state.built, &mut state.cache);
+    pub(super) fn rebuild(&self, state: &mut Unlocked, queue: &Queue) {
+        let built = build_view(
+            &state.sync,
+            queue,
+            &state.core_keys,
+            state.keyring_folder.as_deref(),
+            &state.built,
+            &mut state.cache,
+        );
         if built.bound != state.built.bound {
             self.save_bindings(&state.core_keys.user, &built.bound);
         }
@@ -1242,13 +1290,13 @@ impl Bitwarden {
     }
 
     /// Records what the server did in the cache, so later edits build on it.
-    pub(super) fn absorb(&self, state: &mut Unlocked, queue: &[Op], effect: Effect) {
+    pub(super) fn absorb(&self, state: &mut Unlocked, queue: &Queue, effect: Effect) {
         if let Some(list) = state.sync.get_mut("ciphers").and_then(Value::as_array_mut) {
             match effect {
                 Effect::Nothing => {}
                 Effect::Trashed(gone) => list.retain(|c| c.get("id").and_then(Value::as_str) != Some(&gone)),
                 Effect::Saved(server) => {
-                    let c = crate::bw::api::normalize_keys(server);
+                    let c = dybw_core::api::normalize_keys(server);
                     if let Some(cid) = c.get("id").and_then(Value::as_str).map(str::to_owned) {
                         list.retain(|x| x.get("id").and_then(Value::as_str) != Some(&cid));
                         list.push(c);
@@ -1263,13 +1311,37 @@ impl Bitwarden {
     }
 
     /// Keeps the queue on disk and shows it.
-    pub(super) async fn queue_changed(&self, queue: &[Op]) -> Result<(), BackendError> {
+    pub(super) async fn queue_changed(&self, queue: &Queue) -> Result<(), BackendError> {
         let mut guard = self.state.lock().await;
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
         // Logged in `save_queue`; the change is already in memory.
-        let _ = self.save_queue(queue, &state.keys.user);
+        let _ = self.save_queue(queue, &queue_key(&state.core_keys.user));
         self.rebuild(state, queue);
         Ok(())
+    }
+
+    /// Reads the vault again and shows it with `queue`; a rollback is held
+    /// back unless `accept` lists it (ADR 0019). Returns what is held back.
+    pub(super) async fn pull(&self, queue: &Queue, accept: &[Rollback]) -> Result<Vec<Rollback>, BackendError> {
+        let (revision, mut sync) = self.fetch().await.map_err(map_core_api)?;
+        let held = {
+            let mut guard = self.state.lock().await;
+            let state = guard.as_mut().ok_or(BackendError::Locked)?;
+            let (held, accepted) = hold_rollbacks(&state.sync, &mut sync, &state.built.bound, accept);
+            for r in &accepted {
+                tracing::warn!(id = %r.id, cipher = %r.cipher, revision = %r.revision, "rollback accepted");
+            }
+            state.rollbacks = held;
+            report_rollbacks(&state.rollbacks);
+            state.keyring_folder = keyring_folder(&sync, &state.core_keys.user, &self.root);
+            state.sync = sync;
+            state.revision = revision;
+            self.save_cache(state);
+            self.rebuild(state, queue);
+            state.rollbacks.clone()
+        };
+        self.keep_held_rollbacks(&held).await;
+        Ok(held)
     }
 }
 
@@ -1278,7 +1350,8 @@ impl Bitwarden {
 impl Bitwarden {
     pub(crate) async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
         let generation = self.lock_generation.load(Ordering::SeqCst);
-        let (unlocked, revision, from_cache) = self.open(password).await?;
+        let (unlocked, revision, client) = self.open(password).await?;
+        let from_cache = client.is_none();
         let mut notices = self.check_user_key(&unlocked.user_key_id()).await;
         for UnlockWarning::KdfBelowFloor { params, kdf_source } in &unlocked.warnings {
             let note = format!(
@@ -1291,14 +1364,11 @@ impl Bitwarden {
         // Answered, or no longer asked.
         let _ = self.storage.remove(KDF_OFFERED).await;
         let kdf = ran_kdf(&self.storage).await;
-        let (keys, read_only) = bridge_keys(&unlocked.keys.user)?;
-        if read_only {
-            tracing::warn!("{COSE_READ_ONLY}");
-            notices.push(COSE_READ_ONLY.into());
-        }
         let profile::Unlocked { keys: core_keys, mut sync, .. } = unlocked;
         // Accepted for an unlocked keyring only: one left by an earlier session is never applied.
         notices.extend(self.drop_accepted_rollbacks().await);
+        // Answers are given to the questions of this session only.
+        let _ = self.answers().await;
         // The offline copy is the base: the server may not go below it.
         let base = if from_cache { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
         let lost = match self.load_bindings(&core_keys.user) {
@@ -1326,23 +1396,16 @@ impl Bitwarden {
         self.keep_held_rollbacks(&rollbacks).await;
 
         let mut queue = self.queue.lock().await;
-        // A COSE account's queue is left as it is, for B6 to open.
-        *queue = if read_only { Vec::new() } else { load_queue(&self.queue_path, &keys.user, &self.queue_migrated)? };
+        let seal_key = queue_key(&core_keys.user);
+        *queue = load_queue(&self.queue_path, &core_keys.user, &self.queue_migrated)?;
+        let records = self.load_records(&seal_key);
         let folder = keyring_folder(&sync, &core_keys.user, &self.root);
         let mut cache = UnmarkedCache::default();
-        let built = build_fresh(
-            &sync,
-            &queue,
-            BuildKeys { legacy: &keys, core: &core_keys },
-            folder.as_deref(),
-            &mut cache,
-            &bound,
-        );
+        let built = build_fresh(&sync, &queue, &core_keys, folder.as_deref(), &mut cache, &bound);
         if built.bound != bound {
             self.save_bindings(&core_keys.user, &built.bound);
         }
         let state = Unlocked {
-            keys,
             core_keys,
             kdf,
             sync,
@@ -1352,7 +1415,9 @@ impl Bitwarden {
             keyring_folder: folder,
             notices,
             rollbacks,
-            read_only,
+            records,
+            questions: Vec::new(),
+            stuck: Vec::new(),
         };
         if !from_cache {
             self.save_cache(&state);
@@ -1365,6 +1430,8 @@ impl Bitwarden {
             return Err(BackendError::Locked);
         }
         *guard = Some(state);
+        // Under the state lock, so a lock that follows drops this client too.
+        *self.client.lock().await = client;
         drop(guard);
         drop(queue);
 
@@ -1383,9 +1450,11 @@ impl Bitwarden {
         if let Ok(mut queue) = self.queue.try_lock() {
             queue.clear();
         }
-        self.api.lock().await.logout();
-        // Accepted for this session only.
+        // Waits for a request in flight, then logs out.
+        *self.client.lock().await = None;
+        // Accepted or answered for this session only.
         let _ = self.drop_accepted_rollbacks().await;
+        let _ = self.answers().await;
     }
 
     pub(crate) async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
@@ -1393,8 +1462,8 @@ impl Bitwarden {
             let guard = self.state.lock().await;
             guard.as_ref().ok_or(BackendError::Locked)?.built.snapshot.clone()
         };
-        // Before the first `/sync` of this session (offline unlock), writes
-        // cannot name their owner: sync first, flush after.
+        // Before the first `/sync` of this session (offline unlock, or an
+        // ended session), writes cannot name their owner: sync first, flush after.
         let synced = self.can_write().await;
         let mut accept = rollbacks(&self.storage, ACCEPT_ROLLBACK).await;
         let spent = self.spent_accept.lock().map(|s| s.as_ref() == Some(&accept)).unwrap_or(true);
@@ -1407,32 +1476,20 @@ impl Bitwarden {
             if let Err(e) = self.flush_queue().await {
                 tracing::info!("queued changes stay queued: {e}");
             }
-            let revision = self.api.lock().await.revision_date().await.ok();
+            let revision = match self.client.lock().await.as_mut() {
+                Some(client) => client.revision_date().await.ok(),
+                None => None,
+            };
             let guard = self.state.lock().await;
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
             if revision.is_some() && revision == state.revision {
                 return Ok((state.built.snapshot != before).then(|| state.built.snapshot.clone()));
             }
         }
-        let (revision, mut sync) = self.fetch().await.map_err(map_api)?;
-        let held = {
+        {
             let queue = self.queue.lock().await;
-            let mut guard = self.state.lock().await;
-            let state = guard.as_mut().ok_or(BackendError::Locked)?;
-            let (held, accepted) = hold_rollbacks(&state.sync, &mut sync, &state.built.bound, &accept);
-            for r in &accepted {
-                tracing::warn!(id = %r.id, cipher = %r.cipher, revision = %r.revision, "rollback accepted");
-            }
-            state.rollbacks = held;
-            report_rollbacks(&state.rollbacks);
-            state.keyring_folder = keyring_folder(&sync, &state.core_keys.user, &self.root);
-            state.sync = sync;
-            state.revision = revision;
-            self.save_cache(state);
-            self.rebuild(state, &queue);
-            state.rollbacks.clone()
-        };
-        self.keep_held_rollbacks(&held).await;
+            self.pull(&queue, &accept).await?;
+        }
         if accepting
             && let Some(note) = self.drop_accepted_rollbacks().await
             && let Some(state) = self.state.lock().await.as_mut()
@@ -1449,8 +1506,6 @@ impl Bitwarden {
 
     pub(crate) async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
         let mut queue = self.queue.lock().await;
-        // Under the queue lock: no unlock can install a COSE key after the check.
-        self.writable().await?;
         let result = self.create_collection_locked(&mut queue, label).await;
         self.forget_if_locked(&mut queue).await;
         result
@@ -1458,26 +1513,31 @@ impl Bitwarden {
 
     pub(crate) async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
-        // Under the queue lock: no unlock can install a COSE key after the check.
-        self.writable().await?;
         let result = self.delete_collection_locked(&mut queue, id, items).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
+    #[cfg(test)]
     pub(crate) async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        self.put_item_answered(item, None).await
+    }
+
+    /// `put_item` with the user's answer to the history question an earlier
+    /// try of the same write asked (ADR 0016).
+    pub(crate) async fn put_item_answered(
+        &self,
+        item: &ItemData,
+        answer: Option<(HistoryQuestion, HistoryAnswer)>,
+    ) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
-        // Under the queue lock: no unlock can install a COSE key after the check.
-        self.writable().await?;
-        let result = self.put_locked(&mut queue, item).await;
+        let result = self.put_locked(&mut queue, item, answer).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
     pub(crate) async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
-        // Under the queue lock: no unlock can install a COSE key after the check.
-        self.writable().await?;
         let result = self.delete_locked(&mut queue, &item.id).await;
         self.forget_if_locked(&mut queue).await;
         result
@@ -1493,15 +1553,22 @@ impl Bitwarden {
     }
 
     pub(crate) async fn describe(&self) -> String {
-        let queued = self.queue.lock().await.len();
-        let urls = self.api.lock().await.urls().clone();
+        let queue = self.queue.lock().await;
         let mut out = format!(
-            "Bitwarden {} ({}), folder \"{}\", {queued} queued change(s)",
-            self.email, urls.identity, self.root
+            "Bitwarden {} ({}), folder \"{}\", {} queued change(s)",
+            self.email,
+            self.urls.identity,
+            self.root,
+            queue.len()
         );
         if let Some(state) = self.state.lock().await.as_ref() {
             let rollbacks = (!state.rollbacks.is_empty()).then(|| rollback_text(&state.rollbacks));
-            for line in status_lines(&state.built).into_iter().chain(rollbacks).chain(state.notices.iter().cloned()) {
+            let lines = status_lines(&state.built)
+                .into_iter()
+                .chain(rollbacks)
+                .chain(queue_lines(state, &queue))
+                .chain(state.notices.iter().cloned());
+            for line in lines {
                 out.push('\n');
                 out.push_str(&line);
             }
@@ -1570,7 +1637,15 @@ impl Backend for BitwardenBackend {
     }
 
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
-        self.0.call(|r| Command::PutItem(item.clone(), r)).await?
+        self.0.call(|r| Command::PutItem(item.clone(), None, r)).await?
+    }
+
+    async fn put_item_answered(
+        &self,
+        item: &ItemData,
+        answer: (HistoryQuestion, HistoryAnswer),
+    ) -> Result<(), BackendError> {
+        self.0.call(|r| Command::PutItem(item.clone(), Some(answer), r)).await?
     }
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
@@ -1590,7 +1665,9 @@ impl Backend for BitwardenBackend {
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::bw::write::{Patch, ValueChange};
+    use crate::backend::ops::new_item_of;
+    use crate::bw::scan::Keys;
+    use dybw_core::vault::write::{FieldSet, Patch, ValueChange};
 
     const REV: &str = "2026-01-02T03:04:05Z";
 
@@ -1616,9 +1693,22 @@ mod tests {
         build(&json!({ "ciphers": view }), k, previous)
     }
 
-    fn build_fresh(sync: &Value, queue: &[Op], k: &Keys, folder: Option<&str>) -> Built {
-        let keys = BuildKeys { legacy: k, core: &core(k) };
-        super::build_fresh(sync, queue, keys, folder, &mut UnmarkedCache::default(), &Bindings::new())
+    fn build_fresh(sync: &Value, queue: &Queue, k: &Keys, folder: Option<&str>) -> Built {
+        super::build_fresh(sync, queue, &core(k), folder, &mut UnmarkedCache::default(), &Bindings::new())
+    }
+
+    fn with_queue<'a>(sync: &'a Value, ops: Vec<Op>, k: &Keys) -> Vec<Cow<'a, Value>> {
+        let built = build(sync, k, None);
+        super::with_queue(sync, &Queue { ops, registry: vec![] }, &core(k), None, &built)
+    }
+
+    fn delete(id: &str, cid: &str) -> Op {
+        Op::Delete { id: id.into(), base_revision: REV.into(), cipher_id: Some(cid.into()), organization_id: None }
+    }
+
+    /// A key of the core's, for the queue file.
+    fn ck() -> CoreKey {
+        CoreKey::generate(&OsRandom).unwrap()
     }
 
     fn read_registry(cipher: &Value, k: &Keys) -> Result<Option<Registry>, RegistryError> {
@@ -1691,7 +1781,6 @@ mod tests {
         assert_eq!(b.registry_ciphers, ["c4"]);
         assert!(!b.registry_unreadable);
         assert_eq!(&*b.marked["b"].item.secret, b"secret");
-        assert!(b.unmarked.contains(&("c0".to_owned(), format!("\"{REV}\""))));
     }
 
     #[test]
@@ -1713,16 +1802,15 @@ mod tests {
         let (k, mut cache) = (keys(), UnmarkedCache::default());
         let none = Bindings::new();
         let first = super::build(&sync(vec![login(&k, "c9", &[("other", "x")])]), &core(&k), None, &mut cache, &none);
-        let cached = ("c9".to_owned(), format!("\"{REV}\""));
-        assert!(first.unmarked.contains(&cached));
+        assert!(!first.snapshot.held.contains("c9"));
         let mut garbled = login(&k, "c9", &[]);
         garbled["fields"] = json!([{ "type": 0, "name": "2.bad|bad|bad", "value": "2.bad|bad|bad" }]);
         let s = sync(vec![garbled]);
         // The core's cache lives with the keyring: the same cipher is not opened again.
         let again = super::build(&s, &core(&k), Some(&first), &mut cache, &none);
-        assert!(again.unmarked.contains(&cached));
+        assert!(!again.snapshot.held.contains("c9"), "still known as unmarked");
         // Rescanned, the same cipher cannot be read.
-        assert!(!build(&s, &k, None).unmarked.contains(&cached));
+        assert!(build(&s, &k, None).snapshot.held.contains("c9"));
     }
 
     #[test]
@@ -1785,8 +1873,7 @@ mod tests {
             login(&k, "c2", &[("bwss:id", "b")]),
             login(&k, "c3", &[("bwss:id", "c")]),
         ]);
-        let queue = [Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) }];
-        let view = with_queue(&s, &queue, &k, None, &Built::default());
+        let view = with_queue(&s, vec![delete("b", "c2")], &k);
         let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
         assert_eq!(ids, ["c1", "c3"]);
         assert!(view.iter().all(|c| matches!(c, Cow::Borrowed(_))), "nothing was copied");
@@ -1821,10 +1908,7 @@ mod tests {
         let s = sync(vec![login(&k, "c1", &[("bwss:id", "a")]), login(&k, "c2", &[("bwss:id", "b")])]);
         let mut new = build(&s, &k, None).marked["a"].item.clone();
         new.id = "n".into();
-        let queue = vec![
-            Op::Create { id: "n".into(), collection: "login".into(), item: new },
-            Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) },
-        ];
+        let queue = Queue { ops: vec![Op::Create(new_item_of(&new, None)), delete("b", "c2")], registry: vec![] };
         let b = build_fresh(&s, &queue, &k, None);
         assert_eq!(item_ids(&b), ["a", "n"]);
         assert_eq!(b.marked["n"].cipher_id, QUEUED);
@@ -1860,8 +1944,12 @@ mod tests {
         assert!(path.exists());
     }
 
-    fn one_op() -> Vec<Op> {
-        vec![Op::Delete { id: "a".into(), base_revision: REV.into(), cipher_id: Some("c1".into()) }]
+    fn one_op() -> Queue {
+        Queue { ops: vec![delete("a", "c1")], registry: vec![] }
+    }
+
+    fn seal(queue: &Queue, key: &CoreKey) -> Value {
+        super::seal(queue, key, &OsRandom).unwrap()
     }
 
     fn read_file(path: &Path) -> Value {
@@ -1870,7 +1958,7 @@ mod tests {
 
     /// A queue as bwss wrote it before the queue key: format 2, sealed with
     /// the user key itself. A same-user process can forge exactly this.
-    fn legacy_queue(user: &SymmetricKey) -> Vec<u8> {
+    fn legacy_queue(user: &CoreKey) -> Vec<u8> {
         let mut file = seal(&one_op(), user);
         file["format"] = json!(2);
         serde_json::to_vec(&file).unwrap()
@@ -1895,7 +1983,7 @@ mod tests {
     #[test]
     fn the_queue_is_sealed_with_a_key_of_its_own_as_format_3() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         let file = seal(&one_op(), &queue_key(&user));
         assert_eq!(file["format"], 3);
         std::fs::write(&q.path, serde_json::to_vec(&file).unwrap()).unwrap();
@@ -1907,7 +1995,7 @@ mod tests {
     #[test]
     fn a_pre_migration_queue_is_resealed_once_and_the_flag_set() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         std::fs::write(&q.path, legacy_queue(&user)).unwrap();
         assert_eq!(load_queue(&q.path, &user, &q.flag).unwrap().len(), 1);
         let resealed = read_file(&q.path);
@@ -1920,7 +2008,7 @@ mod tests {
 
     #[test]
     fn a_forged_user_key_queue_after_the_migration_is_never_replayed() {
-        let user = SymmetricKey::generate();
+        let user = ck();
         // Format 2 under the user key, and the same ciphertext labelled format 3.
         let forged_v3 = {
             let mut file = seal(&one_op(), &user);
@@ -1940,7 +2028,7 @@ mod tests {
     #[test]
     fn no_queue_at_all_ends_the_migration_window() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
         assert!(crate::config::flag_set(&q.flag));
         // A user-key queue planted afterwards is not opened with the user key.
@@ -1952,7 +2040,7 @@ mod tests {
     #[test]
     fn a_queue_that_cannot_be_resealed_is_still_read_and_left_as_it_was() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         let old = legacy_queue(&user);
         std::fs::write(&q.path, &old).unwrap();
         // The private write goes through this temporary name: a directory
@@ -1966,9 +2054,9 @@ mod tests {
     #[test]
     fn a_queue_that_opens_with_neither_key_is_kept_aside() {
         let q = queue_dir();
-        let foreign = serde_json::to_vec(&seal(&one_op(), &SymmetricKey::generate())).unwrap();
+        let foreign = serde_json::to_vec(&seal(&one_op(), &ck())).unwrap();
         std::fs::write(&q.path, &foreign).unwrap();
-        assert!(load_queue(&q.path, &SymmetricKey::generate(), &q.flag).unwrap().is_empty());
+        assert!(load_queue(&q.path, &ck(), &q.flag).unwrap().is_empty());
         assert!(!q.path.exists());
         assert_eq!(std::fs::read(&q.aside).unwrap(), foreign, "set aside as it was, never lost");
     }
@@ -2102,12 +2190,14 @@ mod tests {
     fn label_patch(id: &str, label: &str) -> Op {
         Op::Patch(Patch {
             id: id.into(),
-            base_revision: REV.into(),
-            set: vec![("bwss:label".into(), label.into(), false)],
-            remove: vec![],
-            acl_add: vec![],
-            value: ValueChange::Keep,
             cipher_id: None,
+            organization_id: None,
+            base_revision: REV.into(),
+            set: vec![FieldSet { name: "bwss:label".into(), value: Zeroizing::new(label.into()), hidden: false }],
+            remove: vec![],
+            append_lines: vec![],
+            value: ValueChange::Keep,
+            answer: None,
         })
     }
 
@@ -2134,17 +2224,19 @@ mod tests {
         let queue = vec![
             label_patch("a", "a1"),
             label_patch("b", "b1"),
-            Op::Create { id: "d".into(), collection: "login".into(), item: d },
+            Op::Create(new_item_of(&d, None)),
             label_patch("a", "a2"),
-            Op::Delete { id: "b".into(), base_revision: REV.into(), cipher_id: Some("c2".into()) },
+            delete("b", "c2"),
             label_patch("c", "c1"),
+            // A patch to an item whose create is queued goes to that create.
+            label_patch("d", "d2"),
         ];
-        let view = with_queue(&s, &queue, &k, None, &Built::default());
+        let view = with_queue(&s, queue, &k);
         let ids: Vec<_> = view.iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
         assert_eq!(ids, ["c1", "c3", ""], "b is gone, d is queued, nothing else moved");
         assert_eq!(
             view_labels(&view, &k),
-            [("a".into(), "a2".into()), ("c".into(), "c1".into()), ("d".into(), "created".into())]
+            [("a".into(), "a2".into()), ("c".into(), "c1".into()), ("d".into(), "d2".into())]
         );
         // Every patched cipher still carries its own bwss:id and its dates.
         let built = build_list(&view, &k, None);
@@ -2162,8 +2254,7 @@ mod tests {
         big.id = "n".into();
         // A field value over the limit of a Bitwarden custom field.
         big.attributes.insert("blob".into(), "x".repeat(5_000));
-        let queue = [Op::Create { id: "n".into(), collection: "login".into(), item: big }];
-        let view = with_queue(&s, &queue, &k, None, &Built::default());
+        let view = with_queue(&s, vec![Op::Create(new_item_of(&big, None))], &k);
         assert_eq!(view.len(), 1);
         // ADR 0015: without bwss:label the label is the id, not the item name.
         assert_eq!(view_labels(&view, &k), [("a".to_owned(), "a".to_owned())]);
@@ -2171,14 +2262,14 @@ mod tests {
 
     #[test]
     fn api_errors_are_retried_or_refused_by_their_status() {
-        let http = |status| ApiError::Http { status, message: String::new() };
-        for e in [http(429), http(500), http(503), ApiError::Network("reset".into()), ApiError::NotSynced] {
+        let http = |status| CoreApiError::Http { status, message: String::new() };
+        for e in [http(429), http(500), http(503), CoreApiError::Network("reset".into()), CoreApiError::NotSynced] {
             let text = e.to_string();
-            assert!(matches!(map_api(e), BackendError::Unavailable(m) if m == text), "{text}");
+            assert!(matches!(map_core_api(e), BackendError::Unavailable(m) if m == text), "{text}");
         }
-        for e in [http(400), http(401), http(404), ApiError::Protocol("odd".into())] {
+        for e in [http(400), http(401), http(404), CoreApiError::Protocol("odd".into())] {
             let text = e.to_string();
-            assert!(matches!(map_api(e), BackendError::Rejected(m) if m == text), "{text}");
+            assert!(matches!(map_core_api(e), BackendError::Rejected(m) if m == text), "{text}");
         }
     }
 
@@ -2250,7 +2341,7 @@ mod tests {
         // A file where the flag's directory should be: setting it fails.
         let blocker = q.flag.parent().unwrap();
         std::fs::write(blocker, b"x").unwrap();
-        let user = SymmetricKey::generate();
+        let user = ck();
         assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
         assert!(!crate::config::flag_set(&q.flag), "not recorded, so the window stays open");
         assert_eq!(std::fs::read(blocker).unwrap(), b"x");
@@ -2259,7 +2350,7 @@ mod tests {
     #[test]
     fn a_queue_that_cannot_be_read_is_never_touched() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         // A directory where the file should be: reading it fails.
         std::fs::create_dir(&q.path).unwrap();
         let e = load_queue(&q.path, &user, &q.flag).err().unwrap();
@@ -2275,7 +2366,7 @@ mod tests {
     #[test]
     fn a_queue_of_an_older_version_is_set_aside_not_replayed() {
         let q = queue_dir();
-        let user = SymmetricKey::generate();
+        let user = ck();
         let old = br#"{"format":1,"ops":[]}"#;
         std::fs::write(&q.path, old).unwrap();
         assert!(load_queue(&q.path, &user, &q.flag).unwrap().is_empty());
@@ -2286,11 +2377,11 @@ mod tests {
     #[test]
     fn an_old_queue_that_does_not_open_with_the_user_key_is_kept_aside() {
         let q = queue_dir();
-        let mut file = seal(&one_op(), &SymmetricKey::generate());
+        let mut file = seal(&one_op(), &ck());
         file["format"] = json!(2);
         let foreign = serde_json::to_vec(&file).unwrap();
         std::fs::write(&q.path, &foreign).unwrap();
-        assert!(load_queue(&q.path, &SymmetricKey::generate(), &q.flag).unwrap().is_empty());
+        assert!(load_queue(&q.path, &ck(), &q.flag).unwrap().is_empty());
         assert!(!q.path.exists());
         assert_eq!(std::fs::read(&q.aside).unwrap(), foreign);
         assert!(!crate::config::flag_set(&q.flag), "the window is not closed by a queue that never opened");
@@ -2302,9 +2393,9 @@ mod tests {
         // fails on every system and for every user.
         let q = queue_dir();
         let long = q.path.with_file_name("q".repeat(250));
-        let foreign = serde_json::to_vec(&seal(&one_op(), &SymmetricKey::generate())).unwrap();
+        let foreign = serde_json::to_vec(&seal(&one_op(), &ck())).unwrap();
         std::fs::write(&long, &foreign).unwrap();
-        let e = load_queue(&long, &SymmetricKey::generate(), &q.flag).err().unwrap();
+        let e = load_queue(&long, &ck(), &q.flag).err().unwrap();
         assert!(matches!(&e, BackendError::Unavailable(m) if m.contains("left untouched")), "{e}");
         assert_eq!(std::fs::read(&long).unwrap(), foreign);
     }

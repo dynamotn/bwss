@@ -691,9 +691,26 @@ sequenceDiagram
   op's field changes and merges (`bwss:acl` union, registry union), write
   the value source with password history when it is the login password,
   and send the result.
-- Once an op is queued, later ops for any item queue behind it, so order
-  is kept across items. *(builder's call, revisable: ordering per item
-  would let unrelated writes through sooner.)*
+- Once an op is queued, later live ops for any item queue behind it.
+  The flush keeps order per item (dybw-core's queue): an item that has to
+  wait (it cannot be read now, keeps changing, or waits for an answer)
+  keeps its ops queued in order, and the other items' ops go on. A cause
+  every op shares (the network, the login, the clock) stops the flush.
+  Collection registry changes are replayed after the item ops, in order.
+- Writes go through dybw-core (`sync::{update, create, delete}` live,
+  `sync::queue::{enqueue, flush}` queued). ACL lines are a `bwss:acl` line
+  union (`append_lines`), so a retry after an out-of-date answer keeps the
+  lines another device added.
+- ADR 0016: before a write to a login password that is the first from this
+  device, or that would push out of a full history a password this device
+  did not write, bwss asks. A live write asks through the pinentry (write
+  to the login, keep the app's value separate, cancel); a queued one waits,
+  `bwss status` lists it and `bwss answer <id> login|separate|cancel`
+  answers it. What this device wrote to each login password is kept,
+  sealed with the queue key, beside the queue.
+- ADR 0019: an op for an item whose server copy is held back as a rollback
+  waits, queued and listed, until the rollback is accepted or the server
+  moves forward; it is never sent over the older copy.
 - A `Delete` saves the stripped item first and trashes it only if the
   server's answer holds no foreign content (§5.4).
 - A permanent error (4xx other than out-of-date and 429) drops the op,
@@ -705,8 +722,8 @@ sequenceDiagram
 Every `sync_interval_seconds` (default 300), on `bwss sync`, and right after
 an unlock:
 
-1. Flush the queue in order. A transient failure stops the flush; the rest
-   stays queued.
+1. Flush the queue (§8.3). A transient failure stops the flush; the rest
+   stays queued. When the flush sent anything, the vault is read again.
 2. `GET /accounts/revision-date`. If it equals the cached one, stop here.
    *(builder's call, revisable: this saves a full `/sync` on most ticks.)*
 3. `GET /sync`, replace the cache, re-apply ops still queued.

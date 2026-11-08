@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
 use tokio::sync::Mutex;
 use zbus::{Connection, OwnedObjectPath, message::Header, object_server::SignalEmitter};
 use zeroize::Zeroizing;
 
 use crate::acl::{CallerKind, Identities};
 use crate::acl_confirm::{ConfirmSet, Mark};
-use crate::backend::{AclTrust, Backend, BackendError};
+use crate::backend::{AclTrust, Backend, BackendError, question_text};
 use crate::config::{AclMode, Config};
 use crate::dbus::{CollectionObj, ItemObj, ServiceObj};
 use crate::keyring::{Diff, Keyring};
@@ -89,6 +90,19 @@ impl From<BackendError> for SecretError {
             other => SecretError::Failed(other.to_string()),
         }
     }
+}
+
+/// What the pinentry asks before a write to a login password (ADR 0016):
+/// the item, what is lost, and the three answers.
+fn history_prompt(label: &str, q: HistoryQuestion) -> String {
+    let what = question_text(&crate::prompter::one_line(label), q);
+    format!(
+        "An application is making {what}.\n\n\
+         Write to the login: the login password changes, and the old one goes to its history.\n\
+         Keep the app's value separate: the value goes to a hidden field of its own; the login password and its \
+         history stay as they are.\n\
+         Cancel: nothing is written."
+    )
 }
 
 /// The keyring locked while a write was in flight. The backend has already
@@ -694,6 +708,38 @@ impl Daemon {
         }
     }
 
+    /// Stores `item` in the backend, asking the user any history question
+    /// the write raises (ADR 0016); the answer goes back with the write.
+    async fn store(&self, item: &ItemData) -> Result<(), BackendError> {
+        let mut stored = self.backend.put_item(item).await;
+        // A write meets a second question only when its copy changed meanwhile.
+        for asked in 0..3 {
+            let Err(BackendError::Ask(q)) = stored else { return stored };
+            if asked == 2 {
+                break;
+            }
+            let answer = self.ask_history(&item.label, q).await?;
+            stored = self.backend.put_item_answered(item, (q, answer)).await;
+        }
+        Err(BackendError::Unavailable("the item keeps changing elsewhere; try again".into()))
+    }
+
+    /// The user's answer to a history question; cancel, or a prompt that
+    /// could not be put, writes nothing.
+    async fn ask_history(&self, label: &str, q: HistoryQuestion) -> Result<HistoryAnswer, BackendError> {
+        let text = history_prompt(label, q);
+        match self.prompter.history(&text).await {
+            Ok(Some(answer)) => Ok(answer),
+            Ok(None) => Err(BackendError::Rejected("cancelled: nothing was written".into())),
+            Err(e) => {
+                tracing::warn!("prompt failed: {e}");
+                Err(BackendError::Rejected(format!(
+                    "this change needs your answer, which could not be asked ({e}): nothing was written"
+                )))
+            }
+        }
+    }
+
     /// The user's answer; `None` when the prompt failed or timed out.
     async fn ask(&self, text: &str, offer_always: bool) -> Option<Confirm> {
         self.prompter.confirm(text, offer_always).await.inspect_err(|e| tracing::warn!("prompt failed: {e}")).ok()
@@ -786,7 +832,7 @@ impl Daemon {
             item
         };
         self.remember(item_id, caller, Mark::Confirmed).await;
-        if let Err(e) = self.backend.put_item(&updated).await {
+        if let Err(e) = self.store(&updated).await {
             tracing::warn!("could not save the access rule: {e}");
         }
     }
@@ -875,7 +921,7 @@ impl Daemon {
         };
         let is_new = self.keyring.lock().await.item(&item.id).is_none();
         if collection != SESSION_COLLECTION {
-            self.backend.put_item(&item).await?;
+            self.store(&item).await?;
             if is_new && item.acl.iter().any(|a| a == caller) {
                 self.remember(&item.id, caller, Mark::Confirmed).await;
             }
@@ -904,7 +950,7 @@ impl Daemon {
             item
         };
         if item.collection != SESSION_COLLECTION {
-            self.backend.put_item(&item).await?;
+            self.store(&item).await?;
         }
         let r = (item.collection.clone(), item.id.clone());
         if !self.keyring.lock().await.upsert(item) {
@@ -1128,6 +1174,12 @@ mod tests {
         /// Writes and the ACL trust fail as if the server were unreachable.
         failing_puts: AtomicBool,
         failing_trust: AtomicBool,
+        /// Every write is answered with this history question (ADR 0016)
+        /// until it comes back with an answer, which is kept in `answered`.
+        asks: std::sync::Mutex<Option<HistoryQuestion>>,
+        answered: std::sync::Mutex<Vec<(HistoryQuestion, HistoryAnswer)>>,
+        /// An answered write is asked again, as one whose copy keeps changing.
+        asks_again: AtomicBool,
     }
 
     fn unreachable() -> BackendError {
@@ -1147,6 +1199,9 @@ mod tests {
                 unreachable_unlocks: AtomicU64::new(0),
                 failing_puts: AtomicBool::new(false),
                 failing_trust: AtomicBool::new(false),
+                asks: std::sync::Mutex::new(None),
+                answered: std::sync::Mutex::new(Vec::new()),
+                asks_again: AtomicBool::new(false),
             }
         }
     }
@@ -1182,12 +1237,26 @@ mod tests {
             if self.failing_puts.load(Ordering::Relaxed) {
                 return Err(unreachable());
             }
+            if let Some(q) = *self.asks.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                return Err(BackendError::Ask(q));
+            }
             self.inner.put_item(item).await?;
             if self.gated {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
             Ok(())
+        }
+        async fn put_item_answered(
+            &self,
+            item: &ItemData,
+            answer: (HistoryQuestion, HistoryAnswer),
+        ) -> Result<(), BackendError> {
+            self.answered.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(answer);
+            if self.asks_again.load(Ordering::Relaxed) {
+                return Err(BackendError::Ask(answer.0));
+            }
+            self.inner.put_item(item).await
         }
         async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
             self.inner.delete_item(item).await
@@ -1521,6 +1590,56 @@ mod tests {
         d.set_acl_state_path(state.join("acl-confirmed"));
         d.unlock_with_password("pw").await.unwrap();
         (d, backend)
+    }
+
+    #[tokio::test]
+    async fn a_live_write_back_asks_through_pinentry() {
+        let state = tempfile::tempdir().unwrap();
+        let pin = ScriptedPinentry::new(true);
+        let (d, backend) = synced_daemon_and_backend(&[], pin.prompter(), state.path()).await;
+        *backend.asks.lock().unwrap() = Some(HistoryQuestion::EvictsForeign);
+        d.update_item("x", |i| i.secret = Zeroizing::new(b"new".to_vec())).await.unwrap();
+        let answered = backend.answered.lock().unwrap().clone();
+        assert_eq!(answered, [(HistoryQuestion::EvictsForeign, HistoryAnswer::WriteToLogin)]);
+        assert_eq!(&*d.keyring.lock().await.item("x").unwrap().secret, b"new");
+        let log = pin.log();
+        let desc = log.iter().find(|l| l.starts_with("SETDESC")).cloned().unwrap_or_default();
+        assert!(desc.contains("\"l\"") && desc.contains("oldest password in its history"), "{desc}");
+        assert!(desc.contains("would be lost"), "{desc}");
+        for line in ["SETOK Write to the login", "SETNOTOK Keep the app's value separate", "SETCANCEL Cancel"] {
+            assert!(log.iter().any(|l| l == line), "{line}: {log:?}");
+        }
+
+        // Cancel: nothing is written, and the app is told.
+        let pin = ScriptedPinentry::new(false);
+        let state = tempfile::tempdir().unwrap();
+        let (d, backend) = synced_daemon_and_backend(&[], pin.prompter(), state.path()).await;
+        *backend.asks.lock().unwrap() = Some(HistoryQuestion::FirstWriteBack);
+        let err = d.update_item("x", |i| i.secret = Zeroizing::new(b"new".to_vec())).await.unwrap_err();
+        assert!(err.to_string().contains("cancelled: nothing was written"), "{err}");
+        assert!(backend.answered.lock().unwrap().is_empty());
+        assert_eq!(&*d.keyring.lock().await.item("x").unwrap().secret, b"s");
+        let desc = pin.log().into_iter().find(|l| l.starts_with("SETDESC")).unwrap_or_default();
+        assert!(desc.contains("first change from this device"), "{desc}");
+
+        // A prompt that cannot be put writes nothing either.
+        let state = tempfile::tempdir().unwrap();
+        let none = Prompter::new("/nonexistent/bwss-pinentry", Duration::from_secs(1));
+        let (d, backend) = synced_daemon_and_backend(&[], none, state.path()).await;
+        *backend.asks.lock().unwrap() = Some(HistoryQuestion::FirstWriteBack);
+        let err = d.update_item("x", |i| i.secret = Zeroizing::new(b"new".to_vec())).await.unwrap_err();
+        assert!(err.to_string().contains("could not be asked"), "{err}");
+
+        // A write that keeps meeting questions is given up after two answers.
+        let pin = ScriptedPinentry::new(true);
+        let state = tempfile::tempdir().unwrap();
+        let (d, backend) = synced_daemon_and_backend(&[], pin.prompter(), state.path()).await;
+        *backend.asks.lock().unwrap() = Some(HistoryQuestion::FirstWriteBack);
+        backend.asks_again.store(true, Ordering::Relaxed);
+        let err = d.update_item("x", |i| i.secret = Zeroizing::new(b"new".to_vec())).await.unwrap_err();
+        assert!(err.to_string().contains("keeps changing elsewhere"), "{err}");
+        assert_eq!(backend.answered.lock().unwrap().len(), 2, "each answer was sent");
+        assert_eq!(pin.confirms(), 2);
     }
 
     #[tokio::test]

@@ -4,11 +4,13 @@
 Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL, re-read on
 every run so tests can change it between prompts:
 
-    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny", "release": "/path",
+    {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny" | "notok", "release": "/path",
      "confirm_release": "/path"}
 
 A confirmation is two CONFIRM questions in one conversation (allow?, then
-remember?), answered according to "confirm".
+remember?), answered according to "confirm". "notok" answers the first one
+with the third button (SETNOTOK), as a password history question's "keep
+the app's value separate".
 
 "pins" is consumed one entry per GETPIN (the file is rewritten); an empty
 list cancels. With "release", a GETPIN is answered only once that file
@@ -78,6 +80,9 @@ for raw in sys.stdin:
         wait_for("confirm_release")
         confirms += 1
         answer = load().get("confirm", "deny")
+        if answer == "notok" and confirms == 1:
+            out("ERR 83886194 Not confirmed")
+            continue
         ok = answer in ("once", "always") if confirms == 1 else answer == "always"
         out("OK" if ok else "ERR 83886179 Operation cancelled")
     elif cmd == "BYE":

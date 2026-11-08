@@ -4,7 +4,7 @@ pub mod bitwarden;
 pub mod memory;
 pub mod ops;
 pub mod registry;
-mod runner;
+pub(crate) mod runner;
 #[cfg(test)]
 mod tests;
 mod worker;
@@ -13,6 +13,7 @@ use async_trait::async_trait;
 
 use dybw_core::crypto::KdfParams;
 use dybw_core::profile::KdfSource;
+use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
 
 use crate::bw::crypto::SymmetricKey;
 use crate::model::{CollectionData, ItemData, Snapshot};
@@ -24,6 +25,20 @@ pub fn kdf_text(kdf: &KdfParams) -> String {
         KdfParams::Argon2id { iterations, memory_mib, parallelism } => {
             format!("Argon2id, {iterations} iterations, {memory_mib} MiB, parallelism {parallelism}")
         }
+    }
+}
+
+/// What a history question asks about (ADR 0016): the item, and for an
+/// eviction the password that would be lost.
+pub fn question_text(label: &str, q: HistoryQuestion) -> String {
+    match q {
+        HistoryQuestion::FirstWriteBack => {
+            format!("the first change from this device to the login password of \"{label}\"")
+        }
+        HistoryQuestion::EvictsForeign => format!(
+            "a change to the login password of \"{label}\", whose password history is full: the oldest password \
+             in its history, which this device did not write, would be lost"
+        ),
     }
 }
 
@@ -70,6 +85,9 @@ pub enum BackendError {
         "the KDF pin saved on this device is unreadable: check the KDF in the web vault, then run `bwss kdf accept`"
     )]
     KdfPinUnreadable,
+    /// Nothing was written: the user must answer this question first (ADR 0016).
+    #[error("the write needs your answer first ({})", .0.code())]
+    Ask(HistoryQuestion),
 }
 
 #[async_trait]
@@ -86,6 +104,15 @@ pub trait Backend: Send + Sync {
     async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError>;
     /// Stores a new or changed item.
     async fn put_item(&self, item: &ItemData) -> Result<(), BackendError>;
+    /// `put_item` again, with the user's answer to the question it asked
+    /// ([`BackendError::Ask`], ADR 0016). A backend that never asks stores it.
+    async fn put_item_answered(
+        &self,
+        item: &ItemData,
+        _answer: (HistoryQuestion, HistoryAnswer),
+    ) -> Result<(), BackendError> {
+        self.put_item(item).await
+    }
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError>;
     /// How far the ACL lines of the items can be trusted on this device;
     /// [`BackendError::Locked`] while locked.

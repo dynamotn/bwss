@@ -95,3 +95,29 @@ impl Backend for MemoryBackend {
         format!("memory backend, {} item(s)", lock(&self.data).items.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
+
+    #[tokio::test]
+    async fn a_backend_that_never_asks_stores_an_answered_write() {
+        let b = MemoryBackend::new("pw");
+        assert!(b.unlock("pw").await.is_ok());
+        let item = ItemData {
+            id: "a".into(),
+            collection: "login".into(),
+            label: "a".into(),
+            attributes: Default::default(),
+            secret: zeroize::Zeroizing::new(b"s".to_vec()),
+            content_type: "text/plain".into(),
+            created: 1,
+            modified: 1,
+            acl: vec![],
+        };
+        let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
+        assert!(b.put_item_answered(&item, answer).await.is_ok());
+        assert_eq!(b.describe().await, "memory backend, 1 item(s)");
+    }
+}

@@ -304,7 +304,10 @@ def test_marked_login_is_found_and_written_back(account):
         assert d.tool("lookup", "bwss:uri", "https://github.com").stdout == "gh-old"
 
         # ADR 0015: without bwss:label the label is the id, so storing under it writes no label field.
+        # ADR 0016: the first write back to this login is confirmed in the pinentry.
+        d.pinentry(confirm="once")
         d.tool("store", "--label=gh", "bwss:name", "GitHub", input="gh-new")
+        assert any(p.startswith("SETOK Write to the login") for p in d.prompts()), d.prompts()
         it = account.item(c["id"])
         assert it["password"] == "gh-new"
         assert it["history"][0] == "gh-old"
@@ -313,6 +316,67 @@ def test_marked_login_is_found_and_written_back(account):
         assert len(account.fields(c["id"])) == 1
     finally:
         d.stop()
+
+
+def test_a_write_back_asks_and_can_keep_the_value_separate(account):
+    d = bitwarden_daemon(account).start()
+    try:
+        unlock(d, account)
+        c = account.add_login(FOLDER, "Separate", "web-pw", {"bwss:id": "sep", "bwss:attr:app": "sep"})
+        d.cli("sync")
+        d.pinentry(confirm="notok")
+        d.tool("store", "--label=sep", "app", "sep", input="app-pw")
+        desc = [p for p in d.prompts() if p.startswith("SETDESC")]
+        assert desc and '"sep"' in desc[-1] and "first change from this device" in desc[-1], desc
+        it = account.item(c["id"])
+        assert it["password"] == "web-pw" and it["history"] == []
+        assert it["fields"]["bwss:password"] == "app-pw"
+        assert d.tool("lookup", "app", "sep").stdout == "app-pw"
+
+        # Cancelled: nothing is written, and the app is told.
+        c2 = account.add_login(FOLDER, "Cancelled", "web-pw", {"bwss:id": "can", "bwss:attr:app": "can"})
+        d.cli("sync")
+        d.pinentry(confirm="deny")
+        r = d.tool("store", "--label=can", "app", "can", input="app-pw", check=False)
+        assert r.returncode != 0
+        assert account.item(c2["id"])["password"] == "web-pw"
+    finally:
+        d.stop()
+
+
+def test_a_queued_question_is_answered_with_bwss_answer(account):
+    relay = Relay(URL)
+    d = bitwarden_daemon(account, server=relay.url).start()
+    try:
+        unlock(d, account)
+        c = account.add_login(FOLDER, "Queued", "web-pw", {"bwss:id": "qa", "bwss:attr:app": "qa"})
+        d.cli("sync")
+        d.stop()
+
+        # Offline: the write is queued, nothing is asked yet.
+        relay.cut()
+        d.start()
+        unlock(d, account)
+        d.tool("store", "--label=qa", "app", "qa", input="queued-pw")
+        assert "1 queued" in d.cli("status").stdout
+
+        # Back online: the queued write waits for an answer.
+        relay.restore()
+        d.cli("sync")
+        status = d.cli("status").stdout
+        assert "waits for your answer" in status and "`bwss answer qa login|separate|cancel`" in status, status
+        assert account.item(c["id"])["password"] == "web-pw"
+
+        out = d.cli("answer", "qa", "login").stdout
+        assert "answering first-write-back for qa" in out, out
+        it = account.item(c["id"])
+        assert it["password"] == "queued-pw" and it["history"][0] == "web-pw"
+        assert "0 queued" in d.cli("status").stdout
+        r = d.cli("answer", "qa", "login", check=False)
+        assert r.returncode != 0 and "no queued change of qa" in r.stderr, r.stderr
+    finally:
+        d.stop()
+        relay.close()
 
 
 def test_bwss_password_field_keeps_login_password(account):
@@ -442,6 +506,7 @@ def test_clone_does_not_change_what_apps_see(account):
         account.set_password(clone, "clone-pw")
         assert sync_lookup(d, "bwss:id", "cl").stdout == "orig-pw"
         # The loser stays untouched by writes.
+        d.pinentry(confirm="once")
         d.tool("store", "--label=Original", "bwss:id", "cl", input="orig-2")
         assert account.item(c["id"])["password"] == "orig-2"
         assert account.item(clone)["password"] == "clone-pw"
