@@ -91,7 +91,9 @@ impl Worker {
                     let task = tokio::task::spawn_local(serve(vault.clone(), command));
                     if task.await.is_err_and(|e| e.is_panic()) {
                         tracing::error!("a vault command panicked; the keyring is locked");
-                        vault.lock().await;
+                        if tokio::task::spawn_local(async move { vault.lock().await }).await.is_err() {
+                            tracing::error!("locking the keyring after a panic panicked too");
+                        }
                     }
                 });
             }

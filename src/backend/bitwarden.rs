@@ -12,6 +12,7 @@
 use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -548,6 +549,9 @@ pub(crate) struct Bitwarden {
     /// Queued ops; loaded at unlock (it is sealed with the queue key) and
     /// dropped at lock. Lock order: `queue`, then `state`.
     pub(super) queue: Mutex<Vec<Op>>,
+    /// Bumped by every `lock`: an unlock that started before one never
+    /// installs its keys.
+    lock_generation: AtomicU64,
 }
 
 fn unavailable(e: impl std::fmt::Display) -> BackendError {
@@ -590,6 +594,7 @@ impl Bitwarden {
             queue_path,
             queue_migrated: paths.queue_key_migrated(),
             queue: Mutex::new(Vec::new()),
+            lock_generation: AtomicU64::new(0),
         })
     }
 
@@ -676,6 +681,7 @@ impl Bitwarden {
 #[async_trait]
 impl Backend for Bitwarden {
     async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+        let generation = self.lock_generation.load(Ordering::SeqCst);
         let online: Result<(KdfParams, Option<String>, Value), ApiError> = async {
             let kdf = self.api.lock().await.prelogin(&self.email).await?;
             let (revision, sync) = self.fetch().await?;
@@ -721,7 +727,15 @@ impl Backend for Bitwarden {
         if !from_cache {
             self.save_cache(&state);
         }
-        *self.state.lock().await = Some(state);
+        let mut guard = self.state.lock().await;
+        if self.lock_generation.load(Ordering::SeqCst) != generation {
+            // A lock came in while this unlock waited: it wins, and the keys
+            // derived here are dropped.
+            queue.clear();
+            return Err(BackendError::Locked);
+        }
+        *guard = Some(state);
+        drop(guard);
         drop(queue);
 
         if !from_cache && let Err(e) = self.flush_queue().await {
@@ -732,6 +746,7 @@ impl Backend for Bitwarden {
     }
 
     async fn lock(&self) {
+        self.lock_generation.fetch_add(1, Ordering::SeqCst);
         *self.state.lock().await = None;
         // A flush in progress clears the queue itself when it finds the
         // keyring locked; never wait for its network calls here.

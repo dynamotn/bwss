@@ -1937,3 +1937,26 @@ async fn calls_after_a_restart_see_a_locked_vault() {
     b.unlock(PASSWORD).await.unwrap();
     assert!(b.acl_trust().await.is_ok());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_during_an_unlock_wins() {
+    let (fake, b, _dir) = handle(vec![]).await;
+    b.lock().await;
+    let b = Arc::new(b);
+    let mut gate = Gate::hold(&fake, "GET", "/api/sync?excludeDomains=true");
+    let unlocking = tokio::spawn({
+        let b = b.clone();
+        async move { b.unlock(PASSWORD).await }
+    });
+    gate.arrived().await;
+    // Polled once, the lock is sent: the worker runs it before anything sent later.
+    let mut locking = b.lock();
+    assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut locking).await.is_err(), "it waits for the sync");
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+    gate.open();
+    assert!(matches!(unlocking.await.unwrap(), Err(BackendError::Locked)), "the unlock does not bring the keys back");
+    locking.await;
+    assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
+    assert!(matches!(b.refresh().await, Err(BackendError::Locked)));
+    assert!(b.describe().await.contains("0 queued change(s)"));
+}
