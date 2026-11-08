@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use dybw_core::api::{ApiKey as CoreApiKey, Client, DeviceInfo, ServerUrls};
+use dybw_core::crypto::{AwsLcRsa, KdfParams};
+use dybw_core::ports::Storage;
+use dybw_core::profile::{self, CachedSync, ProfileError, SecurityFault, UnlockWarning};
+use dybw_core::vault::{Keys as CoreKeys, Namespace, Organizations};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -26,14 +31,15 @@ use super::ops::{
 use super::registry::{REGISTRY_ID, Registry};
 use super::runner::{Effect, status_lines};
 use super::worker::{Command, Worker, WorkerHandle};
-use super::{AclTrust, Backend, BackendError};
+use super::{AclTrust, Backend, BackendError, kdf_text};
 use crate::bw::api::{Api, ApiError, ApiKey, resolve_server_urls};
-use crate::bw::crypto::{CryptoError, KdfParams, SymmetricKey, derive_master_key};
+use crate::bw::crypto::SymmetricKey;
 use crate::bw::fields::{F_KIND, field_names, field_value, first_index};
 use crate::bw::items::item_key;
 use crate::bw::scan::{Keys, MarkedItem, Scan, is_blob, normalize_collection, resolve_duplicates, scan};
 use crate::bw::write::{apply, new_note};
 use crate::config::{Config, Credentials, Paths};
+use crate::core_ports::{clock::SystemClock, http::HttpPort, kdf::BlockingArgon2, storage::FileStorage};
 use crate::fsutil::{write_json_private, write_private};
 use crate::model::{CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
 
@@ -44,11 +50,109 @@ pub(super) const KIND_COLLECTIONS: &str = "collections";
 /// Cipher id of an item created by a queued op: it is not on the server yet.
 pub(super) const QUEUED: &str = "";
 
+/// Storage key of the KDF an unlock refused, for `bwss kdf accept`.
+pub(crate) const KDF_OFFERED: &str = "kdf-offered";
+/// Storage key of the id of the user key this device last opened (ADR 0023).
+const USER_KEY_ID: &str = "user-key-id";
+/// Why a COSE account takes no writes yet.
+const COSE_READ_ONLY: &str =
+    "this account's user key is a COSE key: this bwss cannot read or write its items yet, and writes nothing to it";
+
+/// KDF parameters as `sync.json` has always stored them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum StoredKdf {
+    Pbkdf2 { iterations: u32 },
+    Argon2id { iterations: u32, memory_mib: u32, parallelism: u32 },
+}
+
+impl From<KdfParams> for StoredKdf {
+    fn from(k: KdfParams) -> Self {
+        match k {
+            KdfParams::Pbkdf2 { iterations } => Self::Pbkdf2 { iterations },
+            KdfParams::Argon2id { iterations, memory_mib, parallelism } => {
+                Self::Argon2id { iterations, memory_mib, parallelism }
+            }
+        }
+    }
+}
+
+impl From<StoredKdf> for KdfParams {
+    fn from(k: StoredKdf) -> Self {
+        match k {
+            StoredKdf::Pbkdf2 { iterations } => Self::Pbkdf2 { iterations },
+            StoredKdf::Argon2id { iterations, memory_mib, parallelism } => {
+                Self::Argon2id { iterations, memory_mib, parallelism }
+            }
+        }
+    }
+}
+
+/// What an unlock refused, for `bwss kdf accept`: a weaker KDF, or (`kdf`
+/// `None`) a pin that cannot be read.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct KdfOffer {
+    pub origin: String,
+    kdf: Option<StoredKdf>,
+}
+
+impl KdfOffer {
+    pub fn kdf(&self) -> Option<KdfParams> {
+        self.kdf.map(Into::into)
+    }
+}
+
+/// The offer the last refused unlock left, if any can be read.
+pub(crate) async fn kdf_offer(storage: &impl Storage) -> Result<Option<KdfOffer>, dybw_core::ports::PortError> {
+    Ok(storage.load(KDF_OFFERED).await?.and_then(|raw| serde_json::from_slice(&raw).ok()))
+}
+
+/// The KDF the last successful unlock ran: the core's pin holds exactly it
+/// then (`kdf-pin`: `{kdf, iterations, memory, parallelism, origin}`).
+// shortcut: reads the core's pin format; use the KDF from `profile::Unlocked` once the core reports it.
+async fn ran_kdf(storage: &impl Storage) -> Option<KdfParams> {
+    #[derive(Deserialize)]
+    struct Pin {
+        kdf: u32,
+        iterations: u32,
+        memory: u32,
+        parallelism: u32,
+    }
+    let pin: Pin = serde_json::from_slice(&storage.load("kdf-pin").await.ok()??).ok()?;
+    match pin.kdf {
+        0 => Some(KdfParams::Pbkdf2 { iterations: pin.iterations }),
+        1 => Some(KdfParams::Argon2id {
+            iterations: pin.iterations,
+            memory_mib: pin.memory,
+            parallelism: pin.parallelism,
+        }),
+        _ => None,
+    }
+}
+
+/// Bridge until B4-B6: bwss's own code reads and writes with its own key
+/// type, which holds a legacy key only. A COSE key gets a random stand-in that
+/// opens nothing, and the keyring takes no writes (`true`).
+fn bridge_keys(user: &dybw_core::crypto::SymmetricKey) -> Result<(Keys, bool), BackendError> {
+    let (user, read_only) = match SymmetricKey::from_bytes(&user.to_bytes()) {
+        Ok(user) => (user, false),
+        Err(_) => {
+            let mut bytes = Zeroizing::new([0u8; 64]);
+            rand::fill(bytes.as_mut_slice());
+            (SymmetricKey::from_bytes(bytes.as_ref()).map_err(|e| BackendError::Rejected(e.to_string()))?, true)
+        }
+    };
+    Ok((Keys { mark: user.derive("value-mark"), user }, read_only))
+}
+
 /// `sync.json`: the last `/sync` response, still ciphertext. The `format`
 /// key is written (`CacheRef`) but not read back.
 #[derive(Deserialize)]
 struct Cache {
-    kdf: KdfParams,
+    /// The KDF of the unlock that wrote it; the core needs it offline for an
+    /// account without `masterPasswordUnlock`.
+    #[serde(default)]
+    kdf: Option<StoredKdf>,
     email: String,
     /// Raw `/accounts/revision-date` answer at the time of the sync.
     #[serde(default)]
@@ -61,7 +165,7 @@ struct Cache {
 #[derive(Serialize)]
 struct CacheRef<'a> {
     format: u64,
-    kdf: KdfParams,
+    kdf: Option<StoredKdf>,
     email: &'a str,
     revision: Option<&'a str>,
     sync: &'a Value,
@@ -523,8 +627,11 @@ fn load_queue(path: &Path, user: &SymmetricKey, migrated: &Path) -> Result<Vec<O
 }
 
 pub(super) struct Unlocked {
+    /// Bridge until B4-B6: bwss's own key type, from `core_keys`.
     pub(super) keys: Keys,
-    kdf: KdfParams,
+    /// The keys dybw-core opened.
+    pub(super) core_keys: CoreKeys,
+    kdf: Option<KdfParams>,
     /// The server's copy of the vault, as cached; queued ops are not in it.
     pub(super) sync: Value,
     /// Raw account revision date of `sync`, when known.
@@ -532,6 +639,10 @@ pub(super) struct Unlocked {
     /// The keyring: `sync` with the queue applied.
     pub(super) built: Built,
     pub(super) keyring_folder: Option<String>,
+    /// What `bwss status` reports about this unlock.
+    notices: Vec<String>,
+    /// Bridge until B4-B6: a COSE user key, which bwss's own code cannot use.
+    read_only: bool,
 }
 
 pub(crate) struct Bitwarden {
@@ -552,6 +663,23 @@ pub(crate) struct Bitwarden {
     /// Bumped by every `lock`: an unlock that started before one never
     /// installs its keys.
     lock_generation: AtomicU64,
+    /// Where dybw-core's client goes, and as which device.
+    urls: ServerUrls,
+    device: DeviceInfo,
+    /// dybw-core's device state: the KDF pin, the security version, the user key id.
+    storage: FileStorage,
+    acl_confirmed: PathBuf,
+}
+
+/// The online half of an unlock.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per unlock; a Box would leave a copy of the keys unwiped on the heap"
+)]
+enum Online {
+    Opened(profile::Unlocked, Option<String>),
+    /// The network is down: the offline copy may be used.
+    Unreachable(String),
 }
 
 fn unavailable(e: impl std::fmt::Display) -> BackendError {
@@ -562,10 +690,38 @@ fn map_api(e: ApiError) -> BackendError {
     if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
 }
 
+fn map_core_api(e: dybw_core::api::ApiError) -> BackendError {
+    if e.is_transient() { BackendError::Unavailable(e.to_string()) } else { BackendError::Rejected(e.to_string()) }
+}
+
+/// An unlock the core refused, with the command that answers it.
+fn map_profile(e: ProfileError) -> BackendError {
+    match e {
+        ProfileError::WrongPassword => BackendError::WrongPassword,
+        ProfileError::Api(e) => map_core_api(e),
+        e @ ProfileError::Port(_) => unavailable(e),
+        ProfileError::KdfWeakened { pinned, offered, kdf_source } => {
+            BackendError::KdfWeakened { pinned, offered, kdf_source }
+        }
+        ProfileError::KdfPinUnreadable => BackendError::KdfPinUnreadable,
+        ProfileError::SecurityDowngrade { seen, offered } => BackendError::SecurityDowngrade { seen, offered },
+        ProfileError::SecurityState(SecurityFault::StoredUnreadable) => BackendError::SecurityState(
+            "the security state version saved on this device is unreadable: `bwss security accept 0` forgets it, \
+             and the next unlock saves the account's version again"
+                .into(),
+        ),
+        ProfileError::SecurityState(fault) => BackendError::SecurityState(format!(
+            "the account's security state {fault}: check the account in the web vault"
+        )),
+        e @ (ProfileError::Crypto(_) | ProfileError::IncompleteUnlockData) => BackendError::Rejected(e.to_string()),
+    }
+}
+
 impl Bitwarden {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
         let urls = resolve_server_urls(&config.server_url).map_err(anyhow::Error::msg)?;
         let profile = config.profile.as_deref().ok_or_else(|| anyhow::anyhow!("no profile to serve"))?;
+        let core_urls = dybw_core::api::resolve_server_urls(&config.server_url)?;
         let device_path = paths.device_id(profile);
         let device_id = match std::fs::read_to_string(&device_path) {
             Ok(s) if !s.trim().is_empty() => s.trim().to_owned(),
@@ -583,7 +739,7 @@ impl Bitwarden {
         Ok(Bitwarden {
             email: config.email.clone(),
             root: config.folder.trim_matches('/').to_owned(),
-            api: Mutex::new(Api::new(urls, device_id)?),
+            api: Mutex::new(Api::new(urls, device_id.clone())?),
             key: ApiKey {
                 origin: creds.identity_origin,
                 client_id: creds.client_id,
@@ -595,7 +751,151 @@ impl Bitwarden {
             queue_migrated: paths.queue_key_migrated(),
             queue: Mutex::new(Vec::new()),
             lock_generation: AtomicU64::new(0),
+            urls: core_urls,
+            // As bwss's own client announces itself.
+            device: DeviceInfo {
+                identifier: device_id,
+                name: "bwss".into(),
+                device_type: 8,
+                client_name: "bwss".into(),
+                client_version: env!("CARGO_PKG_VERSION").into(),
+            },
+            storage: FileStorage::new(paths, profile),
+            acl_confirmed: paths.acl_confirmed(),
         })
+    }
+
+    fn core_key(&self) -> CoreApiKey {
+        CoreApiKey {
+            origin: self.key.origin.clone(),
+            client_id: self.key.client_id.clone(),
+            client_secret: self.key.client_secret.clone(),
+        }
+    }
+
+    /// `profile::unlock` with bwss's ports. A network that is down is not
+    /// an error here: the caller falls back to the offline copy.
+    async fn open_online(&self, password: Zeroizing<String>) -> Result<Online, BackendError> {
+        // Bridge until B5: bwss's own client still writes, so it logs in and
+        // reads the revision (before `/sync`, as it always did) here.
+        let revision = match self.ensure_login().await {
+            Ok(()) => self.api.lock().await.revision_date().await.ok(),
+            Err(e) if e.is_transient() => return Ok(Online::Unreachable(e.to_string())),
+            Err(e) => return Err(map_api(e)),
+        };
+        let http = HttpPort::new().map_err(unavailable)?;
+        let mut client =
+            Client::new(http, SystemClock, self.urls.clone(), self.device.clone()).map_err(map_core_api)?;
+        let (ns, orgs) = (&Namespace::BWSS, &Organizations::None);
+        let opened = profile::unlock(
+            &mut client,
+            &self.storage,
+            &self.core_key(),
+            &self.email,
+            password,
+            &BlockingArgon2,
+            &AwsLcRsa,
+            ns,
+            orgs,
+        )
+        .await;
+        match opened {
+            Ok(unlocked) => {
+                self.api.lock().await.synced(&unlocked.sync);
+                Ok(Online::Opened(unlocked, revision))
+            }
+            Err(ProfileError::Api(e)) if e.is_transient() => Ok(Online::Unreachable(e.to_string())),
+            Err(e) => Err(self.refused(e).await),
+        }
+    }
+
+    /// Opens the user key online, else from the offline copy when the network
+    /// is down: the unlocked profile, the account revision and whether it came
+    /// from the copy.
+    async fn open(&self, password: &str) -> Result<(profile::Unlocked, Option<String>, bool), BackendError> {
+        let password = Zeroizing::new(password.to_owned());
+        let why = match self.open_online(password.clone()).await? {
+            Online::Opened(unlocked, revision) => return Ok((unlocked, revision, false)),
+            Online::Unreachable(why) => why,
+        };
+        let Cache { kdf, email, revision, sync } = load_cache(&self.cache_path, &self.email)?
+            .ok_or_else(|| unavailable(format!("Bitwarden is unreachable and there is no offline copy yet: {why}")))?;
+        tracing::info!("Bitwarden unreachable; unlocking from the offline copy");
+        let cached = CachedSync { sync, prelogin_kdf: kdf.map(Into::into), email };
+        let (ns, orgs) = (&Namespace::BWSS, &Organizations::None);
+        let origin = &self.key.origin;
+        match profile::unlock_cached(cached, &self.storage, origin, password, &BlockingArgon2, &AwsLcRsa, ns, orgs)
+            .await
+        {
+            Ok(unlocked) => Ok((unlocked, revision, true)),
+            Err(e) => Err(self.refused(e).await),
+        }
+    }
+
+    /// Maps a refused unlock, and keeps what `bwss kdf accept` needs to answer it.
+    async fn refused(&self, e: ProfileError) -> BackendError {
+        let kdf = match &e {
+            ProfileError::KdfWeakened { offered, .. } => Some(Some(StoredKdf::from(*offered))),
+            ProfileError::KdfPinUnreadable => Some(None),
+            _ => None,
+        };
+        if let Some(kdf) = kdf {
+            // Numbers and text: it always serializes.
+            let offer = serde_json::to_vec(&KdfOffer { origin: self.key.origin.clone(), kdf }).unwrap_or_default();
+            if let Err(e) = self.storage.save(KDF_OFFERED, &offer).await {
+                tracing::warn!("could not keep the offered KDF for `bwss kdf accept`: {e}");
+            }
+        }
+        map_profile(e)
+    }
+
+    /// ADR 0023: what the old user key sealed cannot be opened with a new one.
+    /// When the key changed, the queue is set aside and the ACL confirmations
+    /// are dropped; returns what to report.
+    async fn check_user_key(&self, id: &str) -> Vec<String> {
+        let saved = self.storage.load(USER_KEY_ID).await.ok().flatten();
+        let saved = saved.as_deref().map(String::from_utf8_lossy);
+        let old = saved.as_deref().map(str::trim).filter(|old| !old.is_empty());
+        let mut notices = Vec::new();
+        if let Some(old) = old.filter(|old| *old != id) {
+            // Only the characters of an id the core makes: never a path.
+            let name: String = old.chars().filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c)).collect();
+            let aside = self.queue_path.with_file_name(format!("queue.{name}.bak"));
+            match std::fs::rename(&self.queue_path, &aside) {
+                Ok(()) => notices.push(format!(
+                    "the user key changed: changes queued before that cannot be sent and were set aside in {}",
+                    aside.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    notices.push(format!("the user key changed, and the write queue could not be set aside: {e}"))
+                }
+            }
+            match std::fs::remove_file(&self.acl_confirmed) {
+                Ok(()) => notices.push("the user key changed: every ACL line is asked again on this device".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    notices.push(format!("the user key changed, and the ACL confirmations could not be reset: {e}"))
+                }
+            }
+        }
+        if old != Some(id)
+            && let Err(e) = self.storage.save(USER_KEY_ID, id.as_bytes()).await
+        {
+            tracing::warn!("could not record the id of the user key: {e}");
+        }
+        for notice in &notices {
+            tracing::warn!("{notice}");
+        }
+        notices
+    }
+
+    /// Bridge until B4-B6: a COSE account takes no writes.
+    async fn writable(&self) -> Result<(), BackendError> {
+        match self.state.lock().await.as_ref() {
+            Some(state) if state.read_only => Err(BackendError::Rejected(COSE_READ_ONLY.into())),
+            _ => Ok(()),
+        }
     }
 
     async fn ensure_login(&self) -> Result<(), ApiError> {
@@ -622,7 +922,7 @@ impl Bitwarden {
     fn save_cache(&self, state: &Unlocked) {
         let cache = CacheRef {
             format: FORMAT,
-            kdf: state.kdf,
+            kdf: state.kdf.map(StoredKdf::from),
             email: &self.email,
             revision: state.revision.as_deref(),
             sync: &state.sync,
@@ -678,43 +978,34 @@ impl Bitwarden {
     }
 }
 
-#[async_trait]
-impl Backend for Bitwarden {
-    async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
+/// The [`Backend`] operations, run by the worker: their futures await the
+/// core's, which are not `Send`.
+impl Bitwarden {
+    pub(crate) async fn unlock(&self, password: &str) -> Result<Snapshot, BackendError> {
         let generation = self.lock_generation.load(Ordering::SeqCst);
-        let online: Result<(KdfParams, Option<String>, Value), ApiError> = async {
-            let kdf = self.api.lock().await.prelogin(&self.email).await?;
-            let (revision, sync) = self.fetch().await?;
-            Ok((kdf, revision, sync))
+        let (unlocked, revision, from_cache) = self.open(password).await?;
+        let mut notices = self.check_user_key(&unlocked.user_key_id()).await;
+        for UnlockWarning::KdfBelowFloor { params, kdf_source } in &unlocked.warnings {
+            let note = format!(
+                "the KDF is below ADR 0017's floor ({}, {kdf_source}): strengthen it in the web vault",
+                kdf_text(params)
+            );
+            tracing::warn!("{note}");
+            notices.push(note);
         }
-        .await;
-        let (kdf, revision, sync, from_cache) = match online {
-            Ok((kdf, revision, sync)) => (kdf, revision, sync, false),
-            Err(e) if e.is_transient() => {
-                let cache = load_cache(&self.cache_path, &self.email)?.ok_or_else(|| {
-                    unavailable(format!("Bitwarden is unreachable and there is no offline copy yet: {e}"))
-                })?;
-                tracing::info!("Bitwarden unreachable; unlocking from the offline copy");
-                (cache.kdf, cache.revision, cache.sync, true)
-            }
-            Err(e) => return Err(map_api(e)),
-        };
-        let protected = sync
-            .pointer("/profile/key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| unavailable("sync without account key"))?;
-        let master =
-            derive_master_key(password, &self.email, kdf).map_err(|e| BackendError::Rejected(e.to_string()))?;
-        let stretched = SymmetricKey::stretch(&master);
-        let user = match stretched.decrypt_key(protected) {
-            Ok(k) => k,
-            Err(CryptoError::BadMac) => return Err(BackendError::WrongPassword),
-            Err(e) => return Err(BackendError::Rejected(e.to_string())),
-        };
-        let keys = Keys { mark: user.derive("value-mark"), user };
+        // Answered, or no longer asked.
+        let _ = self.storage.remove(KDF_OFFERED).await;
+        let kdf = ran_kdf(&self.storage).await;
+        let (keys, read_only) = bridge_keys(&unlocked.keys.user)?;
+        if read_only {
+            tracing::warn!("{COSE_READ_ONLY}");
+            notices.push(COSE_READ_ONLY.into());
+        }
+        let profile::Unlocked { keys: core_keys, sync, .. } = unlocked;
 
         let mut queue = self.queue.lock().await;
-        *queue = load_queue(&self.queue_path, &keys.user, &self.queue_migrated)?;
+        // A COSE account's queue is left as it is, for B6 to open.
+        *queue = if read_only { Vec::new() } else { load_queue(&self.queue_path, &keys.user, &self.queue_migrated)? };
         let folder = keyring_folder(&sync, &keys.user, &self.root);
         let built = build_fresh(&sync, &queue, &keys, folder.as_deref());
         if !built.snapshot.blobs.is_empty() {
@@ -723,7 +1014,8 @@ impl Backend for Bitwarden {
                 built.snapshot.blobs.len()
             );
         }
-        let state = Unlocked { keys, kdf, sync, revision, built, keyring_folder: folder };
+        let state =
+            Unlocked { keys, core_keys, kdf, sync, revision, built, keyring_folder: folder, notices, read_only };
         if !from_cache {
             self.save_cache(&state);
         }
@@ -745,7 +1037,7 @@ impl Backend for Bitwarden {
         Ok(guard.as_ref().ok_or(BackendError::Locked)?.built.snapshot.clone())
     }
 
-    async fn lock(&self) {
+    pub(crate) async fn lock(&self) {
         self.lock_generation.fetch_add(1, Ordering::SeqCst);
         *self.state.lock().await = None;
         // A flush in progress clears the queue itself when it finds the
@@ -756,7 +1048,7 @@ impl Backend for Bitwarden {
         self.api.lock().await.logout();
     }
 
-    async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
+    pub(crate) async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
         let before = {
             let guard = self.state.lock().await;
             guard.as_ref().ok_or(BackendError::Locked)?.built.snapshot.clone()
@@ -794,41 +1086,48 @@ impl Backend for Bitwarden {
         Ok((state.built.snapshot != before).then(|| state.built.snapshot.clone()))
     }
 
-    async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+    pub(crate) async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
+        self.writable().await?;
         let mut queue = self.queue.lock().await;
         let result = self.create_collection_locked(&mut queue, label).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
-    async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
+    pub(crate) async fn delete_collection(&self, id: &str, items: &[String]) -> Result<(), BackendError> {
+        self.writable().await?;
         let mut queue = self.queue.lock().await;
         let result = self.delete_collection_locked(&mut queue, id, items).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
-    async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+    pub(crate) async fn put_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        self.writable().await?;
         let mut queue = self.queue.lock().await;
         let result = self.put_locked(&mut queue, item).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
-    async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+    pub(crate) async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
+        self.writable().await?;
         let mut queue = self.queue.lock().await;
         let result = self.delete_locked(&mut queue, &item.id).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
 
-    async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
+    pub(crate) async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
-        Ok(AclTrust::PerDevice(state.keys.user.derive("acl-confirm")))
+        // ADR 0023: from the core's key, legacy or COSE; for a legacy key the
+        // same bytes as bwss's own derivation.
+        let key = state.core_keys.user.derive_bwss("acl-confirm").to_bytes();
+        Ok(AclTrust::PerDevice(SymmetricKey::from_bytes(&key).map_err(|e| BackendError::Rejected(e.to_string()))?))
     }
 
-    async fn describe(&self) -> String {
+    pub(crate) async fn describe(&self) -> String {
         let queued = self.queue.lock().await.len();
         let urls = self.api.lock().await.urls().clone();
         let mut out = format!(
@@ -836,7 +1135,7 @@ impl Backend for Bitwarden {
             self.email, urls.identity, self.root
         );
         if let Some(state) = self.state.lock().await.as_ref() {
-            for line in status_lines(&state.built) {
+            for line in status_lines(&state.built).into_iter().chain(state.notices.iter().cloned()) {
                 out.push('\n');
                 out.push_str(&line);
             }
@@ -1424,6 +1723,68 @@ mod tests {
             let text = e.to_string();
             assert!(matches!(map_api(e), BackendError::Rejected(m) if m == text), "{text}");
         }
+    }
+
+    #[test]
+    fn unlock_refusals_name_what_answers_them() {
+        use dybw_core::api::ApiError as Core;
+        use dybw_core::crypto::CryptoError;
+        use dybw_core::ports::PortError;
+        use dybw_core::profile::KdfSource;
+        let weak = KdfParams::Pbkdf2 { iterations: 5_000 };
+        let pinned = KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 };
+        let text = |e: ProfileError| map_profile(e).to_string();
+        assert!(matches!(map_profile(ProfileError::WrongPassword), BackendError::WrongPassword));
+        assert!(matches!(map_profile(Core::Network("x".into()).into()), BackendError::Unavailable(_)));
+        assert!(matches!(map_profile(Core::WrongOrigin.into()), BackendError::Rejected(_)));
+        assert!(
+            matches!(map_profile(PortError("disk".into()).into()), BackendError::Unavailable(m) if m == "host port failed: disk")
+        );
+        assert!(matches!(map_profile(CryptoError::BadMac.into()), BackendError::Rejected(_)));
+        assert!(
+            matches!(map_profile(ProfileError::IncompleteUnlockData), BackendError::Rejected(m) if m.contains("incomplete"))
+        );
+        let weakened = text(ProfileError::KdfWeakened { pinned, offered: weak, kdf_source: KdfSource::SyncUnlockData });
+        assert_eq!(
+            weakened,
+            "the KDF from sync unlock data (PBKDF2, 5000 iterations) is weaker than the one pinned on this device \
+             (Argon2id, 3 iterations, 64 MiB, parallelism 4): check it in the web vault, then run `bwss kdf accept`"
+        );
+        assert!(text(ProfileError::KdfPinUnreadable).ends_with("then run `bwss kdf accept`"));
+        assert!(
+            text(ProfileError::SecurityDowngrade { seen: 3, offered: 2 }).ends_with("run `bwss security accept 2`")
+        );
+        let stored = text(ProfileError::SecurityState(SecurityFault::StoredUnreadable));
+        assert!(stored.contains("`bwss security accept 0` forgets it"), "{stored}");
+        for (fault, says) in [(SecurityFault::Missing, "is missing"), (SecurityFault::Invalid, "is invalid")] {
+            let shown = text(ProfileError::SecurityState(fault));
+            assert!(matches!(map_profile(ProfileError::SecurityState(fault)), BackendError::SecurityState(_)));
+            assert!(shown.contains(says) && shown.ends_with("check the account in the web vault"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_cache_keeps_the_kdf_as_bwss_always_wrote_it() {
+        let argon = KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 };
+        let stored = serde_json::to_value(StoredKdf::from(argon)).unwrap();
+        assert_eq!(stored, json!({ "type": "argon2id", "iterations": 3, "memory_mib": 64, "parallelism": 4 }));
+        assert_eq!(KdfParams::from(serde_json::from_value::<StoredKdf>(stored).unwrap()), argon);
+        let pbkdf2 = json!({ "type": "pbkdf2", "iterations": 600_000 });
+        let read = KdfParams::from(serde_json::from_value::<StoredKdf>(pbkdf2).unwrap());
+        assert_eq!(read, KdfParams::Pbkdf2 { iterations: 600_000 });
+    }
+
+    #[tokio::test]
+    async fn the_kdf_an_unlock_ran_is_read_from_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().as_os_str().to_owned();
+        let storage = FileStorage::new(&Paths::with(|v| (v == "HOME").then(|| home.clone())), "p");
+        assert_eq!(ran_kdf(&storage).await, None);
+        let argon = KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 };
+        dybw_core::profile::accept_kdf(&storage, argon, "o").await.unwrap();
+        assert_eq!(ran_kdf(&storage).await, Some(argon));
+        storage.save("kdf-pin", br#"{"kdf":7,"iterations":1,"memory":0,"parallelism":0,"origin":"o"}"#).await.unwrap();
+        assert_eq!(ran_kdf(&storage).await, None);
     }
 
     #[test]

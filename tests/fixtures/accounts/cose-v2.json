@@ -1,0 +1,34 @@
+{
+  "name": "cose-v2",
+  "email": "cose-v2@vectors.invalid",
+  "password": "vectors-cose-v2-password",
+  "kdf": {
+    "type": "pbkdf2",
+    "iterations": 600000
+  },
+  "seed": "Vu29Y5VIWY4yK89oZtfA3HKCEkQ+2pi2eqJBLU7QWjI=",
+  "userKey": "pQEEAlBR2KeWcXIhKg1SAAGlrdCiAzoAARF5BIQDBAUGIFggLUHUWjgLEmked81cWuJ+Qsn7o9RO+47vDEvSQPegGRoB",
+  "profileKey": "2.wQfmxalhXp/0aqNtsPejrA==|tpcXJMp2E0xmhf6O9un3DUy+B5bpmu+UgI1k4++r7dH52qgq2LAiOIplcYqLqVSs9T8275S/n8LE43Z9eUh50N+whAaJ86BAE8lbkZQMAR4=|AG1ZcWwaC2d8dSAo93LDU1+DLeBxCgeO2l1+5xgvZWg=",
+  "profile": {
+    "accountKeys": {
+      "signatureKeyPair": {
+        "wrappedSigningKey": "7.g1gcowE6AAEReQMYZQRQUdinlnFyISoNUgABpa3QoqEFWBggrrGDF0a7AgKNw344/uitCeZW6SinEt1YTwpw5FeOFp3p37+d+ut9Y3BEaZ5e5pN6lqjhR75LgpcITOKg8oZxcUNVXn8BL9/Rl8s19lss7WpCujbYWt28F6yJxDF99C9XjK3MHDcDjQI=",
+        "verifyingKey": "pgEBAlAWzE/5ZQKgf6r1rlq2V5wjAycEgQIgBiFYIG15HSFclc2PE5pOzgrnTUnifV2jskWz/CLdTblNn/Rf"
+      },
+      "securityState": {
+        "securityState": "hFgepAEnAxg8BFAWzE/5ZQKgf6r1rlq2V5wjOgABOH8CoFgkomhlbnRpdHlJZFBhZ+TPZAYVlUzLfH14HVefZ3ZlcnNpb24CWEA+agYx8VUoEHQDQUvf5rLaDAfnf9y6X9aZR6x1B3nvG7g93Zon1aASKWk543HzwasiGybof91W1Cvn2GdzgMwK",
+        "securityVersion": 2
+      }
+    }
+  },
+  "userDecryption": {
+    "masterPasswordUnlock": {
+      "kdf": {
+        "kdfType": 0,
+        "iterations": 600000
+      },
+      "masterKeyEncryptedUserKey": "2.wQfmxalhXp/0aqNtsPejrA==|tpcXJMp2E0xmhf6O9un3DUy+B5bpmu+UgI1k4++r7dH52qgq2LAiOIplcYqLqVSs9T8275S/n8LE43Z9eUh50N+whAaJ86BAE8lbkZQMAR4=|AG1ZcWwaC2d8dSAo93LDU1+DLeBxCgeO2l1+5xgvZWg=",
+      "salt": "cose-v2@vectors.invalid"
+    }
+  }
+}

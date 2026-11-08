@@ -323,9 +323,17 @@ fn registry_note(k: &SymmetricKey, cid: &str, notes: &str) -> Value {
 
 /// A fake server holding `ciphers` for `user`, and what a backend needs to reach it.
 fn server(ciphers: Vec<Value>, user: &SymmetricKey) -> (Fake, Config, Credentials, Paths, tempfile::TempDir) {
+    serve(json!({ "profile": { "id": "user1", "key": protect(user) }, "folders": [], "ciphers": ciphers }))
+}
+
+/// `user` wrapped under the master key of `PASSWORD`, as `profile.key`.
+fn protect(user: &SymmetricKey) -> String {
     let master = derive_master_key(PASSWORD, EMAIL, KdfParams::Pbkdf2 { iterations: ITERATIONS }).unwrap();
-    let protected = SymmetricKey::stretch(&master).encrypt(&user.to_bytes());
-    let sync = json!({ "profile": { "id": "user1", "key": protected }, "folders": [], "ciphers": ciphers });
+    SymmetricKey::stretch(&master).encrypt(&user.to_bytes())
+}
+
+/// A fake server answering `/sync` with `sync`.
+fn serve(sync: Value) -> (Fake, Config, Credentials, Paths, tempfile::TempDir) {
     let (fake, url) = Fake::start(sync);
     let dir = tempfile::tempdir().unwrap();
     let identity_origin = crate::bw::api::origin_of(&url).unwrap();
@@ -1634,13 +1642,17 @@ async fn an_unlock_that_cannot_go_on_says_why() {
     v.backend.lock().await;
 
     // A refusal is not an outage: the offline copy is not used.
+    v.fake.fault("POST", "/identity/connect/token", 401, 1);
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 401")), "{err}");
     v.fake.fault("POST", "/identity/accounts/prelogin", 400, 1);
     let err = v.backend.unlock(PASSWORD).await.unwrap_err();
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
 
     v.fake.with(|s| s.sync["profile"]["key"] = Value::Null);
     let err = v.backend.unlock(PASSWORD).await.unwrap_err();
-    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("without account key")), "{err}");
+    // The core refuses such a `/sync` as a protocol error: the server is wrong, not away.
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("no account key")), "{err}");
     v.fake.with(|s| s.sync["profile"]["key"] = account_key);
 
     // A key derivation the client refuses to run.
@@ -1949,14 +1961,266 @@ async fn lock_during_an_unlock_wins() {
         async move { b.unlock(PASSWORD).await }
     });
     gate.arrived().await;
-    // Polled once, the lock is sent: the worker runs it before anything sent later.
-    let mut locking = b.lock();
-    assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut locking).await.is_err(), "it waits for the sync");
+    // The core's sync holds nothing the lock needs: it is done while the sync waits.
+    b.lock().await;
     assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
     gate.open();
     assert!(matches!(unlocking.await.unwrap(), Err(BackendError::Locked)), "the unlock does not bring the keys back");
-    locking.await;
     assert!(matches!(b.acl_trust().await, Err(BackendError::Locked)));
     assert!(matches!(b.refresh().await, Err(BackendError::Locked)));
     assert!(b.describe().await.contains("0 queued change(s)"));
+}
+
+// --- unlocking through the core ---------------------------------------------------------
+
+use crate::core_ports::storage::FileStorage;
+use dybw_core::crypto::KdfParams as CoreKdf;
+use dybw_core::profile::{KdfSource, accept_kdf};
+
+impl Vault {
+    /// The core's device state, as the backend keeps it.
+    fn storage(&self) -> FileStorage {
+        FileStorage::new(&paths_in(&self.dir), "p")
+    }
+
+    fn core_file(&self, key: &str) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("tool-state/core").join(key)).ok()
+    }
+
+    /// The identity origin the KDF pin is bound to.
+    fn origin(&self) -> String {
+        let pin: Value = serde_json::from_str(&self.core_file("kdf-pin").unwrap()).unwrap();
+        pin["origin"].as_str().unwrap().to_owned()
+    }
+}
+
+#[tokio::test]
+async fn unlocks_online_and_writes_the_cache() {
+    let v = github().await;
+    let cache: Value = serde_json::from_slice(&std::fs::read(v.dir.join("cache/sync.json")).unwrap()).unwrap();
+    assert_eq!(cache["format"], 2);
+    assert_eq!(cache["email"], EMAIL);
+    // The KDF the unlock ran, read back from the pin.
+    assert_eq!(cache["kdf"], json!({ "type": "pbkdf2", "iterations": ITERATIONS }));
+    assert!(cache["revision"].is_string());
+    assert_eq!(cache["sync"]["ciphers"], v.fake.with(|s| s.sync["ciphers"].clone()));
+    assert_eq!(cache["sync"]["profile"]["id"], "user1");
+    // The core's device state: the pin and the id of the user key (ADR 0017, 0023).
+    assert!(v.core_file("kdf-pin").is_some());
+    assert!(v.core_file("user-key-id").is_some_and(|id| id.len() == 22), "{:?}", v.core_file("user-key-id"));
+    // 5,000 iterations are below ADR 0017's floor: the unlock goes on, and the status says so.
+    let status = v.backend.describe().await;
+    assert!(status.contains("below ADR 0017's floor (PBKDF2, 5000 iterations, KDF from prelogin)"), "{status}");
+    assert_eq!(v.fake.count("GET", "/api/sync"), 1, "one /sync, the core's");
+    // Queued writes go out at once, as before the core: the runner can write.
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1);
+}
+
+#[tokio::test]
+async fn unlocks_offline_from_the_cache() {
+    let v = github().await;
+    v.backend.lock().await;
+    v.fake.with(|s| s.down = true);
+    assert!(matches!(v.backend.unlock("wrong").await, Err(BackendError::WrongPassword)));
+    let snap = v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!(snap.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["gh"]);
+    assert!(v.backend.describe().await.contains("below ADR 0017's floor"));
+
+    // The pin is checked offline too.
+    v.backend.lock().await;
+    accept_kdf(&v.storage(), CoreKdf::Pbkdf2 { iterations: ITERATIONS * 2 }, &v.origin()).await.unwrap();
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(err, BackendError::KdfWeakened { .. }), "{err}");
+
+    // A cache without the prelogin KDF cannot open a `profile.key` account.
+    let cache = v.dir.join("cache/sync.json");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    doc.as_object_mut().unwrap().remove("kdf");
+    std::fs::write(&cache, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("incomplete unlock data")), "{err}");
+}
+
+#[tokio::test]
+async fn a_weakened_kdf_is_refused_until_accepted() {
+    let v = github().await;
+    let storage = v.storage();
+    accept_kdf(&storage, CoreKdf::Pbkdf2 { iterations: 10_000 }, &v.origin()).await.unwrap();
+    v.backend.lock().await;
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BackendError::KdfWeakened {
+                pinned: CoreKdf::Pbkdf2 { iterations: 10_000 },
+                offered: CoreKdf::Pbkdf2 { iterations: ITERATIONS },
+                kdf_source: KdfSource::Prelogin,
+            }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("then run `bwss kdf accept`"), "{err}");
+    assert!(v.backend.state.lock().await.is_none());
+
+    // A no at the question changes nothing.
+    assert!(crate::kdf_accept(&storage, async |_| Ok(false)).await.is_err());
+    assert!(matches!(v.backend.unlock(PASSWORD).await, Err(BackendError::KdfWeakened { .. })));
+
+    let mut asked = String::new();
+    crate::kdf_accept(&storage, async |q: &str| {
+        asked = q.to_owned();
+        Ok(true)
+    })
+    .await
+    .unwrap();
+    assert!(asked.contains("PBKDF2, 5000 iterations"), "{asked}");
+    assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
+    let none = crate::kdf_accept(&storage, async |_| Ok(true)).await.unwrap_err().to_string();
+    assert!(none.contains("no unlock waits"), "{none}");
+
+    // An offer that cannot be kept still refuses the unlock.
+    accept_kdf(&storage, CoreKdf::Pbkdf2 { iterations: 10_000 }, &v.origin()).await.unwrap();
+    std::fs::create_dir_all(crate::fsutil::temp_path(&v.dir.join("tool-state/core/kdf-offered"))).unwrap();
+    v.backend.lock().await;
+    assert!(matches!(v.backend.unlock(PASSWORD).await, Err(BackendError::KdfWeakened { .. })));
+    assert!(crate::kdf_accept(&storage, async |_| Ok(true)).await.is_err());
+}
+
+#[tokio::test]
+async fn an_unreadable_kdf_pin_is_forgotten_once_confirmed() {
+    let v = github().await;
+    v.backend.lock().await;
+    std::fs::write(v.dir.join("tool-state/core/kdf-pin"), "{").unwrap();
+    let err = v.backend.unlock(PASSWORD).await.unwrap_err();
+    assert!(matches!(err, BackendError::KdfPinUnreadable), "{err}");
+    assert!(err.to_string().contains("`bwss kdf accept`"), "{err}");
+    let mut asked = String::new();
+    crate::kdf_accept(&v.storage(), async |q: &str| {
+        asked = q.to_owned();
+        Ok(true)
+    })
+    .await
+    .unwrap();
+    assert!(asked.contains("unreadable"), "{asked}");
+    assert_eq!(v.backend.unlock(PASSWORD).await.unwrap().items.len(), 1);
+}
+
+/// The `cose-v2` account of dybw-core's vectors (8c4b303), as a newer
+/// Vaultwarden serves it: a COSE user key, a signed security state and
+/// `masterPasswordUnlock`.
+fn cose_v2() -> (Value, String) {
+    let account: Value = serde_json::from_str(include_str!("../../tests/fixtures/accounts/cose-v2.json")).unwrap();
+    let mut profile = account["profile"].clone();
+    profile["id"] = json!("user1");
+    profile["key"] = account["profileKey"].clone();
+    let sync = json!({
+        "profile": profile, "userDecryption": account["userDecryption"], "folders": [], "ciphers": [],
+    });
+    (sync, account["password"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn a_cose_v2_account_unlocks() {
+    let (sync, password) = cose_v2();
+    let (fake, config, creds, paths, dir) = serve(sync);
+    let b = Bitwarden::new(&config, creds, &paths).unwrap();
+    assert!(b.unlock(&password).await.unwrap().items.is_empty());
+    assert_eq!(fake.count("POST", "/identity/accounts/prelogin"), 0, "source 1 needs no prelogin");
+    let core = dir.path().join("tool-state/core");
+    assert_eq!(std::fs::read_to_string(core.join("security-version")).unwrap(), "2");
+    assert!(core.join("user-key-id").exists());
+    // Until the core builds the keyring (B4) and writes (B5), nothing is written to it.
+    let err = b.put_item(&new_item("n1", "login")).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Rejected(m) if m.contains("COSE")), "{err}");
+    assert!(b.create_collection("Work").await.is_err());
+    assert!(b.delete_collection("work", &[]).await.is_err());
+    assert!(b.delete_item(&new_item("n1", "login")).await.is_err());
+    assert_eq!(fake.count("POST", "/api/"), 0);
+    assert!(b.describe().await.contains("COSE"));
+
+    // ADR 0019: a version below the one this device saw stops the unlock until accepted.
+    b.lock().await;
+    std::fs::write(core.join("security-version"), "3").unwrap();
+    let err = b.unlock(&password).await.unwrap_err();
+    assert!(matches!(err, BackendError::SecurityDowngrade { seen: 3, offered: 2 }), "{err}");
+    assert!(err.to_string().contains("`bwss security accept 2`"), "{err}");
+    let storage = FileStorage::new(&paths, "p");
+    assert!(crate::security_accept(&storage, 2, async |_| Ok(false)).await.is_err());
+    let mut asked = String::new();
+    crate::security_accept(&storage, 2, async |q: &str| {
+        asked = q.to_owned();
+        Ok(true)
+    })
+    .await
+    .unwrap();
+    assert!(asked.contains("version 2"), "{asked}");
+    b.unlock(&password).await.unwrap();
+
+    // Offline, from the cache, with the same checks.
+    b.lock().await;
+    fake.with(|s| s.down = true);
+    b.unlock(&password).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_new_user_key_resets_queue_and_acl_confirmations() {
+    let v = github().await;
+    let old = v.core_file("user-key-id").unwrap();
+    // A change queued offline, and an ACL line confirmed on this device.
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    assert_eq!(v.queue_file(), 1);
+    let confirmed = v.dir.join("tool-state/acl-confirmed");
+    std::fs::write(&confirmed, "{}").unwrap();
+    v.backend.lock().await;
+
+    // The user key is rotated in the web vault.
+    let rotated = SymmetricKey::generate();
+    v.fake.with(|s| s.sync["profile"]["key"] = json!(protect(&rotated)));
+    v.backend.unlock(PASSWORD).await.unwrap();
+    let new = v.core_file("user-key-id").unwrap();
+    assert_ne!(new, old);
+    assert!(v.dir.join(format!("state/queue.{old}.bak")).exists(), "set aside, never opened with the new key");
+    assert!(!v.dir.join("state/queue.json").exists());
+    assert!(!confirmed.exists(), "every ACL line is asked again");
+    assert_eq!(v.queued().await, 0);
+    let status = v.backend.describe().await;
+    assert!(status.contains(&format!("queue.{old}.bak")) && status.contains("asked again"), "{status}");
+
+    // Unchanged on the next unlock: nothing more is reset.
+    v.backend.lock().await;
+    std::fs::write(&confirmed, "{}").unwrap();
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(confirmed.exists());
+    assert!(!v.backend.describe().await.contains("asked again"));
+
+    // A planted id never names a path outside the state directory.
+    v.backend.lock().await;
+    std::fs::write(v.dir.join("tool-state/core/user-key-id"), "../../x/evil").unwrap();
+    std::fs::write(v.dir.join("state/queue.json"), "{}").unwrap();
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(v.dir.join("state/queue.xevil.bak").exists());
+}
+
+#[tokio::test]
+async fn a_key_change_that_cannot_reset_says_so() {
+    let v = github().await;
+    v.backend.lock().await;
+    let core = v.dir.join("tool-state/core");
+    std::fs::write(core.join("user-key-id"), "old").unwrap();
+    std::fs::create_dir_all(v.dir.join("state/queue.old.bak/full")).unwrap();
+    std::fs::write(v.dir.join("state/queue.json"), "{}").unwrap();
+    std::fs::create_dir_all(v.dir.join("tool-state/acl-confirmed/full")).unwrap();
+    std::fs::create_dir_all(crate::fsutil::temp_path(&core.join("user-key-id"))).unwrap();
+    v.backend.unlock(PASSWORD).await.unwrap();
+    let status = v.backend.describe().await;
+    assert!(status.contains("the write queue could not be set aside"), "{status}");
+    assert!(status.contains("the ACL confirmations could not be reset"), "{status}");
+    assert_eq!(
+        std::fs::read_to_string(core.join("user-key-id")).unwrap(),
+        "old",
+        "not recorded: asked again next time"
+    );
 }

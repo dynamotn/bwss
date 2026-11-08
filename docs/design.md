@@ -887,6 +887,8 @@ bwss login --client-id ID [--client-secret-stdin]
 bwss acl off | on
 bwss index derived on | off
 bwss config migrate
+bwss kdf accept
+bwss security accept VERSION
 ```
 
 `bwss unlock` calls `UnlockInteractive`: the daemon shows the pinentry and

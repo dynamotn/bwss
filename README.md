@@ -187,6 +187,8 @@ password.
 | `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
 | `bwss index derived on` / `off` | Put item names, usernames, URIs and ids in the locked index on this device, or take them out (the default). |
 | `bwss config migrate` | Move an old `~/.config/bwss/config.toml` into the shared dybw file. |
+| `bwss kdf accept` | After an unlock refused a KDF weaker than the one this device pinned: show it in the pinentry and, once you confirm it (check it in the web vault first), accept it on this device. |
+| `bwss security accept <version>` | After an unlock refused an older account security state: accept that version on this device, for a profile moved to another server or account. |
 
 ## ⚙️ Configuration
 

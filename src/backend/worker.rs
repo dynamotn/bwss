@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use super::bitwarden::Bitwarden;
-use super::{AclTrust, Backend, BackendError};
+use super::{AclTrust, BackendError};
 use crate::model::{CollectionData, ItemData, Snapshot};
 
 type Reply<T> = oneshot::Sender<Result<T, BackendError>>;

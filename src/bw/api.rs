@@ -238,6 +238,12 @@ impl Api {
         self.user_id.is_some()
     }
 
+    /// Bridge until writes move to the core (B5): the core's `/sync` of the
+    /// unlock names the owner of this client's writes.
+    pub fn synced(&mut self, sync: &Value) {
+        self.user_id = sync.pointer("/profile/id").and_then(Value::as_str).map(str::to_owned);
+    }
+
     pub fn logout(&mut self) {
         self.token = None;
         self.user_id = None;

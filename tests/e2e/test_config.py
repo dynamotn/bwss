@@ -4,6 +4,7 @@ None of these talk to a server: `bwss login` and the daemon's start are
 offline, so the account points at a port nobody listens on.
 """
 
+import json
 import os
 import pty
 import select
@@ -392,3 +393,28 @@ def test_the_log_level_defaults_to_info_and_follows_bwss_log():
         d.stop()
     log = (d.home / "daemon.log").read_text()
     assert "serving org.freedesktop.secrets" in log and "DEBUG" not in log, "an invalid filter means the default: " + log
+
+
+def test_the_answers_to_a_refused_unlock_ask_through_pinentry():
+    d = bitwarden_home()
+    core = d.state / "tools" / "bwss" / "core"
+    r = d.cli("kdf", "accept", check=False)
+    assert r.returncode != 0 and "no unlock waits for a KDF confirmation" in r.stderr, r.stderr
+    # What a refused unlock leaves for `bwss kdf accept`.
+    core.mkdir(parents=True, exist_ok=True)
+    offer = {"origin": "http://127.0.0.1:9", "kdf": {"type": "pbkdf2", "iterations": 100000}}
+    (core / "kdf-offered").write_text(json.dumps(offer))
+    d.pinentry(pins=[], confirm="deny")
+    r = d.cli("kdf", "accept", check=False)
+    assert r.returncode != 0 and "not confirmed" in r.stderr, r.stderr
+    assert not (core / "kdf-pin").exists()
+    d.pinentry(pins=[], confirm="once")
+    assert "accepted on this device" in d.cli("kdf", "accept").stdout
+    pin = json.loads((core / "kdf-pin").read_text())
+    assert (pin["kdf"], pin["iterations"], pin["origin"]) == (0, 100000, "http://127.0.0.1:9")
+    assert not (core / "kdf-offered").exists()
+    assert any("PBKDF2, 100000 iterations" in line for line in d.prompts())
+
+    assert "accepted on this device" in d.cli("security", "accept", "2").stdout
+    assert (core / "security-version").read_text() == "2"
+    assert any("security state version 2" in line for line in d.prompts())

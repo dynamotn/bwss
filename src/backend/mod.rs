@@ -11,8 +11,21 @@ mod worker;
 
 use async_trait::async_trait;
 
+use dybw_core::crypto::KdfParams;
+use dybw_core::profile::KdfSource;
+
 use crate::bw::crypto::SymmetricKey;
 use crate::model::{CollectionData, ItemData, Snapshot};
+
+/// KDF parameters as the user reads them in the web vault.
+pub fn kdf_text(kdf: &KdfParams) -> String {
+    match *kdf {
+        KdfParams::Pbkdf2 { iterations } => format!("PBKDF2, {iterations} iterations"),
+        KdfParams::Argon2id { iterations, memory_mib, parallelism } => {
+            format!("Argon2id, {iterations} iterations, {memory_mib} MiB, parallelism {parallelism}")
+        }
+    }
+}
 
 /// Where the ACL lines of a backend's items can have come from.
 pub enum AclTrust {
@@ -36,6 +49,27 @@ pub enum BackendError {
     Conflict(String),
     #[error("the keyring is locked")]
     Locked,
+    /// The KDF offered is weaker than the one pinned on this device (ADR 0017).
+    #[error(
+        "the {kdf_source} ({}) is weaker than the one pinned on this device ({}): check it in the web vault, \
+         then run `bwss kdf accept`",
+        kdf_text(.offered),
+        kdf_text(.pinned)
+    )]
+    KdfWeakened { pinned: KdfParams, offered: KdfParams, kdf_source: KdfSource },
+    /// The signed security state is older than the one this device saw (ADR 0019).
+    #[error(
+        "the account's security state is older than the one this device saw (seen version {seen}, offered \
+         {offered}): if this profile moved to another server or account, run `bwss security accept {offered}`"
+    )]
+    SecurityDowngrade { seen: u64, offered: u64 },
+    /// The security state is missing or invalid, or the version saved on this device is unreadable.
+    #[error("{0}")]
+    SecurityState(String),
+    #[error(
+        "the KDF pin saved on this device is unreadable: check the KDF in the web vault, then run `bwss kdf accept`"
+    )]
+    KdfPinUnreadable,
 }
 
 #[async_trait]

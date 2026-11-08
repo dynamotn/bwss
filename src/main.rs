@@ -3,9 +3,9 @@
 mod acl;
 mod acl_confirm;
 mod backend;
+#[cfg_attr(not(test), expect(dead_code, reason = "the unlock moved to dybw-core; B4-B9 replace the rest"))]
 mod bw;
 mod config;
-#[expect(dead_code, reason = "the host ports are wired in B2-B3")]
 mod core_ports;
 mod daemon;
 mod dbus;
@@ -33,13 +33,18 @@ use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, bitwarden::BitwardenBackend, memory::MemoryBackend};
+use dybw_core::ports::Storage;
+use dybw_core::profile;
+
+use crate::backend::bitwarden::{KDF_OFFERED, kdf_offer};
+use crate::backend::{Backend, bitwarden::BitwardenBackend, kdf_text, memory::MemoryBackend};
 use crate::bw::api::identity_origin;
 use crate::config::{BackendKind, Credentials, Paths, Trust};
+use crate::core_ports::storage::FileStorage;
 use crate::daemon::Daemon;
 use crate::dbus::{CONTROL_NAME, CONTROL_PATH};
 use crate::keyring::Keyring;
-use crate::prompter::Prompter;
+use crate::prompter::{Confirm, Prompter};
 
 const SECRETS_NAME: &str = "org.freedesktop.secrets";
 const CONTROL_IFACE: &str = "io.github.dynamotn.bwss.Control1";
@@ -98,6 +103,30 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Answer an unlock refused over the KDF (ADR 0017).
+    Kdf {
+        #[command(subcommand)]
+        command: KdfCommand,
+    },
+    /// Answer an unlock refused over the account's security state (ADR 0019).
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KdfCommand {
+    /// Accept on this device the KDF the last unlock refused, after checking
+    /// it in the web vault.
+    Accept,
+}
+
+#[derive(Subcommand)]
+enum SecurityCommand {
+    /// Accept on this device a security state version lower than the one it
+    /// saw: for a profile moved to another server or account.
+    Accept { version: u64 },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -147,6 +176,72 @@ fn confirm(question: &str, tty: bool, input: &mut dyn BufRead, out: &mut dyn Wri
     let mut line = String::new();
     input.read_line(&mut line)?;
     Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// `bwss kdf accept`: confirms on this device the KDF the last unlock
+/// refused, or forgets a pin that cannot be read (ADR 0017).
+async fn kdf_accept(storage: &impl Storage, ask: impl AsyncFnOnce(&str) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+    let offer = kdf_offer(storage).await?.context("no unlock waits for a KDF confirmation on this device")?;
+    match offer.kdf() {
+        Some(kdf) => {
+            let question = format!(
+                "The server offers a weaker KDF than the one this device pinned: {}.\n\n\
+                 Accept it only if you lowered it yourself in the web vault.",
+                kdf_text(&kdf)
+            );
+            if !ask(&question).await? {
+                bail!("not confirmed; the pinned KDF stays");
+            }
+            profile::accept_kdf(storage, kdf, &offer.origin).await?;
+        }
+        None => {
+            let question = "The KDF pin saved on this device is unreadable.\n\n\
+                Forget it? The next unlock pins the KDF the server offers.";
+            if !ask(question).await? {
+                bail!("not confirmed; the pin stays");
+            }
+            storage.remove("kdf-pin").await?;
+        }
+    }
+    Ok(storage.remove(KDF_OFFERED).await?)
+}
+
+/// `bwss security accept`: lets the security state version go down to
+/// `version` on this device (ADR 0019).
+async fn security_accept(
+    storage: &impl Storage,
+    version: u64,
+    ask: impl AsyncFnOnce(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    let question = format!(
+        "Accept the account's security state version {version} on this device?\n\n\
+         Do this only when the profile moved to another server or account: otherwise the server may be \
+         serving old account keys."
+    );
+    if !ask(&question).await? {
+        bail!("not confirmed; the version this device saw stays");
+    }
+    Ok(profile::accept_security_version(storage, version).await?)
+}
+
+/// The pinentry the daemon and the answering commands ask through, checked
+/// right before every start (ADR 0008).
+fn guarded_prompter(program: &str, trust: Trust) -> Prompter {
+    let guard = Arc::new(trust);
+    Prompter::guarded(program, Duration::from_secs(120), Arc::new(move |p: &str| verify_pinentry(&guard, p)))
+}
+
+/// The device state and the pinentry of the profile bwss serves.
+fn answering() -> anyhow::Result<(FileStorage, Prompter)> {
+    let paths = Paths::from_env();
+    let trust = Trust::system()?;
+    let config = config::load(&paths, &trust)?;
+    let profile = config.profile.as_deref().context("bwss serves no profile")?;
+    Ok((FileStorage::new(&paths, profile), guarded_prompter(&config.pinentry, trust)))
+}
+
+async fn pinentry_yes(prompter: &Prompter, question: &str) -> anyhow::Result<bool> {
+    Ok(matches!(prompter.confirm(question, false).await?, Confirm::Once | Confirm::Always))
 }
 
 fn confirm_on_terminal(question: &str) -> anyhow::Result<bool> {
@@ -320,15 +415,9 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             (Arc::new(b), Some(paths.locked_index()))
         }
     };
-    // The pinentry is checked again right before every start (ADR 0008).
-    let guard = Arc::new(trust);
-    let prompter = Prompter::guarded(
-        config.pinentry.clone(),
-        Duration::from_secs(120),
-        Arc::new(move |program: &str| verify_pinentry(&guard, program)),
-    );
+    let prompter = guarded_prompter(&config.pinentry, trust);
     let daemon = Daemon::new(Keyring::new(index, Some(paths.index_derived())), backend, prompter, config.clone());
-    daemon.set_acl_state_path(paths.tool_state.join("acl-confirmed"));
+    daemon.set_acl_state_path(paths.acl_confirmed());
 
     let conn = zbus::connection::Builder::session().build().await?;
     daemon.set_connection(conn.clone());
@@ -452,6 +541,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Kdf { command: KdfCommand::Accept } => {
+            let (storage, prompter) = answering()?;
+            kdf_accept(&storage, async |q: &str| pinentry_yes(&prompter, q).await).await?;
+            println!("accepted on this device; unlock again");
+            Ok(())
+        }
+        Command::Security { command: SecurityCommand::Accept { version } } => {
+            let (storage, prompter) = answering()?;
+            security_accept(&storage, version, async |q: &str| pinentry_yes(&prompter, q).await).await?;
+            println!("accepted on this device; unlock again");
+            Ok(())
+        }
         Command::Config { command: ConfigCommand::Migrate } => {
             let paths = Paths::from_env();
             let mut ask = || {
@@ -499,6 +600,28 @@ mod tests {
         let (refused, said) = ask(false, "yes\n");
         assert!(refused.is_err_and(|e| e.contains("terminal")));
         assert!(said.is_empty(), "nothing is asked without a terminal");
+    }
+
+    #[tokio::test]
+    async fn the_answers_to_an_unlock_need_a_question_and_a_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().as_os_str().to_owned();
+        let storage = FileStorage::new(&Paths::with(|v| (v == "HOME").then(|| home.clone())), "p");
+        let err = kdf_accept(&storage, async |_| Ok(true)).await.unwrap_err().to_string();
+        assert_eq!(err, "no unlock waits for a KDF confirmation on this device");
+        storage.save(KDF_OFFERED, br#"{"origin":"o","kdf":null}"#).await.unwrap();
+        storage.save("kdf-pin", b"{").await.unwrap();
+        assert!(kdf_accept(&storage, async |_| Ok(false)).await.is_err());
+        assert!(storage.load("kdf-pin").await.unwrap().is_some(), "a no keeps the pin");
+        let failed = kdf_accept(&storage, async |_| anyhow::bail!("pinentry is gone")).await.unwrap_err();
+        assert_eq!(failed.to_string(), "pinentry is gone");
+        kdf_accept(&storage, async |_| Ok(true)).await.unwrap();
+        assert!(storage.load("kdf-pin").await.unwrap().is_none());
+        assert!(storage.load(KDF_OFFERED).await.unwrap().is_none());
+
+        let err = security_accept(&storage, 1, async |_| Ok(false)).await.unwrap_err().to_string();
+        assert_eq!(err, "not confirmed; the version this device saw stays");
+        assert!(storage.load("security-version").await.unwrap().is_none());
     }
 
     #[test]

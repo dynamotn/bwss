@@ -195,6 +195,11 @@ impl Paths {
         self.tool_state.join("acl-off")
     }
 
+    /// This device's confirmed ACL lines (`acl_confirm.rs`).
+    pub fn acl_confirmed(&self) -> PathBuf {
+        self.tool_state.join("acl-confirmed")
+    }
+
     /// The locked index (design §7).
     pub fn locked_index(&self) -> PathBuf {
         self.cache.join("locked-index.json")
