@@ -698,12 +698,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// bwss's log subscriber. tungstenite traces the raw WebSocket handshake,
+/// whose request line carries the notifications hub's access token, so its
+/// crates log at info and above only, whatever `filter` asks for.
+fn log_subscriber<W>(filter: tracing_subscriber::EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt};
+    let quiet = filter_fn(|m| *m.level() <= tracing::Level::INFO || !m.target().contains("tungstenite"));
+    let layer = tracing_subscriber::fmt::layer().with_writer(writer).with_filter(filter).with_filter(quiet);
+    tracing_subscriber::registry().with(layer)
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BWSS_LOG").unwrap_or_else(|_| "info".into()))
-        .with_writer(std::io::stderr)
-        .init();
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_env("BWSS_LOG").unwrap_or_else(|_| "info".into());
+    log_subscriber(filter, std::io::stderr).init();
     match run(Cli::parse()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -918,10 +930,11 @@ mod tests {
         use crate::core_ports::events::{WsEvents, test_hub};
         use dybw_core::api::{Hub, HubOptions, hub_url, run_hub};
         let (d, pulls, _guard) = counted_pulls().await;
-        let (base, _seen) = test_hub::serve(5).await;
+        // Five notifications 50 ms apart: with these options the core reports
+        // each one, and only the 300 ms window folds them into one pull.
+        let (base, _seen) = test_hub::serve(5, Duration::from_millis(50)).await;
         let (changes, follow) = watch::channel(());
         let live = spawn_live(d, follow, Duration::from_millis(300));
-        // The core may report the burst more than once this fast; the window folds it.
         let mut hub = Hub::new(HubOptions { settle_ms: 1, min_interval_ms: 1, ..HubOptions::default() }, "me".into());
         let url = async || Some(hub_url(&base, "token"));
         let notify = || changes.send_replace(());
@@ -936,28 +949,72 @@ mod tests {
         live.await.unwrap();
     }
 
+    /// A hub that refuses every connection, counting the attempts.
+    struct DeadHub(std::cell::Cell<usize>);
+
+    impl dybw_core::ports::Events for DeadHub {
+        type Socket = crate::core_ports::events::WsSocket;
+        async fn connect(&self, _url: &str) -> Result<Self::Socket, dybw_core::ports::PortError> {
+            self.0.set(self.0.get() + 1);
+            Err(dybw_core::ports::PortError("refused".into()))
+        }
+    }
+
+    /// A clock on tokio's (paused) time, so the hub's deadlines and sleeps agree.
+    struct PausedClock(tokio::time::Instant);
+
+    impl dybw_core::ports::Clock for PausedClock {
+        fn now_ms(&self) -> i64 {
+            i64::try_from(self.0.elapsed().as_millis()).unwrap()
+        }
+        async fn sleep_ms(&self, ms: u64) {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_dead_hub_falls_back_to_the_timer() {
-        use crate::core_ports::events::WsEvents;
-        use dybw_core::api::{Hub, HubOptions, hub_url, run_hub};
+        use dybw_core::api::{Hub, HubOptions, run_hub};
         let (d, pulls, _guard) = counted_pulls().await;
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
         let (changes, follow) = watch::channel(());
         let live = spawn_live(d.clone(), follow, Duration::from_secs(2));
         let timer = spawn_sync(d, Duration::from_secs(300));
+        let dead = DeadHub(std::cell::Cell::new(0));
         let mut hub = Hub::new(HubOptions::default(), "me".into());
-        let url = async || Some(hub_url(&dead, "token"));
+        let url = async || Some("ws://hub.invalid/hub".to_owned());
         let notify = || changes.send_replace(());
-        let hub = run_hub(&WsEvents, &crate::core_ports::clock::SystemClock, url, &mut hub, notify, || false);
+        let clock = PausedClock(tokio::time::Instant::now());
+        let hub = run_hub(&dead, &clock, url, &mut hub, notify, || false);
         tokio::select! {
             () = hub => unreachable!("the hub keeps trying"),
             () = tokio::time::sleep(Duration::from_secs(301)) => {}
         }
-        assert_eq!(pulls(), 1, "the timer pulled once; the dead hub reported nothing");
+        // Backing off 2, 5, 15 and 60 s: tries at 0, 2, 7, 22 and 82 s, the next at 382 s.
+        assert_eq!(dead.0.get(), 5, "a dead hub is retried with back-off, not hammered");
+        assert_eq!(pulls(), 1, "the timer pulled at 300 s; the dead hub reported nothing");
         live.abort();
         timer.abort();
+    }
+
+    #[tokio::test]
+    async fn the_hub_token_never_reaches_the_log() {
+        use crate::core_ports::events::{WsEvents, test_hub};
+        use dybw_core::ports::{EventSocket, Events};
+        use tracing_subscriber::util::SubscriberInitExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let file = std::sync::Mutex::new(std::fs::File::create(&path).unwrap());
+        // The most a user can ask for, tungstenite's handshake by name included.
+        let filter = tracing_subscriber::EnvFilter::new("trace,tungstenite::handshake::client=trace");
+        // Global, so tungstenite's `log` records come through tracing-log as in the daemon.
+        log_subscriber(filter, file).try_init().unwrap();
+        let (base, _seen) = test_hub::serve(0, Duration::ZERO).await;
+        let url = dybw_core::api::hub_url(&base, "SENTINEL-TOKEN-b8");
+        WsEvents.connect(&url).await.unwrap().close().await;
+        tracing::trace!("after the handshake");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("after the handshake"), "trace is on: {logged}");
+        assert!(!logged.contains("SENTINEL-TOKEN-b8"), "{logged}");
     }
 
     #[tokio::test(start_paused = true)]

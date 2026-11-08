@@ -108,11 +108,7 @@ impl Worker {
 async fn serve(vault: Rc<Bitwarden>, command: Command) {
     match command {
         Command::Unlock(password, reply) => {
-            let unlocked = vault.unlock(&password).await;
-            if unlocked.is_ok() {
-                vault.start_hub();
-            }
-            let _ = reply.send(unlocked);
+            let _ = reply.send(vault.unlock_and_follow(&password).await);
         }
         Command::Lock(reply) => {
             vault.lock().await;

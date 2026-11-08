@@ -3179,7 +3179,7 @@ async fn the_hub_stops_on_lock() {
     use crate::core_ports::events::test_hub::{Seen, serve as serve_hub};
     let user = SymmetricKey::generate();
     let (_fake, config, creds, paths, _dir) = server(vec![], &user);
-    let (hub, mut seen) = serve_hub(1).await;
+    let (hub, mut seen) = serve_hub(1, std::time::Duration::ZERO).await;
     let mut b = Bitwarden::new(&config, creds, &paths).unwrap();
     b.urls.notifications = hub;
     let vault = std::rc::Rc::new(b);
@@ -3187,12 +3187,11 @@ async fn the_hub_stops_on_lock() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            vault.unlock(PASSWORD).await.unwrap();
-            vault.start_hub();
+            vault.unlock_and_follow(PASSWORD).await.unwrap();
             let Some(Seen::Open(uri)) = seen.recv().await else { panic!("the hub never connected") };
             assert!(uri.starts_with("/hub?access_token=") && uri.len() > "/hub?access_token=".len(), "{uri}");
             // Started again (a second unlock): the first connection goes, one stays.
-            vault.start_hub();
+            vault.start_hub(vault.lock_generation.load(std::sync::atomic::Ordering::SeqCst));
             let two = [seen.recv().await.unwrap(), seen.recv().await.unwrap()];
             assert!(two.contains(&Seen::Closed) && two.iter().any(|s| matches!(s, Seen::Open(_))), "{two:?}");
             // The change the hub announced reaches the daemon's side.
@@ -3202,6 +3201,69 @@ async fn the_hub_stops_on_lock() {
             assert_eq!(seen.recv().await, Some(Seen::Closed));
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             assert!(seen.try_recv().is_err(), "no reconnect after the lock");
+            // A hub for an unlock that a lock overtook is refused.
+            vault.start_hub(0);
+            assert!(vault.hub.lock().unwrap().is_none());
+        })
+        .await;
+}
+
+/// Holds `vault.state` from when it gets it until the sender is used or dropped.
+fn hold_state(vault: &std::rc::Rc<Bitwarden>) -> tokio::sync::oneshot::Sender<()> {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let v = vault.clone();
+    tokio::task::spawn_local(async move {
+        let _guard = v.state.lock().await;
+        let _ = released.await;
+    });
+    release
+}
+
+async fn settle() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// An unlock whose last step waits on the state while a lock begins: the
+/// unlock succeeds, then the lock clears the keys. Its hub must not start,
+/// nor outlive the lock.
+#[tokio::test]
+async fn a_lock_during_an_unlock_leaves_no_hub() {
+    use crate::core_ports::events::test_hub::serve as serve_hub;
+    let user = SymmetricKey::generate();
+    let (_fake, config, creds, paths, _dir) = server(vec![], &user);
+    let (hub, mut seen) = serve_hub(0, std::time::Duration::ZERO).await;
+    let mut b = Bitwarden::new(&config, creds, &paths).unwrap();
+    b.urls.notifications = hub;
+    let vault = std::rc::Rc::new(b);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // The unlock stops while installing its keys (it holds the state, waits on the client).
+            let client = vault.client.lock().await;
+            let v = vault.clone();
+            let unlocking = tokio::task::spawn_local(async move { v.unlock_and_follow(PASSWORD).await });
+            while vault.state.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            // Holders of the state in turn, so the unlock's last step queues before the lock.
+            let first = hold_state(&vault);
+            settle().await;
+            drop(client); // the unlock installs, then waits on `first` (its queue check)
+            settle().await;
+            let second = hold_state(&vault);
+            settle().await;
+            let _ = first.send(()); // the queue check passes; the last step waits on `second`
+            settle().await;
+            let v = vault.clone();
+            let locking = tokio::task::spawn_local(async move { v.lock().await });
+            settle().await; // the lock found no hub, and waits behind the unlock
+            let _ = second.send(());
+            assert!(unlocking.await.unwrap().is_ok(), "the unlock won the state");
+            locking.await.unwrap();
+            assert!(vault.hub.lock().unwrap().is_none(), "no hub after the lock");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(seen.try_recv().is_err(), "no connection after the lock");
         })
         .await;
 }
@@ -3214,8 +3276,7 @@ async fn notifications_off_starts_no_hub() {
     let vault = std::rc::Rc::new(Bitwarden::new(&config, creds, &paths).unwrap());
     tokio::task::LocalSet::new()
         .run_until(async {
-            vault.unlock(PASSWORD).await.unwrap();
-            vault.start_hub();
+            vault.unlock_and_follow(PASSWORD).await.unwrap();
             assert!(vault.hub.lock().unwrap().is_none());
         })
         .await;

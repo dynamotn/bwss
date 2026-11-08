@@ -685,18 +685,29 @@ def test_a_change_in_the_vault_arrives_without_waiting_for_the_timer(account):
     d.start()
     try:
         unlock(d, account)
-        time.sleep(1)  # the hub connects right after the unlock; a change before that waits for the timer
-        c = account.add_login(FOLDER, "Live", "first", {"bwss:id": "live", "bwss:attr:service": "live"})
-        arrived = lambda want: d.tool("lookup", "service", "live", check=False).stdout == want  # noqa: E731
-        deadline = time.monotonic() + 10
-        while not arrived("first"):
-            assert time.monotonic() < deadline, "a new item did not arrive within 10 s"
-            time.sleep(0.25)
-        # A remote edit arrives the same way, now that the hub is up.
-        account.set_password(c["id"], "second")
-        deadline = time.monotonic() + 10
-        while not arrived("second"):
-            assert time.monotonic() < deadline, "a remote edit did not arrive within 10 s"
-            time.sleep(0.25)
+        made = []
+
+        def arrives(want, write):
+            # The hub connects right after the unlock; a write before that waits for the timer, so write
+            # again every 3 s. Within 10 s, only a notification can bring it.
+            deadline = time.monotonic() + 10
+            write()
+            written = time.monotonic()
+            while d.tool("lookup", "service", "live", check=False).stdout != want:
+                assert time.monotonic() < deadline, f"{want!r} did not arrive within 10 s"
+                if time.monotonic() - written >= 3:
+                    write()
+                    written = time.monotonic()
+                time.sleep(0.25)
+
+        def create():
+            if made:
+                account.set_password(made[0]["id"], "first")
+            else:
+                made.append(account.add_login(FOLDER, "Live", "first", {"bwss:id": "live", "bwss:attr:service": "live"}))
+
+        arrives("first", create)
+        # A remote edit arrives the same way.
+        arrives("second", lambda: account.set_password(made[0]["id"], "second"))
     finally:
         d.stop()

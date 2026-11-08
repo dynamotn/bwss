@@ -1,10 +1,11 @@
 use dybw_core::ports::{EventSocket, Events, Frame, PortError};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 /// The hub sends small notifications; the core refuses anything over 1 MiB too.
 const MAX_MESSAGE: usize = 1 << 20;
@@ -21,12 +22,29 @@ fn failed(e: impl std::fmt::Display) -> PortError {
     PortError(format!("notifications: {e}"))
 }
 
+/// rustls with aws-lc-rs, named here rather than taken from whichever
+/// provider the build happens to enable, and the system's roots (as reqwest).
+fn tls() -> Result<Arc<rustls::ClientConfig>, PortError> {
+    let mut roots = rustls::RootCertStore::empty();
+    // An empty store fails every handshake with an unknown issuer.
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(failed)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
 impl Events for WsEvents {
     type Socket = WsSocket;
 
     async fn connect(&self, url: &str) -> Result<WsSocket, PortError> {
         let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-        let connecting = tokio_tungstenite::connect_async_tls_with_config(url, Some(config), true, None);
+        // A `ws:` URL (loopback only) stays plain whatever the connector.
+        let connector = Connector::Rustls(tls()?);
+        let connecting = tokio_tungstenite::connect_async_tls_with_config(url, Some(config), true, Some(connector));
         match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
             Ok(Ok((socket, _))) => Ok(WsSocket(socket)),
             Ok(Err(e)) => Err(failed(e)),
@@ -98,9 +116,10 @@ pub(crate) mod test_hub {
     }
 
     /// Serves every connection: answers the handshake, sends `burst` change
-    /// notifications from another device, then holds the connection until
-    /// the client goes. Returns the hub's base URL (as `ServerUrls.notifications`).
-    pub(crate) async fn serve(burst: usize) -> (String, mpsc::UnboundedReceiver<Seen>) {
+    /// notifications from another device, `gap` apart, then holds the
+    /// connection until the client goes. Returns the hub's base URL (as
+    /// `ServerUrls.notifications`).
+    pub(crate) async fn serve(burst: usize, gap: Duration) -> (String, mpsc::UnboundedReceiver<Seen>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (seen, events) = mpsc::unbounded_channel();
@@ -121,6 +140,7 @@ pub(crate) mod test_hub {
                         ws.next().await?.ok()?;
                         ws.send(Message::text("{}\u{1e}")).await.ok()?;
                         for _ in 0..burst {
+                            tokio::time::sleep(gap).await;
                             ws.send(Message::binary(change_from("another-device"))).await.ok()?;
                         }
                         while let Some(Ok(_)) = ws.next().await {}
@@ -190,6 +210,21 @@ mod tests {
         let err = WsEvents.connect(&url).await.err().unwrap();
         assert!(err.0.contains("302"), "{err}");
         assert!(!err.0.contains("SECRET-TOKEN"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_wss_url_goes_through_rustls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}/hub", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"not tls\r\n\r\n").await;
+        });
+        let err = WsEvents.connect(&url).await.err().unwrap();
+        assert!(err.0.starts_with("notifications: "), "{err}");
+        let tls = tls().unwrap();
+        let ours = rustls::crypto::aws_lc_rs::default_provider();
+        assert_eq!(tls.crypto_provider().cipher_suites, ours.cipher_suites, "aws-lc-rs, pinned");
     }
 
     #[tokio::test(start_paused = true)]

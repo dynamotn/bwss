@@ -752,7 +752,8 @@ one connection to the server's hub (SignalR over a WebSocket, dybw-core's
 `api::hub`, which skips this device's own changes and paces reconnects); a
 lock closes it. A notification only triggers this refresh, it is never read
 for content, so the timer stays the fallback when the hub is down. The hub
-URL carries the access token and is never logged.
+URL carries the access token and is never logged; tungstenite, which traces
+the raw handshake, logs at info and above only, whatever `BWSS_LOG` says.
 
 1. Flush the queue (§8.3). A transient failure stops the flush; the rest
    stays queued. When the flush sent anything, the vault is read again.

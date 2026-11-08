@@ -947,7 +947,7 @@ pub(crate) struct Bitwarden {
     pub(super) queue: Mutex<Queue>,
     /// Bumped by every `lock`: an unlock that started before one never
     /// installs its keys.
-    lock_generation: AtomicU64,
+    pub(super) lock_generation: AtomicU64,
     /// Where dybw-core's client goes, and as which device.
     pub(super) urls: ServerUrls,
     device: DeviceInfo,
@@ -1078,8 +1078,10 @@ impl Bitwarden {
     /// Follows the server's notifications hub until the next lock (owner's
     /// decision 3), on the worker's `LocalSet`. The core's [`Hub`] decides
     /// the reconnect timing; the periodic refresh runs either way.
-    pub(super) fn start_hub(self: &std::rc::Rc<Self>) {
-        if !self.notifications {
+    /// Refused when a lock came after `generation`, the one the unlock
+    /// started with: the hub never outlives the keys.
+    pub(super) fn start_hub(self: &std::rc::Rc<Self>, generation: u64) {
+        if !self.notifications || self.lock_generation.load(Ordering::SeqCst) != generation {
             return;
         }
         let vault = self.clone();
@@ -1087,6 +1089,22 @@ impl Bitwarden {
         if let Some(old) = self.hub.lock().ok().and_then(|mut h| h.replace(task.abort_handle())) {
             old.abort();
         }
+    }
+
+    fn stop_hub(&self) {
+        if let Some(hub) = self.hub.lock().ok().and_then(|mut h| h.take()) {
+            hub.abort();
+        }
+    }
+
+    /// `unlock`, then the hub of that unlock (the worker's `Unlock`).
+    pub(super) async fn unlock_and_follow(self: &std::rc::Rc<Self>, password: &str) -> Result<Snapshot, BackendError> {
+        let generation = self.lock_generation.load(Ordering::SeqCst);
+        let unlocked = self.unlock(password).await;
+        if unlocked.is_ok() {
+            self.start_hub(generation);
+        }
+        unlocked
     }
 
     async fn follow_hub(&self) {
@@ -1546,9 +1564,7 @@ impl Bitwarden {
 
     pub(crate) async fn lock(&self) {
         self.lock_generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(hub) = self.hub.lock().ok().and_then(|mut h| h.take()) {
-            hub.abort();
-        }
+        self.stop_hub();
         *self.state.lock().await = None;
         // A flush in progress clears the queue itself when it finds the
         // keyring locked; never wait for its network calls here.
@@ -1557,6 +1573,8 @@ impl Bitwarden {
         }
         // Waits for a request in flight, then logs out.
         *self.client.lock().await = None;
+        // Again: an unlock that finished while this lock waited may have started one.
+        self.stop_hub();
         // Accepted for this session only.
         let _ = self.drop_accepted_rollbacks().await;
     }
