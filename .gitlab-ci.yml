@@ -25,10 +25,10 @@ variables:
   # job token authenticates (.core-token).
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
-# Lets git reach gitlab.com as this job. CI_JOB_TOKEN is masked; the project
+# Lets git reach dybw-core, and only it, as this job. CI_JOB_TOKEN is masked; the project
 # must be on dybw-core's job token allowlist.
 .core-token: &core-token
-  - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/".insteadOf "https://gitlab.com/"
+  - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/dynamo-tools/dybw-core".insteadOf "https://gitlab.com/dynamo-tools/dybw-core"
 
 default:
   image: rust:1-trixie

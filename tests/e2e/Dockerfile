@@ -32,10 +32,12 @@ RUN --mount=type=secret,id=dybw_core_token --mount=type=secret,id=dybw_core_toke
     if [ -s /run/secrets/dybw_core_token ]; then \
       user="$(cat /run/secrets/dybw_core_token_user 2>/dev/null)"; \
       GIT_CONFIG_COUNT=1 \
-      GIT_CONFIG_KEY_0="url.https://${user:-oauth2}:$(cat /run/secrets/dybw_core_token)@gitlab.com/.insteadOf" \
-      GIT_CONFIG_VALUE_0=https://gitlab.com/ \
+      GIT_CONFIG_KEY_0="url.https://${user:-oauth2}:$(cat /run/secrets/dybw_core_token)@gitlab.com/dynamo-tools/dybw-core.insteadOf" \
+      GIT_CONFIG_VALUE_0=https://gitlab.com/dynamo-tools/dybw-core \
       CARGO_NET_GIT_FETCH_WITH_CLI=true \
       cargo fetch --locked --manifest-path /fetch/Cargo.toml; \
+    else \
+      echo "no dybw_core_token secret: dybw-core is not prefetched" >&2; \
     fi
 
 ENV CARGO_TARGET_DIR=/target BWSS_BIN=/target/release/bwss PYTHONDONTWRITEBYTECODE=1
