@@ -16,6 +16,9 @@ jobs:
     uses: ./.github/workflows/static-binary.yml
     with:
       arch: ${{ matrix.arch }}
+    secrets:
+      DYBW_CORE_TOKEN: ${{ secrets.DYBW_CORE_TOKEN }}
+      DYBW_CORE_TOKEN_USER: ${{ secrets.DYBW_CORE_TOKEN_USER }}
 
   release:
     name: GitHub release

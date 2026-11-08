@@ -1,0 +1,27 @@
+# dybw-core is a private GitLab repository: lets cargo fetch it with git,
+# authenticated by a token. The token stays in the job's git config and in
+# this step's environment only; it is a masked secret and is never printed.
+# Without a token (a fork's pull request) nothing is set, and the fetch fails.
+name: dybw-core token
+description: Lets cargo fetch the private dybw-core repository with a token.
+inputs:
+  token:
+    description: A GitLab token that can read dybw-core (secret DYBW_CORE_TOKEN).
+    required: false
+    default: ""
+  user:
+    description: The token's user name (secret DYBW_CORE_TOKEN_USER); oauth2 when empty.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: sh
+      env:
+        TOKEN: ${{ inputs.token }}
+        TOKEN_USER: ${{ inputs.user }}
+      run: |
+        echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+        if [ -n "$TOKEN" ]; then
+          git config --global url."https://${TOKEN_USER:-oauth2}:${TOKEN}@gitlab.com/".insteadOf "https://gitlab.com/"
+        fi

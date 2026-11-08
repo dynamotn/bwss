@@ -9,6 +9,13 @@ on:
         description: x86_64 or aarch64
         required: true
         type: string
+    secrets:
+      DYBW_CORE_TOKEN:
+        description: A GitLab token that can read the private dybw-core.
+        required: false
+      DYBW_CORE_TOKEN_USER:
+        description: That token's user name; oauth2 when unset.
+        required: false
 
 permissions:
   contents: read
@@ -23,7 +30,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - run: apk add --no-cache musl-dev file
+      - run: apk add --no-cache musl-dev file git
+      - uses: ./.github/actions/dybw-core-token
+        with:
+          token: ${{ secrets.DYBW_CORE_TOKEN }}
+          user: ${{ secrets.DYBW_CORE_TOKEN_USER }}
       - run: cargo build --locked --release
       - name: Package
         env:
