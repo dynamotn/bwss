@@ -5,12 +5,15 @@
 
 use std::time::Instant;
 
+use dybw_core::crypto::{KdfParams, MarkScheme, Marker, NativeArgon2, SymmetricKey, derive_master_key};
+use dybw_core::vault::write::new_item;
+use dybw_core::vault::{Keys, Namespace, Organizations, Scan, UnmarkedCache, scan};
+use futures_util::FutureExt as _;
 use zeroize::Zeroizing;
 
 use crate::backend::bitwarden::build;
-use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
-use crate::bw::scan::{Keys, Scan, scan};
-use crate::bw::write::new_note;
+use crate::backend::ops::new_item_of;
+use crate::core_ports::random::OsRandom;
 use crate::keyring::Keyring;
 use crate::model::{Attributes, ItemData, Snapshot};
 use crate::session::{DH_AES, Session};
@@ -44,17 +47,19 @@ fn item(i: usize) -> ItemData {
 #[test]
 #[ignore = "performance; run explicitly"]
 fn perf_budgets() {
-    time("pbkdf2-600k", 3_000, || derive_master_key("pw", "a@b.c", KdfParams::Pbkdf2 { iterations: 600_000 }).unwrap());
-    time("argon2id-64m-t3-p4", 5_000, || {
-        derive_master_key("pw", "a@b.c", KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 }).unwrap()
-    });
+    // The core's KDFs run inline here: each future is ready at once.
+    let derive = |kdf| derive_master_key("pw", "a@b.c", kdf, &NativeArgon2).now_or_never().unwrap().unwrap();
+    time("pbkdf2-600k", 3_000, || derive(KdfParams::Pbkdf2 { iterations: 600_000 }));
+    time("argon2id-64m-t3-p4", 5_000, || derive(KdfParams::Argon2id { iterations: 3, memory_mib: 64, parallelism: 4 }));
 
-    let key = SymmetricKey::generate();
-    let keys = Keys { mark: key.derive("value-mark"), user: key };
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
+    let keys =
+        Keys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: Default::default(), security_version: 0 };
+    let ns = &Namespace::BWSS;
     let ciphers: Vec<_> = time("new-note-10000-items", 5_000, || {
         (0..10_000)
             .map(|i| {
-                let mut body = new_note(&item(i), Some("f"), &keys).unwrap();
+                let mut body = new_item(&new_item_of(&item(i), Some("f")), ns, &keys, &OsRandom).unwrap();
                 body.insert("id".into(), format!("c{i}").into());
                 body.insert("revisionDate".into(), "2026-10-23T00:00:00Z".into());
                 serde_json::Value::Object(body)
@@ -62,18 +67,15 @@ fn perf_budgets() {
             .collect()
     });
     let marked = time("scan-10000-items", 5_000, || {
-        ciphers.iter().filter(|c| matches!(scan(c, &keys), Scan::Marked(_))).count()
+        ciphers.iter().filter(|c| matches!(scan(c, ns, &keys, &Organizations::None), Scan::Marked(_))).count()
     });
     assert_eq!(marked, 10_000);
     let sync = serde_json::json!({ "ciphers": ciphers });
-    let user = dybw_core::crypto::SymmetricKey::from_bytes(&keys.user.to_bytes()).unwrap();
-    let marker = dybw_core::crypto::Marker::new(&user, dybw_core::crypto::MarkScheme::Bwss);
-    let core = dybw_core::vault::Keys { user, marker, orgs: Default::default(), security_version: 0 };
-    let mut cache = dybw_core::vault::UnmarkedCache::default();
+    let mut cache = UnmarkedCache::default();
     let none = Default::default();
-    let built = time("build-10000-items", 5_000, || build(&sync, &core, None, &mut cache, &none, true));
+    let built = time("build-10000-items", 5_000, || build(&sync, &keys, None, &mut cache, &none, true));
     assert_eq!(built.snapshot.items.len(), 10_000);
-    time("rescan-10000-unchanged", 5_000, || build(&sync, &core, Some(&built), &mut cache, &built.bound, true));
+    time("rescan-10000-unchanged", 5_000, || build(&sync, &keys, Some(&built), &mut cache, &built.bound, true));
     let decoded = built.snapshot.items;
 
     let mut k = Keyring::new(None, None);

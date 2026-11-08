@@ -19,9 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::bw::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_LABEL, PREFIX};
-use crate::bw::scan::normalize_collection;
-use crate::model::{ItemData, LOGIN_COLLECTION};
+use crate::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_LABEL, PREFIX};
+use crate::model::{ItemData, LOGIN_COLLECTION, normalize_collection};
 
 use super::registry::Entry;
 

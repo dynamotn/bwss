@@ -122,6 +122,13 @@ pub fn new_item_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// Collection id from a `bwss:collection` value: trimmed and lowercased;
+/// empty, `default` and `session` (memory only) all mean `login`.
+pub fn normalize_collection(raw: &str) -> String {
+    let id = raw.trim().to_lowercase();
+    if id.is_empty() || id == "default" || id == SESSION_COLLECTION { LOGIN_COLLECTION.to_owned() } else { id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +146,14 @@ mod tests {
         assert_eq!(unescape_segment("_zz"), None);
         assert_eq!(unescape_segment("a-b"), None, "a byte that escape_segment would have escaped");
         assert_eq!(unescape_segment("a b"), None);
+    }
+
+    #[test]
+    fn collection_values_normalize() {
+        assert_eq!(normalize_collection(" Default "), "login");
+        assert_eq!(normalize_collection("Session"), "login");
+        assert_eq!(normalize_collection("Work/Keys"), "work/keys");
+        assert_eq!(normalize_collection(""), "login");
     }
 
     #[test]

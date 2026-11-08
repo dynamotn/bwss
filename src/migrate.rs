@@ -13,7 +13,8 @@ use serde::Deserialize;
 use toml::{Table, Value};
 use zeroize::Zeroizing;
 
-use crate::bw::api::identity_origin;
+use dybw_core::api::{origin_of, resolve_server_urls};
+
 use crate::config::{
     self, BackendKind, Credentials, DEFAULT_FOLDER, DEFAULT_LOCK_TIMEOUT_MINUTES, DEFAULT_MEMORY_PASSWORD,
     DEFAULT_PINENTRY, Paths, Trust,
@@ -293,7 +294,7 @@ pub fn migrate(
                 // Bound to the server bwss will send it to: the profile's.
                 let server =
                     own.and_then(|t| t.get("server_url")).and_then(Value::as_str).unwrap_or(&legacy.server_url);
-                let origin = identity_origin(server).map_err(anyhow::Error::msg)?;
+                let origin = origin_of(&resolve_server_urls(server)?.identity)?;
                 let moved = Credentials {
                     identity_origin: origin.clone(),
                     client_id: found.client_id,

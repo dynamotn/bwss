@@ -505,7 +505,7 @@ Unchanged from `legacy`:
   - **Derived attributes stay out by default.** `bwss:id`, `bwss:name`,
     `bwss:username` and `bwss:uri` are the item's name, username, URIs and
     id, guessable offline from such a file. They are not indexed unless
-    this device opted in with `bwss index derived on` (§10), which keeps
+    this device opted in with `bwss derive on` (§10), which keeps
     them in a separate `derived` list per item. While the keyring is
     unlocked they match as always. While it is locked, a search that names
     one of them matches nothing: `SearchItems` returns two empty lists, no
@@ -867,12 +867,14 @@ backend = "bitwarden"            # or "memory" (with memory_password) for tests 
     is a speed bump, not a defence against local malware, which can create
     the file itself.
   - `index_derived_attributes` in `[bwss]` is an error that names `bwss
-    index derived on`. Putting derived attributes in the locked index (§7)
-    is device state: `bwss index derived on` (asked on the terminal, saying
-    that usernames and URIs become guessable offline from `~/.cache`;
-    refused when stdin is not one) creates
-    `$XDG_STATE_HOME/dybw/tools/bwss/index-derived`, and `bwss index
-    derived off` (no question) removes it.
+    derive on`. Showing derived attributes to apps and putting them in the
+    locked index (§7, ADR 0015) is device state: `bwss derive on` (asked on
+    the terminal, saying that names, usernames and URIs become visible to
+    apps and guessable offline from `~/.cache`; refused when stdin is not
+    one) creates `$XDG_STATE_HOME/dybw/tools/bwss/derive-on`, and `bwss
+    derive off` (no question) removes it; a running daemon rebuilds at once.
+    `bwss index derived on | off` is a deprecated alias, and the old
+    `index-derived` flag is read once as `derive-on`.
   - `pinentry` is resolved to an absolute path: a bare name through `PATH`,
     then every symlink (`canonicalize`). bwss runs that resolved path. It is
     accepted, and the daemon logs which rule accepted it, when either
@@ -936,7 +938,7 @@ bwss unlock [--password-stdin]
 bwss lock | sync | status
 bwss login --client-id ID [--client-secret-stdin]
 bwss acl off | on
-bwss index derived on | off
+bwss derive on | off          (alias: bwss index derived on | off)
 bwss config migrate
 bwss kdf accept
 bwss security accept VERSION
@@ -1072,15 +1074,13 @@ config, fsutil), since none of those change in substance.
 
 | Module | Change from `legacy` |
 |---|---|
-| `bw/crypto.rs` | Adds the `value-mark` key derivation |
-| `bw/api.rs` | Adds `GET /ciphers/{id}` and `GET /accounts/revision-date`; folder writes are only needed for the keyring folder |
-| `bw/items.rs` | Rewritten: marker scan (field names only), the read and write rules of §3 and §5, foreign-content check, field-level re-apply on conflict |
+| `bw/*` | Removed (M4): the crypto, the API client, the marker scan, the read and write rules of §3 and §5, the foreign-content check and the field-level re-apply on conflict come from dybw-core; `core_ports/` gives the core its ports and `backend/worker.rs` hosts it |
 | `backend/bitwarden.rs` | Snapshot built from marked items and the collection registry; no sub-folders, no `whole_vault`, no `vault-acl` |
 | `model.rs` | No `read_only`; reversible path escape |
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
 | `config.rs`, `migrate.rs` | The shared dybw file (§10): registry validation, profile resolution, the `pinentry` rule, origin-bound credentials, `bwss config migrate` |
-| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl`, `bwss index derived` and `bwss config migrate` |
+| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl`, `bwss derive` and `bwss config migrate` |
 
 ## 14. Compatibility with `legacy`
 

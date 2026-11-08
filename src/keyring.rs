@@ -15,7 +15,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bw::fields::{A_ID, DERIVED};
+use crate::fields::{A_ID, DERIVED};
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, now};
 
 /// Version of the locked index file; an index of another version is not

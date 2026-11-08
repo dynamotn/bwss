@@ -34,16 +34,15 @@ use tokio::sync::MutexGuard;
 use zeroize::Zeroizing;
 
 use super::bitwarden::{
-    Bitwarden, Built, CoreClient, KIND_COLLECTIONS, QUEUED, Unlocked, ciphers, copy_keys, queue_key, read_registry,
-    registry_with_queue, uninspectable_text, with_queue,
+    Bitwarden, Built, CoreClient, KIND_COLLECTIONS, MarkedItem, QUEUED, Unlocked, ciphers, copy_keys, queue_key,
+    read_registry, registry_with_queue, uninspectable_text, with_queue,
 };
 use super::ops::{Queue, Records, RegistryOp, new_item_of, target};
 use super::registry::{Entry, REGISTRY_ID, Registry};
 use super::{BackendError, question_text};
-use crate::bw::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_ID, F_KIND, F_LABEL, F_PASSWORD, PREFIX};
-use crate::bw::scan::{MarkedItem, ValueSource, normalize_collection};
 use crate::core_ports::random::OsRandom;
-use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, now};
+use crate::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_ID, F_KIND, F_LABEL, F_PASSWORD, PREFIX};
+use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, normalize_collection, now};
 use crate::prompter::one_line;
 
 /// Sends per registry write: the first one and up to two re-applications
@@ -73,16 +72,6 @@ const RESPONSE_ONLY: [&str; 11] = [
 /// The attributes an app set: derived ones (`bwss:*`) are never stored.
 pub(crate) fn own_attributes(a: &Attributes) -> Attributes {
     a.iter().filter(|(k, _)| !k.starts_with(PREFIX)).map(|(k, v)| (k.clone(), v.clone())).collect()
-}
-
-/// The core's name of a value source.
-pub(crate) fn core_source(s: ValueSource) -> CoreSource {
-    match s {
-        ValueSource::Field => CoreSource::Field,
-        ValueSource::BwssNotes => CoreSource::Notes,
-        ValueSource::NoteBody => CoreSource::NoteBody,
-        ValueSource::LoginPassword => CoreSource::LoginPassword,
-    }
 }
 
 fn text(name: &str, value: &str) -> FieldSet {
@@ -134,12 +123,7 @@ pub(crate) fn plan_put(old: Option<&MarkedItem>, new: &ItemData) -> Op {
     let value = if new.secret == old.item.secret {
         ValueChange::Keep
     } else {
-        ValueChange::Set {
-            source: core_source(old.source),
-            secret: new.secret.clone(),
-            base_mark: old.mark,
-            owned: false,
-        }
+        ValueChange::Set { source: old.source, secret: new.secret.clone(), base_mark: old.mark, owned: false }
     };
     Op::Patch(Patch {
         id: old.item.id.clone(),
@@ -192,8 +176,8 @@ impl Undo {
 /// Extra `bwss status` lines: what the user may want to fix.
 pub(super) fn status_lines(built: &Built, derive: bool) -> Vec<String> {
     let mut lines = Vec::new();
-    for (id, losers) in &built.duplicates {
-        lines.push(format!("duplicate id {id}: {} items ignored", losers.len()));
+    for d in &built.duplicates {
+        lines.push(format!("duplicate id {}: {} items ignored", d.id, d.left.len()));
     }
     // Items an app could not tell apart: one collection, one attribute set.
     // Items without attributes are found by their derived ones instead, or
@@ -221,7 +205,7 @@ pub(super) fn status_lines(built: &Built, derive: bool) -> Vec<String> {
         let list: Vec<String> = group.iter().map(|(label, id)| format!("{label} ({id})")).collect();
         lines.push(format!("possible duplicates: {}", list.join(", ")));
     }
-    for (_, why) in &built.skipped {
+    for (.., why) in &built.skipped {
         lines.push(format!("skipped: {why}"));
     }
     if built.registry_unreadable {
@@ -1212,9 +1196,7 @@ mod tests {
         MarkedItem {
             cipher_id: "c1".into(),
             revision_date: "2026-01-02T03:04:05Z".into(),
-            creation_date: None,
-            organization: false,
-            source: ValueSource::LoginPassword,
+            source: CoreSource::LoginPassword,
             mark: [9; 32],
             item: ItemData {
                 id: "a".into(),
@@ -1616,8 +1598,17 @@ mod tests {
             registry: Registry::default(),
             registry_ciphers: vec![],
             registry_unreadable: true,
-            duplicates: vec![("a".into(), vec!["c2".into(), "c3".into()])],
-            skipped: vec![("c4".into(), "c4: item type 3 is not supported".into())],
+            duplicates: vec![dybw_core::vault::Duplicate {
+                id: "a".into(),
+                kept: "c1".into(),
+                left: vec!["c2".into(), "c3".into()],
+                bound_kept: false,
+            }],
+            skipped: vec![(
+                "c4".into(),
+                dybw_core::vault::SkipReason::WrongType,
+                "c4: item type 3 is not supported".into(),
+            )],
             ..Built::default()
         };
         assert_eq!(
@@ -1647,19 +1638,6 @@ mod tests {
         );
         assert!(!says(false).contains("GitHub"), "an item with attributes is not listed");
         assert_eq!(says(true), "", "with derived attributes on they find it");
-    }
-
-    #[test]
-    fn value_sources_map_to_the_cores() {
-        let pairs = [
-            (ValueSource::Field, CoreSource::Field),
-            (ValueSource::BwssNotes, CoreSource::Notes),
-            (ValueSource::NoteBody, CoreSource::NoteBody),
-            (ValueSource::LoginPassword, CoreSource::LoginPassword),
-        ];
-        for (bwss, core) in pairs {
-            assert_eq!(core_source(bwss), core);
-        }
     }
 
     #[test]

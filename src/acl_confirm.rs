@@ -16,8 +16,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use dybw_core::crypto::SymmetricKey;
+
 use crate::backend::ops::{FORMAT, Loaded, read_versioned};
-use crate::bw::crypto::{SymmetricKey, acl_confirm_tag};
+use crate::core_ports::random::OsRandom;
 use crate::fsutil::write_json_private;
 
 /// What this device decided about one ACL line.
@@ -75,7 +77,7 @@ impl ConfirmSet {
     }
 
     fn tag(&self, id: &str, exe: &str) -> String {
-        hex::encode(acl_confirm_tag(&self.key, id, exe))
+        hex::encode(self.key.tag(&[id.as_bytes(), &[0], exe.as_bytes()].concat()))
     }
 
     /// What this device decided about `exe`'s line in the item `id`.
@@ -119,7 +121,11 @@ impl ConfirmSet {
         }
     }
 
-    #[expect(clippy::expect_used, reason = "two sets of strings always serialize")]
+    #[expect(
+        clippy::expect_used,
+        reason = "two sets of strings always serialize, and encryption fails only when the random source does, which \
+                  OsRandom never does"
+    )]
     fn save(&self) {
         let Some(path) = &self.path else { return };
         if !self.writable {
@@ -127,7 +133,8 @@ impl ConfirmSet {
             return;
         }
         let plain = serde_json::to_vec(&self.tags).expect("tags serialize");
-        let file = serde_json::json!({ "format": FORMAT, "set": self.key.encrypt(&plain) });
+        let sealed = self.key.encrypt(&plain, &OsRandom).expect("OsRandom never fails");
+        let file = serde_json::json!({ "format": FORMAT, "set": sealed });
         if let Err(e) = write_json_private(path, &file) {
             tracing::warn!(path = %path.display(), "could not save the ACL confirmations: {e}");
         }
@@ -139,6 +146,10 @@ impl ConfirmSet {
 mod tests {
     use super::*;
 
+    fn copy(key: &SymmetricKey) -> SymmetricKey {
+        SymmetricKey::from_bytes(&key.to_bytes()).unwrap()
+    }
+
     fn path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("dybw/tools/bwss/acl-confirmed")
     }
@@ -146,13 +157,13 @@ mod tests {
     #[test]
     fn marks_round_trip_through_the_sealed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let key = SymmetricKey::generate();
-        let mut set = ConfirmSet::open(Some(path(&dir)), key.clone());
+        let key = SymmetricKey::generate(&OsRandom).unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), copy(&key));
         assert_eq!(set.mark("item-1", "/usr/bin/git"), Mark::None);
         set.set("item-1", "/usr/bin/git", Mark::Confirmed);
         set.set("item-1", "/usr/bin/evil-tool", Mark::Denied);
 
-        let again = ConfirmSet::open(Some(path(&dir)), key.clone());
+        let again = ConfirmSet::open(Some(path(&dir)), copy(&key));
         assert_eq!(again.mark("item-1", "/usr/bin/git"), Mark::Confirmed);
         assert_eq!(again.mark("item-1", "/usr/bin/evil-tool"), Mark::Denied);
         assert_eq!(again.mark("item-2", "/usr/bin/git"), Mark::None, "a mark is per item");
@@ -169,8 +180,8 @@ mod tests {
     #[test]
     fn the_file_reveals_neither_items_nor_executables() {
         let dir = tempfile::tempdir().unwrap();
-        let key = SymmetricKey::generate();
-        let mut set = ConfirmSet::open(Some(path(&dir)), key.clone());
+        let key = SymmetricKey::generate(&OsRandom).unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), copy(&key));
         set.set("item-7f3a-unique", "/usr/bin/git-unique", Mark::Confirmed);
         let text = std::fs::read_to_string(path(&dir)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -180,7 +191,8 @@ mod tests {
             assert!(!text.contains(needle), "{needle} leaked: {text}");
         }
         // The tag is the documented HMAC, so other tools can compute it.
-        let tag = hex::encode(crate::bw::crypto::acl_confirm_tag(&key, "item-7f3a-unique", "/usr/bin/git-unique"));
+        // The bytes are `bwss:id ‖ 0x00 ‖ exe`; the HMAC itself is the core's (tag_known_answers).
+        let tag = hex::encode(key.tag(b"item-7f3a-unique\0/usr/bin/git-unique"));
         let plain = key.decrypt(v["set"].as_str().unwrap()).unwrap();
         assert!(String::from_utf8(plain.to_vec()).unwrap().contains(&tag));
         #[cfg(unix)]
@@ -193,11 +205,11 @@ mod tests {
     #[test]
     fn a_set_under_another_key_is_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
-        let mut theirs = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        let mut theirs = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate(&OsRandom).unwrap());
         theirs.set("item-1", "/usr/bin/git", Mark::Confirmed);
         let before = std::fs::read(path(&dir)).unwrap();
 
-        let mut mine = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        let mut mine = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate(&OsRandom).unwrap());
         assert_eq!(mine.mark("item-1", "/usr/bin/git"), Mark::None, "unreadable reads as empty");
         mine.set("item-1", "/usr/bin/ssh", Mark::Confirmed);
         assert_eq!(mine.mark("item-1", "/usr/bin/ssh"), Mark::Confirmed, "kept in memory");
@@ -209,8 +221,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(path(&dir).parent().unwrap()).unwrap();
         std::fs::write(path(&dir), b"not json").unwrap();
-        let key = SymmetricKey::generate();
-        let mut set = ConfirmSet::open(Some(path(&dir)), key.clone());
+        let key = SymmetricKey::generate(&OsRandom).unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), copy(&key));
         assert_eq!(set.mark("i", "/x"), Mark::None);
         set.set("i", "/x", Mark::Denied);
         assert_eq!(std::fs::read(path(&dir).with_file_name("acl-confirmed.corrupt")).unwrap(), b"not json");
@@ -220,8 +232,8 @@ mod tests {
     #[test]
     fn retain_keeps_only_current_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let key = SymmetricKey::generate();
-        let mut set = ConfirmSet::open(Some(path(&dir)), key.clone());
+        let key = SymmetricKey::generate(&OsRandom).unwrap();
+        let mut set = ConfirmSet::open(Some(path(&dir)), copy(&key));
         set.set("a", "/usr/bin/git", Mark::Confirmed);
         set.set("a", "/usr/bin/ssh", Mark::Denied);
         set.set("b", "/usr/bin/git", Mark::Confirmed);
@@ -240,7 +252,7 @@ mod tests {
         // A directory where the file should be: reading it fails, not "missing".
         let p = path(&dir);
         std::fs::create_dir_all(&p).unwrap();
-        let mut set = ConfirmSet::open(Some(p.clone()), SymmetricKey::generate());
+        let mut set = ConfirmSet::open(Some(p.clone()), SymmetricKey::generate(&OsRandom).unwrap());
         assert_eq!(set.mark("i", "/x"), Mark::None);
         set.set("i", "/x", Mark::Confirmed);
         assert_eq!(set.mark("i", "/x"), Mark::Confirmed, "kept in memory");
@@ -252,7 +264,7 @@ mod tests {
     #[test]
     fn setting_the_mark_it_already_has_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate(&OsRandom).unwrap());
         set.set("i", "/x", Mark::None);
         assert!(!path(&dir).exists(), "nothing recorded, nothing written");
         set.set("i", "/x", Mark::Denied);
@@ -264,7 +276,7 @@ mod tests {
     #[test]
     fn a_failed_save_keeps_the_decision_in_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate());
+        let mut set = ConfirmSet::open(Some(path(&dir)), SymmetricKey::generate(&OsRandom).unwrap());
         // The file does not exist yet, so the set is writable; then a
         // directory takes the file's place and the replace fails.
         std::fs::create_dir_all(path(&dir)).unwrap();
@@ -275,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_memory_only_set_still_remembers() {
-        let mut set = ConfirmSet::open(None, SymmetricKey::generate());
+        let mut set = ConfirmSet::open(None, SymmetricKey::generate(&OsRandom).unwrap());
         set.set("i", "/x", Mark::Confirmed);
         assert_eq!(set.mark("i", "/x"), Mark::Confirmed);
     }

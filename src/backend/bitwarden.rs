@@ -25,8 +25,8 @@ use dybw_core::sync::{Op, is_rollback};
 use dybw_core::vault::fields as core_fields;
 use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion, NewItem, new_item};
 use dybw_core::vault::{
-    Keys as CoreKeys, MarkedItem as CoreItem, Namespace, Organizations, SkipReason, Uninspectable, UnmarkedCache,
-    ValueSource as CoreSource, item_meta, scan_vault_with,
+    Duplicate, Keys as CoreKeys, MarkedItem as CoreItem, Namespace, Organizations, SkipReason, Uninspectable,
+    UnmarkedCache, ValueSource as CoreSource, item_meta, scan_vault_with,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,19 +41,18 @@ use super::registry::{REGISTRY_ID, Registry};
 use super::runner::{Effect, apply_shown, queue_lines, status_lines};
 use super::worker::{Command, Worker, WorkerHandle};
 use super::{AclTrust, Backend, BackendError, kdf_text};
-use crate::bw::crypto::SymmetricKey;
-use crate::bw::fields::{
-    A_ID, A_NAME, A_URI, A_USERNAME, DERIVED, F_ACL, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND,
-    F_LABEL, F_LOCATION,
-};
-use crate::bw::items::parse_date;
-use crate::bw::scan::{MarkedItem, ValueSource, normalize_collection};
 use crate::config::{Config, Credentials, Paths};
 use crate::core_ports::{
     clock::SystemClock, events::WsEvents, http::HttpPort, kdf::BlockingArgon2, random::OsRandom, storage::FileStorage,
 };
+use crate::fields::{
+    A_ID, A_NAME, A_URI, A_USERNAME, DERIVED, F_ACL, F_COLLECTION, F_CONTENT_TYPE, F_CREATED, F_ENCODING, F_ID, F_KIND,
+    F_LABEL, F_LOCATION,
+};
 use crate::fsutil::{write_json_private, write_private};
-use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot};
+use crate::model::{
+    Attributes, CollectionData, ItemData, LOGIN_COLLECTION, SESSION_COLLECTION, Snapshot, normalize_collection,
+};
 
 const FORMAT: u64 = 2;
 const TYPE_SECURE_NOTE: u64 = 2;
@@ -218,10 +217,10 @@ pub(crate) struct Built {
     pub registry_ciphers: Vec<String>,
     /// A registry note could not be read: it must never be written over.
     pub registry_unreadable: bool,
-    /// `(bwss:id, losing cipher ids)`.
-    pub duplicates: Vec<(String, Vec<String>)>,
-    /// `(cipher id, reason)` of marked items that are not supported.
-    pub skipped: Vec<(String, String)>,
+    /// Ids carried by several ciphers, as the core resolved them (§7).
+    pub duplicates: Vec<Duplicate>,
+    /// `(cipher id, reason, what status says)` of marked items that are not supported.
+    pub skipped: Vec<(String, SkipReason, String)>,
     /// The bindings after this build: every item served from the server,
     /// and every held id whose cipher is still there.
     pub bound: Bindings,
@@ -325,11 +324,32 @@ pub(super) fn uninspectable_text(why: Uninspectable) -> &'static str {
     }
 }
 
+/// A served item as the core read it, with what a write needs: the cipher it
+/// came from, where its value is kept and the mark of that value.
+#[derive(Debug, Clone)]
+pub struct MarkedItem {
+    pub cipher_id: String,
+    pub revision_date: String,
+    pub source: CoreSource,
+    /// Mark of the stored text at `source`: decrypted, before any base64
+    /// decoding, so a client re-encrypting the same value keeps the mark.
+    pub mark: [u8; 32],
+    /// `id` is the trimmed `bwss:id`, raw.
+    pub item: ItemData,
+}
+
+/// An RFC 3339 date in Unix seconds; 0 when it does not parse.
+fn parse_date(s: &str) -> u64 {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map(|t| u64::try_from(t.unix_timestamp()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
 /// bwss's item from the core's read (design §3). The label is `bwss:label`,
 /// else the id, or the item name when `derive` is on (ADR 0015). The name,
 /// username and URI are attributes only when `derive` is on; one that does
 /// not decrypt is left out.
-fn to_marked(m: CoreItem, keys: &CoreKeys, derive: bool) -> MarkedItem {
+pub(super) fn to_marked(m: CoreItem, keys: &CoreKeys, derive: bool) -> MarkedItem {
     let meta = item_meta(&m, keys);
     let tool = |name: &str| m.tool_fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
     let mut attributes: Attributes = m
@@ -363,18 +383,10 @@ fn to_marked(m: CoreItem, keys: &CoreKeys, derive: bool) -> MarkedItem {
     let acl = tool(F_ACL)
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect())
         .unwrap_or_default();
-    let source = match m.source {
-        CoreSource::Field => ValueSource::Field,
-        CoreSource::Notes => ValueSource::BwssNotes,
-        CoreSource::LoginPassword => ValueSource::LoginPassword,
-        CoreSource::NoteBody => ValueSource::NoteBody,
-    };
     let modified = parse_date(&m.revision_date);
     MarkedItem {
-        organization: m.organization_id.is_some(),
-        source,
+        source: m.source,
         mark: m.mark,
-        creation_date,
         item: ItemData {
             id: m.id,
             collection,
@@ -441,7 +453,7 @@ pub(crate) fn build(
         if first_report(("skipped", &why)) {
             tracing::warn!("skipped: {why}");
         }
-        skipped.push((cid.clone(), why));
+        skipped.push((cid.clone(), *reason, why));
     }
 
     let mut uninspectable = HashSet::new();
@@ -467,7 +479,6 @@ pub(crate) fn build(
     for d in &report.duplicates {
         tracing::warn!(id = %d.id, losers = ?d.left, bound = d.bound_kept, "several items carry one bwss:id; one is used");
     }
-    let duplicates = report.duplicates.into_iter().map(|d| (d.id, d.left)).collect();
     let served: HashSet<String> = report.items.iter().map(|m| m.cipher_id.clone()).collect();
     let mut marked: HashMap<String, MarkedItem> =
         report.items.into_iter().map(|m| (m.id.clone(), to_marked(m, keys, derive))).collect();
@@ -502,7 +513,7 @@ pub(crate) fn build(
         registry,
         registry_ciphers,
         registry_unreadable,
-        duplicates,
+        duplicates: report.duplicates,
         skipped,
         bound: next,
     }
@@ -1698,10 +1709,8 @@ impl Bitwarden {
     pub(crate) async fn acl_trust(&self) -> Result<AclTrust, BackendError> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
-        // ADR 0023: from the core's key, legacy or COSE; for a legacy key the
-        // same bytes as bwss's own derivation.
-        let key = state.core_keys.user.derive_bwss("acl-confirm").to_bytes();
-        Ok(AclTrust::PerDevice(SymmetricKey::from_bytes(&key).map_err(|e| BackendError::Rejected(e.to_string()))?))
+        // ADR 0023: from the core's key, legacy or COSE.
+        Ok(AclTrust::PerDevice(state.core_keys.user.derive_bwss("acl-confirm")))
     }
 
     pub(crate) async fn describe(&self) -> String {
@@ -1844,21 +1853,22 @@ impl Backend for BitwardenBackend {
 mod tests {
     use super::*;
     use crate::backend::ops::{new_item_of, target};
-    use crate::bw::scan::Keys;
+    use dybw_core::vault::Keys;
     use dybw_core::vault::write::{FieldSet, Patch, ValueChange};
 
     const REV: &str = "2026-01-02T03:04:05Z";
 
     fn keys() -> Keys {
-        let user = SymmetricKey::generate();
-        Keys { mark: user.derive("value-mark"), user }
+        keys_of(CoreKey::generate(&OsRandom).unwrap())
     }
 
-    /// The core's keys for the same user key.
-    fn core(k: &Keys) -> CoreKeys {
-        use dybw_core::crypto::{MarkScheme, Marker};
-        let user = CoreKey::from_bytes(&k.user.to_bytes()).unwrap();
-        CoreKeys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: BTreeMap::new(), security_version: 0 }
+    fn keys_of(user: CoreKey) -> Keys {
+        Keys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: BTreeMap::new(), security_version: 0 }
+    }
+
+    /// A copy of the keys, for a call that takes them by value.
+    fn core(k: &Keys) -> Keys {
+        copy_keys(k)
     }
 
     /// `super::build` with a fresh scan cache, bound as `previous` was.
@@ -1897,7 +1907,7 @@ mod tests {
         Value::Array(
             fields
                 .iter()
-                .map(|(n, v)| json!({ "type": 0, "name": k.user.encrypt_str(n), "value": k.user.encrypt_str(v) }))
+                .map(|(n, v)| json!({ "type": 0, "name": k.user.encrypt_str(n, &OsRandom).unwrap(), "value": k.user.encrypt_str(v, &OsRandom).unwrap() }))
                 .collect(),
         )
     }
@@ -1905,8 +1915,8 @@ mod tests {
     fn login(k: &Keys, id: &str, f: &[(&str, &str)]) -> Value {
         json!({
             "id": id, "type": 1, "revisionDate": REV, "creationDate": REV, "folderId": null,
-            "name": k.user.encrypt_str(&format!("name {id}")), "notes": null,
-            "login": { "username": null, "password": k.user.encrypt_str("pw"), "uris": null },
+            "name": k.user.encrypt_str(&format!("name {id}"), &OsRandom).unwrap(), "notes": null,
+            "login": { "username": null, "password": k.user.encrypt_str("pw", &OsRandom).unwrap(), "uris": null },
             "fields": fields(k, f),
         })
     }
@@ -1914,7 +1924,7 @@ mod tests {
     fn note(k: &Keys, id: &str, f: &[(&str, &str)], notes: &str) -> Value {
         json!({
             "id": id, "type": 2, "revisionDate": REV, "creationDate": REV, "folderId": "other",
-            "name": k.user.encrypt_str(&format!("name {id}")), "notes": k.user.encrypt_str(notes),
+            "name": k.user.encrypt_str(&format!("name {id}"), &OsRandom).unwrap(), "notes": k.user.encrypt_str(notes, &OsRandom).unwrap(),
             "secureNote": { "type": 0 }, "fields": fields(k, f),
         })
     }
@@ -2022,7 +2032,7 @@ mod tests {
     #[test]
     fn read_registry_reports_why() {
         let k = keys();
-        let other = SymmetricKey::generate();
+        let other = CoreKey::generate(&OsRandom).unwrap();
         let kind = [("bwss:id", REGISTRY_ID), ("bwss:kind", "collections")];
 
         let good = registry_note(&k, "r", r#"{"home":{"label":"Home","created":1}}"#);
@@ -2032,15 +2042,15 @@ mod tests {
         assert_eq!(read_registry(&registry_note(&k, "r", "not json"), &k), Err(RegistryError::Parse));
 
         let mut notes = registry_note(&k, "r", "{}");
-        notes["notes"] = json!(other.encrypt_str("{}"));
+        notes["notes"] = json!(other.encrypt_str("{}", &OsRandom).unwrap());
         assert_eq!(read_registry(&notes, &k), Err(RegistryError::Notes));
 
         let mut fields = note(&k, "r", &kind, "{}");
-        fields["fields"] = self::fields(&Keys { mark: other.derive("value-mark"), user: other }, &kind);
+        fields["fields"] = self::fields(&keys_of(other), &kind);
         assert_eq!(read_registry(&fields, &k), Err(RegistryError::Fields));
 
         let mut item_key = note(&k, "r", &kind, "{}");
-        item_key["key"] = json!(SymmetricKey::generate().encrypt_str("garbage"));
+        item_key["key"] = json!(CoreKey::generate(&OsRandom).unwrap().encrypt_str("garbage", &OsRandom).unwrap());
         assert_eq!(read_registry(&item_key, &k), Err(RegistryError::Key));
     }
 
@@ -2067,6 +2077,70 @@ mod tests {
         assert_eq!(b.skipped.len(), 1);
     }
 
+    /// Ported from `bw/scan.rs` onto bwss's part of the read (`to_marked`),
+    /// with derived attributes on, as bwss always derived them then.
+    #[test]
+    fn label_attributes_and_defaults() {
+        let k = keys();
+        let enc = |s: &str| k.user.encrypt_str(s, &OsRandom).unwrap();
+        let login = |f: &[(&str, &str)]| {
+            json!({
+                "id": "c1", "type": 1, "revisionDate": "2026-01-02T03:04:05Z", "creationDate": "2025-01-02T03:04:05Z",
+                "name": enc("GitHub"), "notes": null,
+                "login": { "username": enc("me"), "password": enc("pw"),
+                           "uris": [{ "uri": enc("https://github.com"), "match": null }] },
+                "fields": fields(&k, f),
+            })
+        };
+        let read = |c: Value| {
+            let b = super::build(&sync(vec![c]), &k, None, &mut UnmarkedCache::default(), &Bindings::new(), true);
+            b.marked.into_values().next().unwrap()
+        };
+        let s = read(login(&[("bwss:id", " gh "), ("bwss:attr:service", "git"), ("bwss:attr:bwss:name", "spoof")]));
+        assert_eq!(s.item.id, "gh");
+        assert_eq!(s.item.label, "GitHub");
+        assert_eq!(s.item.collection, "login");
+        assert_eq!(s.item.content_type, "text/plain");
+        let attr = |n: &str| s.item.attributes.get(n).map(String::as_str);
+        assert_eq!(attr("service"), Some("git"));
+        assert_eq!(attr("bwss:name"), Some("GitHub"));
+        assert_eq!(attr("bwss:id"), Some("gh"));
+        assert_eq!(attr("bwss:username"), Some("me"));
+        assert_eq!(attr("bwss:uri"), Some("https://github.com"));
+        assert_eq!(s.item.created, 1_735_787_045); // creationDate
+        assert_eq!(s.item.modified, 1_767_323_045);
+        assert_eq!(s.cipher_id, "c1");
+        // bwss:label wins over the name; bwss:created wins over creationDate
+        let s = read(login(&[
+            ("bwss:id", "gh"),
+            ("bwss:label", "Mine"),
+            ("bwss:created", "42"),
+            ("bwss:acl", "/a\n\n/b\n"),
+            ("bwss:collection", "Work/Keys"),
+            ("bwss:content-type", "text/x"),
+        ]));
+        assert_eq!((s.item.label.as_str(), s.item.created), ("Mine", 42));
+        assert_eq!(s.item.acl, vec!["/a".to_owned(), "/b".to_owned()]);
+        assert_eq!((s.item.collection.as_str(), s.item.content_type.as_str()), ("work/keys", "text/x"));
+    }
+
+    /// Ported from `bw/items.rs`: the revision date in seconds, 0 when it
+    /// does not parse; fields under the item's own key when it has one.
+    #[test]
+    fn dates_round_trip_and_items_use_their_own_key() {
+        assert_eq!(parse_date("2023-11-14T22:13:20Z"), 1_700_000_000);
+        assert_eq!(parse_date("2023-11-14T22:13:20.123Z"), 1_700_000_000);
+        assert_eq!(parse_date("not a date"), 0);
+        assert_eq!(parse_date("1960-01-01T00:00:00Z"), 0, "before the epoch");
+        let user = CoreKey::generate(&OsRandom).unwrap();
+        let own = CoreKey::generate(&OsRandom).unwrap();
+        let cipher = json!({ "key": user.encrypt(&own.to_bytes(), &OsRandom).unwrap() });
+        let got = core_fields::item_key(&cipher, &user).unwrap();
+        assert_eq!(got.decrypt_str(&own.encrypt_str("x", &OsRandom).unwrap()).unwrap().as_str(), "x");
+        let plain = core_fields::item_key(&json!({ "key": null }), &user).unwrap();
+        assert_eq!(plain.decrypt_str(&user.encrypt_str("y", &OsRandom).unwrap()).unwrap().as_str(), "y");
+    }
+
     #[test]
     fn duplicates_and_skipped_items_are_recorded() {
         let k = keys();
@@ -2077,8 +2151,9 @@ mod tests {
         let b = build(&sync(vec![newer, login(&k, "c1", &[("bwss:id", "a")]), card]), &k, None);
         assert_eq!(item_ids(&b), ["a"]);
         assert_eq!(b.marked["a"].cipher_id, "c1");
-        assert_eq!(b.duplicates, vec![("a".to_owned(), vec!["c2".to_owned()])]);
-        assert_eq!(b.skipped.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["c3"]);
+        let dups: Vec<_> = b.duplicates.iter().map(|d| (d.id.as_str(), d.left.as_slice())).collect();
+        assert_eq!(dups, [("a", &["c2".to_owned()][..])]);
+        assert_eq!(b.skipped.iter().map(|(c, ..)| c.as_str()).collect::<Vec<_>>(), ["c3"]);
     }
 
     #[test]
@@ -2100,9 +2175,9 @@ mod tests {
         let k = keys();
         let mut s = sync(vec![]);
         s["folders"] = json!([
-            { "id": "f2", "name": k.user.encrypt_str("secret-service") },
-            { "id": "f1", "name": k.user.encrypt_str("secret-service") },
-            { "id": "f0", "name": k.user.encrypt_str("other") },
+            { "id": "f2", "name": k.user.encrypt_str("secret-service", &OsRandom).unwrap() },
+            { "id": "f1", "name": k.user.encrypt_str("secret-service", &OsRandom).unwrap() },
+            { "id": "f0", "name": k.user.encrypt_str("other", &OsRandom).unwrap() },
         ]);
         assert_eq!(keyring_folder(&s, &core(&k).user, "secret-service").as_deref(), Some("f1"));
         assert_eq!(keyring_folder(&s, &core(&k).user, "nope"), None);
@@ -2479,7 +2554,7 @@ mod tests {
         let k = keys();
         let c = note(&k, "c1", &[("bwss:id", "n"), ("bwss:location", "notes"), ("bwss:collection", " Session ")], "v");
         let b = build(&sync(vec![c]), &k, None);
-        assert_eq!(b.marked["n"].source, ValueSource::BwssNotes);
+        assert_eq!(b.marked["n"].source, CoreSource::Notes);
         assert_eq!(&*b.marked["n"].item.secret, b"v");
         assert_eq!(b.marked["n"].item.collection, LOGIN_COLLECTION, "session is memory only");
     }

@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 
+use futures_util::FutureExt as _;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -16,15 +17,15 @@ use super::bitwarden::{Bitwarden, BitwardenBackend};
 use super::ops::{Loaded, QUEUE_FORMAT, Queue, new_item_of, read_formats, unseal};
 use super::registry::Registry;
 use super::runner::Effect;
-use crate::bw::crypto::{KdfParams, SymmetricKey, derive_master_key};
-use crate::bw::fields::field_names;
-use crate::bw::scan::{Keys, Scan, scan};
 use crate::config::{Config, Credentials, Paths};
 use crate::core_ports::random::OsRandom;
 use crate::model::{Attributes, ItemData, Snapshot};
+use dybw_core::crypto::{KdfParams, MarkScheme, Marker, NativeArgon2, SymmetricKey, derive_master_key};
 use dybw_core::ports::Storage;
 use dybw_core::sync::Op;
+use dybw_core::vault::fields::field_names;
 use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion, Patch, ValueChange, WriteRecord};
+use dybw_core::vault::{Keys, Namespace, Organizations, Scan, scan};
 
 const EMAIL: &str = "a@b.c";
 const PASSWORD: &str = "pw";
@@ -297,7 +298,7 @@ fn enc_fields(k: &SymmetricKey, fields: &[(&str, &str)]) -> Value {
     Value::Array(
         fields
             .iter()
-            .map(|(n, v)| json!({ "type": 0, "name": k.encrypt_str(n), "value": k.encrypt_str(v), "linkedId": null }))
+            .map(|(n, v)| json!({ "type": 0, "name": k.encrypt_str(n, &OsRandom).unwrap(), "value": k.encrypt_str(v, &OsRandom).unwrap(), "linkedId": null }))
             .collect(),
     )
 }
@@ -306,10 +307,10 @@ fn enc_fields(k: &SymmetricKey, fields: &[(&str, &str)]) -> Value {
 fn hand_marked(k: &SymmetricKey, cid: &str, id: &str) -> Value {
     json!({
         "id": cid, "type": 1, "organizationId": null, "folderId": null, "revisionDate": REV, "creationDate": REV,
-        "deletedDate": null, "name": k.encrypt_str("GitHub"), "notes": null, "favorite": false, "reprompt": 0,
+        "deletedDate": null, "name": k.encrypt_str("GitHub", &OsRandom).unwrap(), "notes": null, "favorite": false, "reprompt": 0,
         "login": {
-            "username": k.encrypt_str("me"), "password": k.encrypt_str("pw"), "totp": null,
-            "uris": [{ "uri": k.encrypt_str("https://github.com"), "match": null }],
+            "username": k.encrypt_str("me", &OsRandom).unwrap(), "password": k.encrypt_str("pw", &OsRandom).unwrap(), "totp": null,
+            "uris": [{ "uri": k.encrypt_str("https://github.com", &OsRandom).unwrap(), "match": null }],
         },
         "passwordHistory": null,
         "fields": enc_fields(k, &[("bwss:id", id), ("bwss:attr:service", "git"), ("obsidian:id", "o1")]),
@@ -319,7 +320,7 @@ fn hand_marked(k: &SymmetricKey, cid: &str, id: &str) -> Value {
 fn registry_note(k: &SymmetricKey, cid: &str, notes: &str) -> Value {
     json!({
         "id": cid, "type": 2, "organizationId": null, "folderId": null, "revisionDate": REV, "creationDate": REV,
-        "deletedDate": null, "name": k.encrypt_str("bwss collections"), "notes": k.encrypt_str(notes),
+        "deletedDate": null, "name": k.encrypt_str("bwss collections", &OsRandom).unwrap(), "notes": k.encrypt_str(notes, &OsRandom).unwrap(),
         "secureNote": { "type": 0 }, "passwordHistory": null,
         "fields": enc_fields(k, &[("bwss:id", "_collections"), ("bwss:kind", "collections")]),
     })
@@ -332,15 +333,17 @@ fn server(ciphers: Vec<Value>, user: &SymmetricKey) -> (Fake, Config, Credential
 
 /// `user` wrapped under the master key of `PASSWORD`, as `profile.key`.
 fn protect(user: &SymmetricKey) -> String {
-    let master = derive_master_key(PASSWORD, EMAIL, KdfParams::Pbkdf2 { iterations: ITERATIONS }).unwrap();
-    SymmetricKey::stretch(&master).encrypt(&user.to_bytes())
+    let kdf = KdfParams::Pbkdf2 { iterations: ITERATIONS };
+    // PBKDF2 runs inline: the future is ready at once.
+    let master = derive_master_key(PASSWORD, EMAIL, kdf, &NativeArgon2).now_or_never().unwrap().unwrap();
+    SymmetricKey::stretch(&master).encrypt(&user.to_bytes(), &OsRandom).unwrap()
 }
 
 /// A fake server answering `/sync` with `sync`.
 fn serve(sync: Value) -> (Fake, Config, Credentials, Paths, tempfile::TempDir) {
     let (fake, url) = Fake::start(sync);
     let dir = tempfile::tempdir().unwrap();
-    let identity_origin = crate::bw::api::origin_of(&url).unwrap();
+    let identity_origin = dybw_core::api::origin_of(&url).unwrap();
     let config = Config { server_url: url, email: EMAIL.into(), profile: Some("p".into()), ..Config::default() };
     let paths = paths_in(dir.path());
     let creds = Credentials { identity_origin, client_id: "id".into(), client_secret: Zeroizing::new("secret".into()) };
@@ -359,7 +362,7 @@ async fn vault_with(ciphers: Vec<Value>, user: SymmetricKey, derive: bool) -> Va
     }
     let backend = Arc::new(Bitwarden::new(&config, creds, &paths).unwrap());
     backend.unlock(PASSWORD).await.unwrap();
-    let keys = Keys { mark: user.derive("value-mark"), user };
+    let keys = Keys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: BTreeMap::new(), security_version: 0 };
     Vault { keys, fake, backend, dir: dir.path().to_owned(), _dir: dir }
 }
 
@@ -421,9 +424,9 @@ impl Vault {
         self.keys.user.decrypt_str(v.as_str().unwrap()).unwrap().to_string()
     }
 
-    fn marked(&self, cid: &str) -> crate::bw::scan::MarkedItem {
-        match scan(&self.fake.cipher(cid), &self.keys) {
-            Scan::Marked(m) => *m,
+    fn marked(&self, cid: &str) -> super::bitwarden::MarkedItem {
+        match scan(&self.fake.cipher(cid), &Namespace::BWSS, &self.keys, &Organizations::None) {
+            Scan::Marked(m) => super::bitwarden::to_marked(*m, &self.keys, false),
             other => panic!("expected {cid} marked, got {other:?}"),
         }
     }
@@ -436,7 +439,7 @@ impl Vault {
     fn queue_file(&self) -> usize {
         match read_formats(&self.dir.join("state/queue.json"), "legacy", &[QUEUE_FORMAT]) {
             Loaded::Ok(v) => {
-                let key = super::bitwarden::queue_key(&core_key(&self.keys.user));
+                let key = super::bitwarden::queue_key(&self.keys.user);
                 unseal(&v, &key, v["user_key_id"].as_str().unwrap()).unwrap().0.len()
             }
             Loaded::Missing => 0,
@@ -445,8 +448,8 @@ impl Vault {
     }
 }
 
-/// The core's copy of a key of bwss's own.
-fn core_key(k: &SymmetricKey) -> dybw_core::crypto::SymmetricKey {
+/// A copy of a key: the core's keys are not `Clone`.
+fn core_key(k: &SymmetricKey) -> SymmetricKey {
     dybw_core::crypto::SymmetricKey::from_bytes(&k.to_bytes()).unwrap()
 }
 
@@ -479,7 +482,7 @@ fn new_item(id: &str, collection: &str) -> ItemData {
 
 #[tokio::test]
 async fn writes_change_only_bwss_fields_and_the_value_source() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.confirm_write_back("gh", "c1").await;
     let mut item = v.item("gh").await;
@@ -505,7 +508,7 @@ async fn writes_change_only_bwss_fields_and_the_value_source() {
 
 #[tokio::test]
 async fn deleting_strips_and_trashes_only_bare_items() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     assert_eq!(v.fake.count("POST", "/api/folders"), 1);
@@ -532,12 +535,12 @@ async fn deleting_strips_and_trashes_only_bare_items() {
 
 #[tokio::test]
 async fn out_of_date_writes_reapply_and_value_conflicts_fail() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], core_key(&k)).await;
     v.confirm_write_back("gh", "c1").await;
 
     // Another device renamed the item: bwss's label lands on the fresh copy.
-    let renamed = k.encrypt_str("Renamed elsewhere");
+    let renamed = k.encrypt_str("Renamed elsewhere", &OsRandom).unwrap();
     v.fake.with(|s| s.before_put = Some(Box::new(move |c: &mut Value| c["name"] = json!(renamed))));
     let mut item = v.item("gh").await;
     item.label = "Mine".into();
@@ -546,7 +549,7 @@ async fn out_of_date_writes_reapply_and_value_conflicts_fail() {
     assert_eq!(v.marked("c1").item.label, "Mine");
 
     // Another device changed the password: bwss does not overwrite it.
-    let other = k.encrypt_str("theirs");
+    let other = k.encrypt_str("theirs", &OsRandom).unwrap();
     v.fake.with(|s| s.before_put = Some(Box::new(move |c: &mut Value| c["login"]["password"] = json!(other))));
     let mut item = v.item("gh").await;
     item.secret = Zeroizing::new(b"ours".to_vec());
@@ -558,7 +561,7 @@ async fn out_of_date_writes_reapply_and_value_conflicts_fail() {
 
 #[tokio::test]
 async fn offline_writes_queue_merge_and_replay() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
@@ -599,8 +602,8 @@ async fn offline_writes_queue_merge_and_replay() {
 
 #[tokio::test]
 async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], core_key(&k)).await;
     v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
@@ -610,7 +613,7 @@ async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
 
     // Another client renames the item; saving re-encrypts every value with
     // a fresh IV, the unchanged password included.
-    let (name, pw) = (k.encrypt_str("Renamed"), k.encrypt_str("pw"));
+    let (name, pw) = (k.encrypt_str("Renamed", &OsRandom).unwrap(), k.encrypt_str("pw", &OsRandom).unwrap());
     v.fake.with(|s| {
         s.down = false;
         s.rev += 1;
@@ -631,8 +634,8 @@ async fn a_queued_write_survives_a_save_that_re_encrypts_the_same_value() {
 
 #[tokio::test]
 async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![hand_marked(&k, "c1", "gh")], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], core_key(&k)).await;
     v.confirm_write_back("gh", "c1").await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
@@ -644,7 +647,7 @@ async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
     assert_eq!(v.queued().await, 1);
 
     // Another device changes the password meanwhile.
-    let theirs = k.encrypt_str("theirs");
+    let theirs = k.encrypt_str("theirs", &OsRandom).unwrap();
     v.fake.with(|s| {
         s.down = false;
         s.rev += 1;
@@ -665,7 +668,7 @@ async fn a_queued_value_conflict_keeps_the_rest_of_the_change() {
 
 #[tokio::test]
 async fn a_change_that_cannot_be_kept_on_disk_is_refused() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.fake.with(|s| s.down = true);
     // The private write goes through this temporary name: a directory there
@@ -693,10 +696,10 @@ impl Vault {
 
 #[tokio::test]
 async fn queued_changes_wait_for_unreadable_items_and_drop_for_gone_ones() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let other = json!({
         "id": "c2", "type": 2, "organizationId": null, "folderId": null, "revisionDate": REV, "creationDate": REV,
-        "deletedDate": null, "name": k.encrypt_str("Other"), "notes": null, "secureNote": { "type": 0 },
+        "deletedDate": null, "name": k.encrypt_str("Other", &OsRandom).unwrap(), "notes": null, "secureNote": { "type": 0 },
         "passwordHistory": null, "fields": enc_fields(&k, &[("bwss:id", "x"), ("bwss:password", "s")]),
     });
     let v = vault(vec![hand_marked(&k, "c1", "gh"), other], k).await;
@@ -749,7 +752,7 @@ async fn queued_changes_wait_for_unreadable_items_and_drop_for_gone_ones() {
 
 #[tokio::test]
 async fn an_unrelated_unreadable_item_never_holds_the_queue() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k).await;
     v.fake.with(|s| s.down = true);
     let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
@@ -775,7 +778,7 @@ async fn an_unrelated_unreadable_item_never_holds_the_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_accepted_create_leaves_the_queue_even_when_the_keyring_locks() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![], k).await;
     v.fake.with(|s| s.down = true);
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
@@ -817,7 +820,7 @@ async fn an_accepted_create_leaves_the_queue_even_when_the_keyring_locks() {
 
 #[tokio::test]
 async fn collections_live_in_the_registry_note() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![], k).await;
     let work = v.backend.create_collection("Work").await.unwrap();
     assert_eq!(work.id, "work");
@@ -853,14 +856,14 @@ async fn collections_live_in_the_registry_note() {
 
 #[tokio::test]
 async fn a_queued_tombstone_never_buries_a_newer_collection() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![registry_note(&k, "r1", r#"{"work":{"label":"Work","created":5}}"#)], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![registry_note(&k, "r1", r#"{"work":{"label":"Work","created":5}}"#)], core_key(&k)).await;
     v.fake.with(|s| s.down = true);
     v.backend.delete_collection("work", &[]).await.unwrap();
     assert_eq!(v.queued().await, 1);
 
     // Another device deleted and created it again meanwhile.
-    let notes = k.encrypt_str(r#"{"work":{"label":"Work again","created":100}}"#);
+    let notes = k.encrypt_str(r#"{"work":{"label":"Work again","created":100}}"#, &OsRandom).unwrap();
     v.fake.with(|s| {
         s.down = false;
         s.rev += 1;
@@ -880,7 +883,7 @@ async fn a_queued_tombstone_never_buries_a_newer_collection() {
 
 #[tokio::test]
 async fn an_unreadable_registry_is_never_written() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![registry_note(&k, "r1", "not json")], k).await;
     let writes = || v.fake.count("PUT", "/api/") + v.fake.count("POST", "/api/");
     let before = writes();
@@ -892,7 +895,7 @@ async fn an_unreadable_registry_is_never_written() {
 
 #[tokio::test]
 async fn status_lists_duplicates() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let mut clone = hand_marked(&k, "c2", "gh");
     clone["creationDate"] = json!("2026-06-01T00:00:00Z");
     let twin = hand_marked(&k, "c3", "twin");
@@ -904,8 +907,8 @@ async fn status_lists_duplicates() {
 
 #[tokio::test]
 async fn a_write_read_from_the_server_replaces_a_queued_one() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], core_key(&k)).await;
     v.confirm_write_back("gh", "c1").await;
     // A delete that cannot be sent keeps the queue blocked, so the change
     // below stays queued across refreshes.
@@ -919,7 +922,7 @@ async fn a_write_read_from_the_server_replaces_a_queued_one() {
 
     // Another device changes the password; the refresh shows it, since the
     // queued change cannot be applied to it.
-    let theirs = k.encrypt_str("theirs");
+    let theirs = k.encrypt_str("theirs", &OsRandom).unwrap();
     v.fake.with(|s| {
         s.rev += 1;
         let rev = s.revision();
@@ -943,7 +946,7 @@ async fn a_write_read_from_the_server_replaces_a_queued_one() {
 
 #[tokio::test]
 async fn text_after_a_queued_binary_write_never_reaches_the_login_password() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.fake.with(|s| s.down = true);
     let mut item = v.item_offline("gh").await;
@@ -962,12 +965,12 @@ async fn text_after_a_queued_binary_write_never_reaches_the_login_password() {
     assert!(c["passwordHistory"].as_array().is_none_or(Vec::is_empty));
     assert!(!v.names("c1").iter().any(|n| n == "bwss:encoding"));
     let m = v.marked("c1");
-    assert_eq!((m.source, m.item.secret.as_slice()), (crate::bw::scan::ValueSource::Field, &b"text"[..]));
+    assert_eq!((m.source, m.item.secret.as_slice()), (dybw_core::vault::ValueSource::Field, &b"text"[..]));
 }
 
 #[tokio::test]
 async fn a_write_out_of_date_on_every_attempt_is_retried_never_lost() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
 
     // Live: the app is told to try again, and nothing is queued.
@@ -996,15 +999,15 @@ async fn a_write_out_of_date_on_every_attempt_is_retried_never_lost() {
 
 #[tokio::test]
 async fn a_delete_keeps_an_item_that_gained_foreign_content_meanwhile() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![], core_key(&k)).await;
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     let cid = v.fake.with(|s| s.sync["ciphers"][0]["id"].as_str().unwrap().to_owned());
     let item = v.item("n1").await;
 
     // While bwss saves the stripped item, another device adds a note field:
     // the save is out of date, and the retry keeps that field.
-    let (name, value) = (k.encrypt_str("note"), k.encrypt_str("mine"));
+    let (name, value) = (k.encrypt_str("note", &OsRandom).unwrap(), k.encrypt_str("mine", &OsRandom).unwrap());
     v.fake.with(|s| {
         s.before_put = Some(Box::new(move |c: &mut Value| {
             c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": name, "value": value }));
@@ -1018,11 +1021,11 @@ async fn a_delete_keeps_an_item_that_gained_foreign_content_meanwhile() {
 
 #[tokio::test]
 async fn acl_decisions_are_keyed_by_a_key_of_their_own() {
-    let user = SymmetricKey::generate();
-    let v = vault(vec![], user.clone()).await;
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![], core_key(&user)).await;
     match v.backend.acl_trust().await.unwrap() {
         super::AclTrust::PerDevice(key) => {
-            assert_eq!(key.to_bytes(), user.derive("acl-confirm").to_bytes());
+            assert_eq!(key.to_bytes(), user.derive_bwss("acl-confirm").to_bytes());
             assert_ne!(key.to_bytes(), user.to_bytes());
         }
         super::AclTrust::Local => panic!("synced lines must be confirmed per device"),
@@ -1035,11 +1038,12 @@ async fn acl_decisions_are_keyed_by_a_key_of_their_own() {
 
 #[tokio::test]
 async fn keep_separate_moves_the_value_to_a_field() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let mut login = hand_marked(&k, "c1", "gh");
     // A full history of passwords this device never wrote.
-    let history: Vec<Value> =
-        (1..=5).map(|n| json!({ "password": k.encrypt_str(&format!("old{n}")), "lastUsedDate": REV })).collect();
+    let history: Vec<Value> = (1..=5)
+        .map(|n| json!({ "password": k.encrypt_str(&format!("old{n}"), &OsRandom).unwrap(), "lastUsedDate": REV }))
+        .collect();
     login["passwordHistory"] = json!(history);
     let v = vault(vec![login], k).await;
     let puts = v.fake.count("PUT", "/api/ciphers/");
@@ -1063,7 +1067,7 @@ async fn keep_separate_moves_the_value_to_a_field() {
     let field = c["fields"].as_array().unwrap().iter().find(|f| v.dec(&f["name"]) == "bwss:password").unwrap();
     assert_eq!((field["type"].as_u64(), v.dec(&field["value"])), (Some(1), "app".to_owned()), "hidden");
     let m = v.marked("c1");
-    assert_eq!((m.source, m.item.secret.as_slice()), (crate::bw::scan::ValueSource::Field, &b"app"[..]));
+    assert_eq!((m.source, m.item.secret.as_slice()), (dybw_core::vault::ValueSource::Field, &b"app"[..]));
     // From then on the field is the value source: no more questions.
     v.backend.put_item(&ItemData { secret: Zeroizing::new(b"again".to_vec()), ..item }).await.unwrap();
     assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "pw");
@@ -1071,7 +1075,7 @@ async fn keep_separate_moves_the_value_to_a_field() {
 
 #[tokio::test]
 async fn a_queued_question_waits_for_bwss_answer() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x"), hand_marked(&k, "c3", "y")], k).await;
     // Offline since the unlock: a live write would ask through the pinentry instead.
     v.fake.with(|s| s.down = true);
@@ -1140,7 +1144,7 @@ async fn a_queued_question_waits_for_bwss_answer() {
 
 #[tokio::test]
 async fn a_cancelled_queued_answer_keeps_the_other_changes() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.fake.with(|s| s.down = true);
     *v.backend.client.lock().await = None;
@@ -1170,7 +1174,7 @@ async fn a_cancelled_queued_answer_keeps_the_other_changes() {
 
 #[tokio::test]
 async fn a_stuck_item_does_not_queue_writes_to_other_items() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k).await;
     v.confirm_write_back("x", "c2").await;
     v.fake.with(|s| s.down = true);
@@ -1203,7 +1207,10 @@ async fn a_stuck_item_does_not_queue_writes_to_other_items() {
 async fn acl_lines_union_after_an_out_of_date_retry() {
     let v = github().await;
     // Another device grants its own app while this one grants another.
-    let (name, value) = (v.keys.user.encrypt_str("bwss:acl"), v.keys.user.encrypt_str("/usr/bin/theirs"));
+    let (name, value) = (
+        v.keys.user.encrypt_str("bwss:acl", &OsRandom).unwrap(),
+        v.keys.user.encrypt_str("/usr/bin/theirs", &OsRandom).unwrap(),
+    );
     v.fake.with(|s| {
         s.before_put = Some(Box::new(move |c: &mut Value| {
             c["fields"].as_array_mut().unwrap().push(json!({ "type": 1, "name": name, "value": value }));
@@ -1246,7 +1253,7 @@ async fn a_write_record_belongs_to_its_cipher() {
 
 #[tokio::test]
 async fn write_records_that_cannot_be_kept_ask_again() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     // The records live in the queue file: a directory where its temporary
     // copy goes makes writing it fail, for any user.
@@ -1391,7 +1398,7 @@ impl Vault {
     /// as it is, so a refresh does not look at it.
     fn add_field(&self, cid: &str, name: &str, value: &str) {
         let field = json!({
-            "type": 0, "name": self.keys.user.encrypt_str(name), "value": self.keys.user.encrypt_str(value),
+            "type": 0, "name": self.keys.user.encrypt_str(name, &OsRandom).unwrap(), "value": self.keys.user.encrypt_str(value, &OsRandom).unwrap(),
             "linkedId": null,
         });
         self.fake.with(|s| s.find(cid).unwrap()["fields"].as_array_mut().unwrap().push(field));
@@ -1473,7 +1480,7 @@ async fn lock_during<T: 'static>(
 /// A vault with the login `gh` (cipher `c1`), whose first write back this
 /// device already confirmed (ADR 0016).
 async fn github() -> Vault {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     v.confirm_write_back("gh", "c1").await;
     v
@@ -1555,7 +1562,7 @@ async fn a_keyring_locked_before_the_reread_stays_locked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_after_a_lock_is_told_the_keyring_is_locked() {
     // The folder is created while the keyring locks; the note is not.
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     let backend = v.backend.clone();
     let result =
         lock_during(&v, "POST", "/api/folders", async move { backend.put_item(&new_item("n1", "login")).await }).await;
@@ -1566,7 +1573,7 @@ async fn a_write_after_a_lock_is_told_the_keyring_is_locked() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flush_stops_when_the_keyring_locks_and_the_write_stays_on_disk() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.with(|s| s.down = true);
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     assert_eq!(v.queue_file(), 1);
@@ -1627,7 +1634,7 @@ async fn a_delete_whose_answer_cannot_be_read_keeps_the_item() {
 
 #[tokio::test]
 async fn an_item_left_in_the_vault_when_the_trash_refuses_it_is_no_longer_the_keyrings() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     let cid = v.fake.with(|s| s.sync["ciphers"][0]["id"].as_str().unwrap().to_owned());
     v.fake.fault("PUT", &format!("/api/ciphers/{cid}/delete"), 500, 1);
@@ -1801,7 +1808,7 @@ async fn a_queued_write_the_server_refuses_is_dropped_and_the_view_goes_back() {
 
 #[tokio::test]
 async fn ops_that_were_done_before_send_nothing() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
     let item = v.item("n1").await;
     let (posts, puts) = (v.fake.count("POST", "/api/ciphers"), v.fake.count("PUT", "/api/ciphers"));
@@ -1830,7 +1837,7 @@ async fn ops_that_were_done_before_send_nothing() {
 
 #[tokio::test]
 async fn a_new_item_the_server_refuses_is_rejected() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.fault("POST", "/api/ciphers", 400, 1);
     let err = v.backend.put_item(&new_item("n1", "login")).await.unwrap_err();
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
@@ -1840,7 +1847,7 @@ async fn a_new_item_the_server_refuses_is_rejected() {
 
 #[tokio::test]
 async fn a_folder_the_server_creates_without_an_id_is_not_used_yet() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.fault_reply("POST", "/api/folders", 200, json!({ "name": "x" }));
     // A server that answers oddly is treated as one that cannot be used now.
     v.backend.put_item(&new_item("n1", "login")).await.unwrap();
@@ -1853,7 +1860,7 @@ async fn a_folder_the_server_creates_without_an_id_is_not_used_yet() {
 
 #[tokio::test]
 async fn a_new_item_queued_offline_is_edited_and_dropped_in_the_queue() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.with(|s| s.down = true);
     let mut item = new_item("n1", "login");
     v.backend.put_item(&item).await.unwrap();
@@ -1895,7 +1902,7 @@ async fn a_new_item_queued_offline_is_edited_and_dropped_in_the_queue() {
 const HOME: &str = r#"{"home":{"label":"Home","created":1}}"#;
 
 async fn with_registry() -> Vault {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     vault(vec![registry_note(&k, "r1", HOME)], k).await
 }
 
@@ -1953,7 +1960,7 @@ async fn a_registry_note_changed_elsewhere_into_something_else_is_handled() {
 
     // Its notes are no longer a registry: never written over.
     let v = with_registry().await;
-    let junk = v.keys.user.encrypt_str("not json");
+    let junk = v.keys.user.encrypt_str("not json", &OsRandom).unwrap();
     v.fake.with(|s| s.before_put = Some(Box::new(move |c: &mut Value| c["notes"] = json!(junk))));
     let err = v.backend.create_collection("Work").await.unwrap_err();
     assert!(
@@ -1964,7 +1971,10 @@ async fn a_registry_note_changed_elsewhere_into_something_else_is_handled() {
 
     // It is no longer of the registry's kind: a new registry note is started.
     let v = with_registry().await;
-    let (name, other) = (v.keys.user.encrypt_str("bwss:kind"), v.keys.user.encrypt_str("something-else"));
+    let (name, other) = (
+        v.keys.user.encrypt_str("bwss:kind", &OsRandom).unwrap(),
+        v.keys.user.encrypt_str("something-else", &OsRandom).unwrap(),
+    );
     v.fake.with(|s| {
         // The second field is `bwss:kind`.
         s.before_put =
@@ -1983,7 +1993,7 @@ async fn a_registry_note_changed_elsewhere_into_something_else_is_handled() {
 
 #[tokio::test]
 async fn a_registry_note_with_a_password_field_is_never_rewritten() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let mut note = registry_note(&k, "r1", HOME);
     note["fields"] = enc_fields(
         &k,
@@ -1997,7 +2007,7 @@ async fn a_registry_note_with_a_password_field_is_never_rewritten() {
 
 #[tokio::test]
 async fn a_registry_note_the_server_refuses_is_rejected() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.fault("POST", "/api/ciphers", 400, 1);
     let err = v.backend.create_collection("Work").await.unwrap_err();
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("HTTP 400")), "{err}");
@@ -2014,7 +2024,7 @@ async fn a_queued_collection_change_waits_for_a_registry_that_cannot_be_read() {
     // Another device wrote something else into the registry note.
     v.fake.with(|s| s.down = false);
     let puts = v.fake.count("PUT", "/api/ciphers/r1");
-    let junk = v.keys.user.encrypt_str("not json");
+    let junk = v.keys.user.encrypt_str("not json", &OsRandom).unwrap();
     v.edit_elsewhere("r1", |c| c["notes"] = json!(junk));
     v.backend.refresh().await.unwrap();
     v.backend.refresh().await.unwrap();
@@ -2022,7 +2032,7 @@ async fn a_queued_collection_change_waits_for_a_registry_that_cannot_be_read() {
     assert_eq!(v.fake.count("PUT", "/api/ciphers/r1") - puts, 1, "only the out-of-date attempt");
 
     // Fixed: the change goes through.
-    let fixed = v.keys.user.encrypt_str(HOME);
+    let fixed = v.keys.user.encrypt_str(HOME, &OsRandom).unwrap();
     v.edit_elsewhere("r1", |c| c["notes"] = json!(fixed));
     v.backend.refresh().await.unwrap();
     v.backend.refresh().await.unwrap();
@@ -2032,7 +2042,7 @@ async fn a_queued_collection_change_waits_for_a_registry_that_cannot_be_read() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registry_found_unreadable_while_its_folder_is_made_is_not_written() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     let mut gate = Gate::hold(&v.fake, "POST", "/api/folders");
     let backend = v.backend.clone();
     let local = tokio::task::LocalSet::new();
@@ -2102,7 +2112,7 @@ async fn a_cache_that_cannot_be_written_does_not_stop_the_unlock() {
 
 #[tokio::test]
 async fn status_lists_items_that_are_not_supported() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let mut card = hand_marked(&k, "c4", "card");
     card["type"] = json!(3);
     let v = vault(vec![hand_marked(&k, "c1", "gh"), card], k).await;
@@ -2167,7 +2177,7 @@ async fn a_server_answer_without_an_id_is_not_recorded() {
 
 #[tokio::test]
 async fn a_vault_sync_without_a_cipher_list_still_takes_writes() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.fake.with(|s| {
         s.rev += 1;
         s.sync.as_object_mut().unwrap().remove("ciphers");
@@ -2183,7 +2193,7 @@ async fn a_vault_sync_without_a_cipher_list_still_takes_writes() {
 
 #[tokio::test]
 async fn deleting_a_collection_that_only_items_name_leaves_no_registry_entry() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     v.backend.put_item(&new_item("n1", "work")).await.unwrap();
     v.snapshot().await;
     v.backend.delete_collection("work", &["n1".to_owned()]).await.unwrap();
@@ -2209,7 +2219,7 @@ fn a_backend_needs_a_profile_to_serve() {
 
 #[tokio::test]
 async fn a_new_item_too_large_for_bitwarden_is_rejected_when_it_is_sent() {
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     let mut item = new_item("n1", "login");
     item.attributes.insert("blob".into(), "x".repeat(5_000));
     let err = v.backend.put_item(&item).await.unwrap_err();
@@ -2227,7 +2237,7 @@ async fn a_collection_too_large_for_the_registry_note_is_rejected() {
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("too large")), "{err}");
     assert_eq!(v.fake.count("PUT", "/api/ciphers/r1"), 0);
     // Writing the first one.
-    let v = vault(vec![], SymmetricKey::generate()).await;
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
     let err = v.backend.create_collection(&big).await.unwrap_err();
     assert!(matches!(&err, BackendError::Rejected(m) if m.contains("too large")), "{err}");
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
@@ -2236,7 +2246,7 @@ async fn a_collection_too_large_for_the_registry_note_is_rejected() {
 
 #[tokio::test]
 async fn a_collection_made_again_is_newer_than_its_tombstone() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let far = crate::model::now() + 1_000_000;
     let tombstone = format!(r#"{{"work":{{"label":"Old","created":{far},"deleted":true}}}}"#);
     let v = vault(vec![registry_note(&k, "r1", &tombstone)], k).await;
@@ -2249,7 +2259,7 @@ async fn a_collection_made_again_is_newer_than_its_tombstone() {
 
 #[tokio::test]
 async fn collections_are_written_to_the_registry_note_with_the_lowest_id() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let notes = [registry_note(&k, "r2", HOME), registry_note(&k, "r1", HOME)];
     let v = vault(notes.to_vec(), k).await;
     v.backend.create_collection("Work").await.unwrap();
@@ -2274,7 +2284,7 @@ async fn a_registry_that_cannot_be_inspected_keeps_its_collections_while_changes
 
 /// The handle the daemon sees, unlocked, on its worker thread.
 async fn handle(ciphers: Vec<Value>) -> (Fake, BitwardenBackend, tempfile::TempDir) {
-    let (fake, config, creds, paths, dir) = server(ciphers, &SymmetricKey::generate());
+    let (fake, config, creds, paths, dir) = server(ciphers, &SymmetricKey::generate(&OsRandom).unwrap());
     let backend = BitwardenBackend::new(&config, creds, &paths).unwrap();
     backend.unlock(PASSWORD).await.unwrap();
     (fake, backend, dir)
@@ -2619,7 +2629,7 @@ async fn a_new_user_key_resets_queue_and_acl_confirmations() {
     v.backend.lock().await;
 
     // The user key is rotated in the web vault.
-    let rotated = SymmetricKey::generate();
+    let rotated = SymmetricKey::generate(&OsRandom).unwrap();
     v.fake.with(|s| s.sync["profile"]["key"] = json!(protect(&rotated)));
     v.backend.unlock(PASSWORD).await.unwrap();
     let new = v.core_file("user-key-id").unwrap();
@@ -2747,7 +2757,7 @@ fn blob(k: &SymmetricKey, cid: &str, fields: &[(&str, &str)], password: &str) ->
 
 #[tokio::test]
 async fn blob_items_are_served() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let marked = blob(&k, "c1", &[("bwss:id", "b"), ("bwss:attr:service", "blobby")], "sealed pw");
     let unmarked = blob(&k, "c2", &[("other", "x")], "never read");
     let v = vault_with(vec![marked, unmarked], k, true).await;
@@ -2767,11 +2777,14 @@ async fn a_held_item_keeps_its_last_value() {
     assert_eq!(&*v.item("gh").await.secret, b"pw");
     // Another client gives it a value source this bwss cannot read: skipped,
     // and the id it holds keeps serving what was read last.
-    let k = v.keys.user.clone();
+    let k = core_key(&v.keys.user);
     v.edit_elsewhere("c1", |c| {
-        c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("bwss:location"),
-            "value": k.encrypt_str("somewhere-new") }));
-        c["login"]["password"] = json!(k.encrypt_str("changed"));
+        c["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "type": 0, "name": k.encrypt_str("bwss:location", &OsRandom).unwrap(),
+            "value": k.encrypt_str("somewhere-new", &OsRandom).unwrap() }));
+        c["login"]["password"] = json!(k.encrypt_str("changed", &OsRandom).unwrap());
     });
     let snap = v.snapshot().await;
     assert_eq!(snap.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["gh"], "never deleted while held");
@@ -2784,10 +2797,13 @@ async fn a_held_item_keeps_its_last_value() {
 #[tokio::test]
 async fn a_newer_format_item_is_not_served_and_is_listed() {
     let v = github().await;
-    let k = v.keys.user.clone();
+    let k = core_key(&v.keys.user);
     v.edit_elsewhere("c1", |c| {
-        c["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("dybw:requires"),
-            "value": k.encrypt_str("bwss:future\nother:thing") }));
+        c["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "type": 0, "name": k.encrypt_str("dybw:requires", &OsRandom).unwrap(),
+            "value": k.encrypt_str("bwss:future\nother:thing", &OsRandom).unwrap() }));
     });
     let snap = v.snapshot().await;
     assert!(snap.items.is_empty(), "ADR 0020: not served, not even as last read");
@@ -2801,10 +2817,13 @@ async fn a_newer_format_item_is_not_served_and_is_listed() {
 
 #[tokio::test]
 async fn label_falls_back_to_the_id() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let mut labelled = hand_marked(&k, "c2", "lab");
-    labelled["fields"].as_array_mut().unwrap().push(json!({ "type": 0, "name": k.encrypt_str("bwss:label"),
-        "value": k.encrypt_str("My label") }));
+    labelled["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": 0, "name": k.encrypt_str("bwss:label", &OsRandom).unwrap(),
+        "value": k.encrypt_str("My label", &OsRandom).unwrap() }));
     let v = vault(vec![hand_marked(&k, "c1", "gh"), labelled], k).await;
     // ADR 0015: the item name ("GitHub") is no label.
     assert_eq!(v.item("gh").await.label, "gh");
@@ -2813,7 +2832,7 @@ async fn label_falls_back_to_the_id() {
 
 #[tokio::test]
 async fn derived_attributes_are_off_by_default() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     let item = v.item("gh").await;
     assert_eq!(item.attributes["bwss:id"], "gh", "the id is always shown");
@@ -2826,7 +2845,7 @@ async fn derived_attributes_are_off_by_default() {
 
 #[tokio::test]
 async fn status_announces_a_carried_over_derive_flag() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     assert!(!v.backend.describe().await.contains("carried over"));
     let paths = paths_in(&v.dir);
@@ -2842,7 +2861,7 @@ async fn status_announces_a_carried_over_derive_flag() {
 async fn derive_on_shows_them_and_off_hides_them_at_once() {
     // The terminal confirmation is `main::derive` (see `turning_derived_attributes_on_says_what_becomes_visible`
     // and the e2e tests); this is what the device flag does.
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let v = vault_with(vec![hand_marked(&k, "c1", "gh")], k, true).await;
     let item = v.item("gh").await;
     assert_eq!(item.attributes["bwss:name"], "GitHub");
@@ -2870,8 +2889,8 @@ fn roll_back(v: &Vault, cid: &str, cipher: Value) {
 async fn a_rolled_back_item_keeps_its_cached_value() {
     let v = github().await;
     let old = v.fake.cipher("c1");
-    let k = v.keys.user.clone();
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    let k = core_key(&v.keys.user);
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new", &OsRandom).unwrap()));
     assert_eq!(&*v.item("gh").await.secret, b"new");
 
     roll_back(&v, "c1", old);
@@ -2896,8 +2915,8 @@ impl Vault {
     /// `gh`'s server copy taken back to `old` after a newer one was synced.
     async fn rolled_back(&self, cid: &str, password: &str) {
         let old = self.fake.cipher(cid);
-        let k = self.keys.user.clone();
-        self.edit_elsewhere(cid, |c| c["login"]["password"] = json!(k.encrypt_str(password)));
+        let k = core_key(&self.keys.user);
+        self.edit_elsewhere(cid, |c| c["login"]["password"] = json!(k.encrypt_str(password, &OsRandom).unwrap()));
         self.snapshot().await;
         roll_back(self, cid, old);
         self.snapshot().await;
@@ -2967,11 +2986,11 @@ async fn accept_rollback_takes_the_server_version() {
 
 #[tokio::test]
 async fn accept_rollback_takes_only_the_listed_versions() {
-    let k = SymmetricKey::generate();
-    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "tw")], k.clone()).await;
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "tw")], core_key(&k)).await;
     let (gh_old, tw_old) = (v.fake.cipher("c1"), v.fake.cipher("c2"));
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("gh-new")));
-    v.edit_elsewhere("c2", |c| c["login"]["password"] = json!(k.encrypt_str("tw-new")));
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("gh-new", &OsRandom).unwrap()));
+    v.edit_elsewhere("c2", |c| c["login"]["password"] = json!(k.encrypt_str("tw-new", &OsRandom).unwrap()));
     v.snapshot().await;
     roll_back(&v, "c1", gh_old.clone());
     v.snapshot().await;
@@ -2995,7 +3014,7 @@ async fn accept_rollback_takes_only_the_listed_versions() {
 
 #[tokio::test]
 async fn a_bound_winner_stays_after_a_restart() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let (fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
     let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
     b.unlock(PASSWORD).await.unwrap();
@@ -3009,7 +3028,7 @@ async fn a_bound_winner_stays_after_a_restart() {
     // A clone with an older creation date: §7 alone would pick it.
     let mut clone = hand_marked(&k, "c0", "gh");
     clone["creationDate"] = json!("2020-01-01T00:00:00Z");
-    clone["login"]["password"] = json!(k.encrypt_str("clone"));
+    clone["login"]["password"] = json!(k.encrypt_str("clone", &OsRandom).unwrap());
     fake.with(|s| s.sync["ciphers"].as_array_mut().unwrap().push(clone));
 
     let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
@@ -3043,8 +3062,8 @@ async fn a_bound_winner_stays_after_a_restart() {
 async fn lost_bindings_do_not_switch_rollback_detection_off() {
     let v = github().await;
     let old = v.fake.cipher("c1");
-    let k = v.keys.user.clone();
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    let k = core_key(&v.keys.user);
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new", &OsRandom).unwrap()));
     v.snapshot().await;
     v.backend.lock().await;
     std::fs::remove_file(v.dir.join("tool-state/core/bindings")).unwrap();
@@ -3057,7 +3076,7 @@ async fn lost_bindings_do_not_switch_rollback_detection_off() {
 
 #[tokio::test]
 async fn bindings_that_cannot_be_read_or_kept_do_not_stop_the_unlock() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let (fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
     // A directory where the file should be: reading and replacing it fail.
     let bindings = dir.path().join("tool-state/core/bindings");
@@ -3079,8 +3098,8 @@ async fn an_accepted_rollback_that_cannot_be_cleared_is_still_taken() {
     use std::os::unix::fs::PermissionsExt as _;
     let v = github().await;
     let old = v.fake.cipher("c1");
-    let k = v.keys.user.clone();
-    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new")));
+    let k = core_key(&v.keys.user);
+    v.edit_elsewhere("c1", |c| c["login"]["password"] = json!(k.encrypt_str("new", &OsRandom).unwrap()));
     v.snapshot().await;
     roll_back(&v, "c1", old);
     v.snapshot().await;
@@ -3108,7 +3127,7 @@ async fn a_migrated_queue_keeps_its_old_file_until_a_flush_moves_on() {
     v.backend.lock().await;
     // A delete queued by bwss's format-3 writer.
     let plain = format!(r#"[{{"Delete":{{"id":"gh","base_revision":"{REV}","cipher_id":"c1"}}}}]"#);
-    let key = super::bitwarden::queue_key(&core_key(&v.keys.user));
+    let key = super::bitwarden::queue_key(&v.keys.user);
     let old = json!({ "format": 3, "ops": key.encrypt(plain.as_bytes(), &OsRandom).unwrap() });
     std::fs::write(v.dir.join("state/queue.json"), serde_json::to_vec(&old).unwrap()).unwrap();
     let backup = v.dir.join("state/queue.json.v3.bak");
@@ -3139,7 +3158,7 @@ async fn a_migrated_queue_keeps_its_old_file_until_a_flush_moves_on() {
 
 #[tokio::test]
 async fn bindings_have_a_key_of_their_own() {
-    let k = SymmetricKey::generate();
+    let k = SymmetricKey::generate(&OsRandom).unwrap();
     let (_fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);
     let user = core_key(&k);
     let b = Bitwarden::new(&config, creds.clone(), &paths).unwrap();
@@ -3177,7 +3196,7 @@ async fn bindings_have_a_key_of_their_own() {
 #[tokio::test]
 async fn the_hub_stops_on_lock() {
     use crate::core_ports::events::test_hub::{Seen, serve as serve_hub};
-    let user = SymmetricKey::generate();
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
     let (_fake, config, creds, paths, _dir) = server(vec![], &user);
     let (hub, mut seen) = serve_hub(1, std::time::Duration::ZERO).await;
     let mut b = Bitwarden::new(&config, creds, &paths).unwrap();
@@ -3231,7 +3250,7 @@ async fn settle() {
 #[tokio::test]
 async fn a_lock_during_an_unlock_leaves_no_hub() {
     use crate::core_ports::events::test_hub::serve as serve_hub;
-    let user = SymmetricKey::generate();
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
     let (_fake, config, creds, paths, _dir) = server(vec![], &user);
     let (hub, mut seen) = serve_hub(0, std::time::Duration::ZERO).await;
     let mut b = Bitwarden::new(&config, creds, &paths).unwrap();
@@ -3270,7 +3289,7 @@ async fn a_lock_during_an_unlock_leaves_no_hub() {
 
 #[tokio::test]
 async fn notifications_off_starts_no_hub() {
-    let user = SymmetricKey::generate();
+    let user = SymmetricKey::generate(&OsRandom).unwrap();
     let (_fake, mut config, creds, paths, _dir) = server(vec![], &user);
     config.notifications = false;
     let vault = std::rc::Rc::new(Bitwarden::new(&config, creds, &paths).unwrap());

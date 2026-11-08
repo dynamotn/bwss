@@ -2,24 +2,3 @@
 # A listed vector that passes fails the run (src/vectors.rs).
 read/duplicates/personal-wins bwss does not read organization items (data model §9: "Reading organization items is opt-in per tool"), so the organization cipher c1 is uninspectable and there is no duplicate to resolve
 read/view-password-hidden bwss does not read organization items (data model §9: "Reading organization items is opt-in per tool"), so both organization ciphers are uninspectable instead of c1 skipped as view-password-hidden and c2 read
-read/cose-item bwss does not read EncString type 7 (`newer-format`); it reads them once on the core (M4)
-write/cose-create the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-read/blob/marked-field waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/marked-login-password waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/marked-notes waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/newer-content-version waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/newer-format-version waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/tampered-cek waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/tampered-envelope waits for ADR 0021, blob ciphers; the core brings it in M4
-read/blob/unmarked waits for ADR 0021, blob ciphers; the core brings it in M4
-write/blob/create the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-write/blob/field-write-back the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-write/blob/login-write-back-history the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-write/blob/strip the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-write/blob/unknown-keys-kept the write goes through the core and sends a blob, which bwss's vector adapter cannot decode (the core keeps the blob codec private); B9 moves the adapter onto the core's vector runner
-read/duplicates/bound-unreadable-held waits for ADR 0019, rollback, duplicates and size; the core brings it in M4
-read/duplicates/bound-winner-kept waits for ADR 0019, rollback, duplicates and size; the core brings it in M4
-read/requires/unknown-dybw-feature waits for ADR 0020, requires; the core brings it in M4
-read/requires/unknown-own-feature waits for ADR 0020, requires; the core brings it in M4
-write/requires-refused bwss writes only the items it serves: an item that needs a newer format (ADR 0020) is not served, so an app has no copy of it to write; the core refuses it as `unsupported` if one is ever sent
-sync/requires-held-not-cleared bwss has no sync planner, and the vector waits for ADR 0020, requires; the core brings it in M4

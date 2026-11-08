@@ -1198,7 +1198,7 @@ mod tests {
         release: Notify,
         /// ACL lines may come from other devices, as Bitwarden's do, and every
         /// refresh brings a new snapshot, as a sync with changes would.
-        per_device: Option<crate::bw::crypto::SymmetricKey>,
+        per_device: Option<dybw_core::crypto::SymmetricKey>,
         /// How many times `unlock` and `refresh` ran.
         unlocks: AtomicU64,
         refreshes: AtomicU64,
@@ -1229,7 +1229,8 @@ mod tests {
                 gated,
                 entered: Notify::new(),
                 release: Notify::new(),
-                per_device: per_device.then(crate::bw::crypto::SymmetricKey::generate),
+                per_device: per_device
+                    .then(|| dybw_core::crypto::SymmetricKey::generate(&crate::core_ports::random::OsRandom).unwrap()),
                 unlocks: AtomicU64::new(0),
                 refreshes: AtomicU64::new(0),
                 unreachable_unlocks: AtomicU64::new(0),
@@ -1317,7 +1318,10 @@ mod tests {
                 return Err(unreachable());
             }
             let local = self.inner.acl_trust().await?;
-            Ok(self.per_device.clone().map_or(local, AclTrust::PerDevice))
+            let copy = |k: &dybw_core::crypto::SymmetricKey| {
+                dybw_core::crypto::SymmetricKey::from_bytes(&k.to_bytes()).unwrap()
+            };
+            Ok(self.per_device.as_ref().map(copy).map_or(local, AclTrust::PerDevice))
         }
         async fn describe(&self) -> String {
             self.inner.describe().await

@@ -11,11 +11,10 @@ mod worker;
 
 use async_trait::async_trait;
 
-use dybw_core::crypto::KdfParams;
+use dybw_core::crypto::{KdfParams, SymmetricKey};
 use dybw_core::profile::KdfSource;
 use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
 
-use crate::bw::crypto::SymmetricKey;
 use crate::model::{CollectionData, ItemData, Snapshot};
 
 /// KDF parameters as the user reads them in the web vault.

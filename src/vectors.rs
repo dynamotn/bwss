@@ -1,5 +1,7 @@
 //! The dybw conformance vectors (`dybw-core/vectors/generated/bwss/`), run
-//! against bwss's real read code and its write glue over the core's writer.
+//! against bwss's glue over the core: the snapshot build (labels, the
+//! registry skip, derived attributes off) over the core's scan, and bwss's
+//! write plan over the core's writer.
 //!
 //! Opt-in: `cargo test --features vectors vectors::`. The vectors are found
 //! at `DYBW_VECTORS_DIR`, else at `../core/vectors` next to the crate (the
@@ -19,67 +21,41 @@ use std::rc::Rc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use dybw_core::api::{ApiKey, Client, DeviceInfo, normalize_keys, origin_of, resolve_server_urls};
-use dybw_core::crypto::{MarkScheme, Marker, SymmetricKey as CoreKey, unwrap_signing_key, verify_security_state};
+use dybw_core::crypto::{
+    Cbor, EnvelopeNamespace, MarkScheme, Marker, SymmetricKey as CoreKey, open_envelope, parse_cek, unwrap_signing_key,
+    verify_security_state,
+};
 use dybw_core::ports::{Http, HttpRequest, HttpResponse, Method, PortError};
 use dybw_core::sync::{self, Op, SyncWriteError};
 use dybw_core::vault::fields as core_fields;
-use dybw_core::vault::write::{HistoryAnswer, Patch, WriteError, WriteRecord};
-use dybw_core::vault::{Keys as CoreKeys, Namespace};
+use dybw_core::vault::write::{HistoryAnswer, Patch, ValueChange, WriteError, WriteRecord};
+use dybw_core::vault::{Keys as CoreKeys, Namespace, Organizations, Scan, SkipReason, ValueSource, scan};
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
-use crate::backend::bitwarden::Built;
+use crate::backend::bitwarden::{Bindings, Built};
 use crate::backend::ops::new_item_of;
 use crate::backend::runner::plan_put;
-use crate::bw::crypto::SymmetricKey;
-use crate::bw::scan::{Keys, Scan, ValueSource, scan};
 use crate::core_ports::clock::SystemClock;
 use crate::core_ports::random::OsRandom;
+use crate::fields::{DERIVED, F_ACL};
 use crate::model::{Attributes, ItemData, LOGIN_COLLECTION, now};
 
-/// bwss's snapshot build over the core's scan.
-fn build(sync: &Value, core: &CoreKeys, previous: Option<&Built>) -> Built {
-    let bound = previous.map(|p| p.bound.clone()).unwrap_or_default();
-    crate::backend::bitwarden::build(sync, core, previous, &mut Default::default(), &bound, true)
+/// bwss's snapshot build over the core's scan, with derived attributes off
+/// (ADR 0015) and the device's bindings (ADR 0019).
+fn build(sync: &Value, keys: &CoreKeys, bound: &Bindings) -> Built {
+    crate::backend::bitwarden::build(sync, keys, None, &mut Default::default(), bound, false)
 }
 
-/// The core's keys for bwss's own legacy keys.
-// shortcut: the read side still takes bwss's own keys; B9 moves it to the core's.
-fn core_of(keys: &Keys) -> Option<CoreKeys> {
-    let user = CoreKey::from_bytes(&keys.user.to_bytes()).ok()?;
-    Some(CoreKeys { marker: Marker::new(&user, MarkScheme::Bwss), user, orgs: BTreeMap::new(), security_version: 0 })
+/// The vector's device bindings (`device.base`, ADR 0019): `bwss:id` to cipher id.
+fn bindings(v: &Value) -> Bindings {
+    let base = v.pointer("/device/base").and_then(Value::as_object).into_iter().flatten();
+    base.filter_map(|(id, e)| Some((id.clone(), e.get("cipher")?.as_str()?.to_owned()))).collect()
 }
 
 const NAMESPACE: &str = "bwss";
 const NOT_FOUND: &str = "conformance vectors not found: set DYBW_VECTORS_DIR";
 const EXPECTED_FAILURES: &str = "tests/vectors-expected-failures.txt";
-/// Derived attributes (`fields::DERIVED`): compared only when a vector lists them.
-const DERIVED: [&str; 4] = ["bwss:id", "bwss:name", "bwss:username", "bwss:uri"];
-
-/// bwss's skip reasons (`Scan::Skipped` and the registry check in `build`)
-/// mapped to the shared reason codes. A reason with no code is reported as
-/// is, so it can never match an expectation.
-const REASONS: &[(&str, &str)] = &[
-    ("is not supported", "wrong-type"),
-    ("unknown bwss:location", "unknown-location"),
-    ("unknown bwss:encoding", "unknown-encoding"),
-    ("bwss:encoding=base64 on a value bwss does not own", "encoding-on-user-source"),
-    ("is reserved", "reserved-id"),
-    ("value is not valid base64", "invalid-base64"),
-];
-
-fn reason_code(why: &str) -> String {
-    REASONS.iter().find(|(text, _)| why.contains(text)).map_or_else(|| why.to_owned(), |(_, code)| (*code).to_owned())
-}
-
-fn source_name(source: ValueSource) -> &'static str {
-    match source {
-        ValueSource::Field => "field",
-        ValueSource::BwssNotes => "notes",
-        ValueSource::NoteBody => "note-body",
-        ValueSource::LoginPassword => "login-password",
-    }
-}
 
 fn vectors_dir() -> PathBuf {
     let dir = std::env::var_os("DYBW_VECTORS_DIR")
@@ -137,17 +113,6 @@ fn expected_failures() -> BTreeMap<String, String> {
     out
 }
 
-/// The keys bwss holds once unlocked: the account's user key, and the mark
-/// key derived from it as `BitwardenBackend::unlock` does.
-/// `Err` for a user key bwss cannot hold (a COSE key): the vectors of that account fail, they do not abort the run.
-fn account_keys(dir: &Path, name: &str) -> Result<Keys, String> {
-    let account = read_json(&dir.join("accounts").join(format!("{name}.json")));
-    let raw = account.get("userKey").and_then(Value::as_str).unwrap_or_else(|| panic!("{name}: no userKey"));
-    let bytes = Zeroizing::new(B64.decode(raw).unwrap_or_else(|e| panic!("{name}: userKey: {e}")));
-    let user = SymmetricKey::from_bytes(&bytes).map_err(|e| format!("{name}: userKey: {e}"))?;
-    Ok(Keys { mark: user.derive("value-mark"), user })
-}
-
 /// The keys the core opens for account `name`: its user key (legacy or COSE)
 /// and the version of its signed security state, 0 without one.
 fn core_account_keys(dir: &Path, name: &str) -> Result<CoreKeys, String> {
@@ -195,8 +160,8 @@ fn by_key(list: &mut [Value], key: &str) {
 
 /// What bwss reads from the vector's ciphers, in the shape of `expect.read`.
 /// `expected` says which items list attributes.
-fn actual_read(ciphers: &[Value], keys: &Keys, expected: &Value) -> Value {
-    let built = core_of(keys).map(|core| build(&json!({ "ciphers": ciphers }), &core, None)).unwrap_or_default();
+fn actual_read(ciphers: &[Value], keys: &CoreKeys, bound: &Bindings, expected: &Value) -> Value {
+    let built = build(&json!({ "ciphers": ciphers }), keys, bound);
     let listed_attributes: HashMap<&str, &Map<String, Value>> = expected
         .get("items")
         .and_then(Value::as_array)
@@ -212,7 +177,7 @@ fn actual_read(ciphers: &[Value], keys: &Keys, expected: &Value) -> Value {
                 "cipher": m.cipher_id,
                 "id": m.item.id,
                 "value": value_text(&m.item.secret),
-                "source": source_name(m.source),
+                "source": m.source.code(),
             });
             if let (Some(listed), Some(o)) = (listed_attributes.get(m.cipher_id.as_str()), item.as_object_mut()) {
                 let attributes: Map<String, Value> = m
@@ -232,18 +197,25 @@ fn actual_read(ciphers: &[Value], keys: &Keys, expected: &Value) -> Value {
             .cmp(&(b.get("id").map(Value::to_string), b.get("cipher").map(Value::to_string)))
     });
     let mut skipped: Vec<Value> =
-        built.skipped.iter().map(|(cid, why)| json!({ "cipher": cid, "reason": reason_code(why) })).collect();
+        built.skipped.iter().map(|(cid, why, _)| json!({ "cipher": cid, "reason": why.code() })).collect();
     by_key(&mut skipped, "cipher");
+    // bwss holds these (`snapshot.held`) without saying why; the core's scan names them.
     let mut uninspectable: Vec<String> = ciphers
         .iter()
-        .filter(|c| matches!(scan(c, keys), Scan::Uninspectable(_)))
+        .filter(|c| matches!(scan(c, &Namespace::BWSS, keys, &Organizations::None), Scan::Uninspectable(_)))
         .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
         .collect();
     uninspectable.sort();
     let duplicates: Vec<Value> = built
         .duplicates
         .iter()
-        .map(|(id, left)| json!({ "id": id, "kept": built.marked.get(id).map(|m| m.cipher_id.clone()), "left": left }))
+        .map(|d| {
+            let mut out = json!({ "id": d.id, "kept": d.kept, "left": d.left });
+            if let (true, Some(o)) = (d.bound_kept, out.as_object_mut()) {
+                o.insert("boundKept".into(), json!(true));
+            }
+            out
+        })
         .collect();
     json!({ "items": items, "skipped": skipped, "uninspectable": uninspectable, "duplicates": duplicates })
 }
@@ -371,21 +343,134 @@ fn is_extra(key: &str) -> bool {
     key.strip_prefix('x').is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
-/// The canonical write body (vectors README) of a request bwss sent.
-// shortcut: a blob request (`data`) is not decoded: the core keeps the blob codec private; B9 moves this adapter onto
-// the core's vector runner.
-fn canonical(method: &str, cipher: Option<&str>, body: &Map<String, Value>, user: &CoreKey) -> Result<Value, String> {
-    if body.get("data").is_some_and(Value::is_string) {
-        return Err("the request is a blob, which this adapter cannot decode".into());
+/// A decoded CBOR item as JSON: a byte string is its base64 text and a map
+/// key is its text, which is all a blob needs.
+fn cbor_json(c: &Cbor) -> Result<Value, String> {
+    Ok(match c {
+        Cbor::Uint(n) => json!(n),
+        Cbor::Nint(n) => json!(-1 - i64::try_from(*n).map_err(|_| "CBOR integer")?),
+        Cbor::Bytes(b) => json!(B64.encode(b.as_slice())),
+        Cbor::Text(t) => json!(t.as_str()),
+        Cbor::Bool(b) => json!(b),
+        Cbor::Null => Value::Null,
+        Cbor::Array(a) => Value::Array(a.iter().map(cbor_json).collect::<Result<_, _>>()?),
+        Cbor::Map(m) => {
+            let mut map = Map::new();
+            for (k, v) in m {
+                let key = match cbor_json(k)? {
+                    Value::String(s) => s,
+                    Value::Number(n) => n.to_string(),
+                    _ => return Err("CBOR map key".into()),
+                };
+                map.insert(key, cbor_json(v)?);
+            }
+            Value::Object(map)
+        }
+    })
+}
+
+/// The sealed content (`CipherBlobV1`) of a blob request (ADR 0021): `data`
+/// is the sealed blob's JSON text, its content key wrapped under `key`.
+fn open_blob(data: &str, key: &CoreKey) -> Result<Value, String> {
+    let sealed: Value = serde_json::from_str(data).map_err(|_| "blob data is not JSON")?;
+    if sealed.get("format_version") != Some(&json!(1)) {
+        return Err("blob format_version is not 1".into());
     }
+    let wrapped = sealed.get("wrapped_cek").and_then(Value::as_str).ok_or("blob wrapped_cek is missing")?;
+    let cek = key.decrypt(wrapped).map_err(|e| format!("blob wrapped_cek: {e}"))?;
+    let cek = parse_cek(&cek).map_err(|e| format!("blob content key: {e}"))?;
+    let text = sealed.get("envelope").and_then(Value::as_str).ok_or("blob envelope is missing")?;
+    let envelope = B64.decode(text).map_err(|_| "blob envelope is not base64")?;
+    let opened =
+        open_envelope(&cek, &envelope, EnvelopeNamespace::VaultItem).map_err(|e| format!("blob envelope: {e}"))?;
+    let content = cbor_json(&opened)?;
+    if content.get("version") != Some(&json!("1")) {
+        return Err("blob content version is not 1".into());
+    }
+    content.get("content").cloned().ok_or_else(|| "blob has no content".into())
+}
+
+/// The canonical `name`, `notes`, `login` and `fields` of a blob's content.
+fn blob_parts(content: &Value) -> (Value, Value, Value, Value) {
+    let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+    let list = |v: &Value, k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+    let type_data = content.get("typeData").cloned().unwrap_or(Value::Null);
+    let login = if type_data.get("type") == Some(&json!("login")) {
+        json!({
+            "username": get(&type_data, "username"),
+            "password": get(&type_data, "password"),
+            "uris": list(&type_data, "uris").iter().map(|u| get(u, "uri")).collect::<Vec<_>>(),
+            "totp": get(&type_data, "totp"),
+            "passwordHistory": list(content, "passwordHistory").iter().map(|h| get(h, "password")).collect::<Vec<_>>(),
+        })
+    } else {
+        Value::Null
+    };
+    let fields = list(content, "fields")
+        .iter()
+        .map(|f| json!({ "name": get(f, "name"), "value": get(f, "value"), "type": get(f, "type") }))
+        .collect::<Vec<_>>();
+    (get(content, "name"), get(content, "notes"), login, json!(fields))
+}
+
+/// The canonical write body (vectors README) of a request bwss sent; a blob
+/// is opened and read as the README's `blob` request.
+fn canonical(method: &str, cipher: Option<&str>, body: &Map<String, Value>, user: &CoreKey) -> Result<Value, String> {
     let whole = Value::Object(body.clone());
     let key = core_fields::item_key(&whole, user).map_err(|e| format!("request item key does not unwrap: {e}"))?;
+    let blob = match body.get("data") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(data)) => Some(open_blob(data, &key)?),
+        Some(other) => return Err(format!("request data: {other}")),
+    };
+    let (name, notes, login, fields) = match &blob {
+        Some(content) => blob_parts(content),
+        None => plain_parts(body, &key)?,
+    };
+    let extra: Map<String, Value> =
+        body.iter().filter(|(k, _)| is_extra(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let plain = |k: &str| body.get(k).cloned().unwrap_or(Value::Null);
+    let mut request = json!({
+        "method": method,
+        "cipher": cipher,
+        "type": plain("type"),
+        "name": name,
+        "notes": notes,
+        "login": login,
+        "fields": fields,
+        "organizationId": plain("organizationId"),
+        "folderId": plain("folderId"),
+        // A create body has none; the server reads that as null.
+        "lastKnownRevisionDate": plain("lastKnownRevisionDate"),
+        "hasItemKey": body.get("key").and_then(Value::as_str).is_some_and(|k| !k.is_empty()),
+        "extra": extra,
+    });
+    if let (Some(content), Some(o)) = (&blob, request.as_object_mut()) {
+        o.insert("blob".into(), json!(true));
+        // The sealed content's unknown keys, listed only when there are any (README, canonical body).
+        let unknown: Map<String, Value> = content
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| is_extra(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !unknown.is_empty() {
+            o.insert("blobExtra".into(), Value::Object(unknown));
+        }
+    }
+    Ok(request)
+}
+
+/// The canonical `name`, `notes`, `login` and `fields` of a request that is
+/// not a blob, decrypted with the item key.
+fn plain_parts(body: &Map<String, Value>, key: &CoreKey) -> Result<(Value, Value, Value, Value), String> {
     let login = match body.get("login") {
         None | Some(Value::Null) => Value::Null,
         Some(Value::Object(l)) => {
             let uris = match l.get("uris") {
                 Some(Value::Array(a)) => {
-                    Value::Array(a.iter().map(|u| decrypt(&key, u.get("uri"), "uri")).collect::<Result<_, _>>()?)
+                    Value::Array(a.iter().map(|u| decrypt(key, u.get("uri"), "uri")).collect::<Result<_, _>>()?)
                 }
                 // Absent and null read as [], like the plugin's adapter.
                 None | Some(Value::Null) => Value::Array(Vec::new()),
@@ -396,13 +481,13 @@ fn canonical(method: &str, cipher: Option<&str>, body: &Map<String, Value>, user
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .map(|h| decrypt(&key, h.get("password"), "passwordHistory"))
+                .map(|h| decrypt(key, h.get("password"), "passwordHistory"))
                 .collect::<Result<Vec<_>, _>>()?;
             json!({
-                "username": decrypt(&key, l.get("username"), "username")?,
-                "password": decrypt(&key, l.get("password"), "password")?,
+                "username": decrypt(key, l.get("username"), "username")?,
+                "password": decrypt(key, l.get("password"), "password")?,
                 "uris": uris,
-                "totp": decrypt(&key, l.get("totp"), "totp")?,
+                "totp": decrypt(key, l.get("totp"), "totp")?,
                 "passwordHistory": history,
             })
         }
@@ -415,30 +500,14 @@ fn canonical(method: &str, cipher: Option<&str>, body: &Map<String, Value>, user
         .flatten()
         .map(|f| {
             Ok(json!({
-                "name": decrypt(&key, f.get("name"), "field name")?,
-                "value": decrypt(&key, f.get("value"), "field value")?,
+                "name": decrypt(key, f.get("name"), "field name")?,
+                "value": decrypt(key, f.get("value"), "field value")?,
                 "type": f.get("type").cloned().unwrap_or(Value::Null),
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let extra: Map<String, Value> =
-        body.iter().filter(|(k, _)| is_extra(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let plain = |k: &str| body.get(k).cloned().unwrap_or(Value::Null);
-    Ok(json!({
-        "method": method,
-        "cipher": cipher,
-        "type": plain("type"),
-        "name": decrypt(&key, body.get("name"), "name")?,
-        "notes": decrypt(&key, body.get("notes"), "notes")?,
-        "login": login,
-        "fields": fields,
-        "organizationId": plain("organizationId"),
-        "folderId": plain("folderId"),
-        // A create body has none; the server reads that as null.
-        "lastKnownRevisionDate": plain("lastKnownRevisionDate"),
-        "hasItemKey": body.get("key").and_then(Value::as_str).is_some_and(|k| !k.is_empty()),
-        "extra": extra,
-    }))
+    let name = decrypt(key, body.get("name"), "name")?;
+    Ok((name, decrypt(key, body.get("notes"), "notes")?, login, Value::Array(fields)))
 }
 
 /// The tool-defined parts of a create (vectors README, R16): `name`, and
@@ -477,17 +546,55 @@ fn given(op: &Value) -> Option<HistoryAnswer> {
     }
 }
 
+/// A value-only patch of the cipher that carries `id` but was skipped for
+/// `dybw:requires` (ADR 0020). bwss never serves such an item, so no app
+/// holds a copy to write; the vector checks that the core refuses one that
+/// is written anyway, as from a stale copy.
+fn stale_patch(built: &Built, ciphers: &[Value], keys: &CoreKeys, id: &str, secret: Vec<u8>) -> Option<Op> {
+    let carries = |c: &Value| -> Option<bool> {
+        let key = core_fields::item_key(c, &keys.user).ok()?;
+        let names = core_fields::field_names(c, &key).ok()?;
+        let at = core_fields::first_index(&names, crate::fields::F_ID)?;
+        Some(core_fields::field_value(c, at, &key).ok()?.trim() == id)
+    };
+    let held = |c: &&Value| {
+        let cid = c.get("id").and_then(Value::as_str).unwrap_or_default();
+        built.skipped.iter().any(|(s, why, _)| s == cid && *why == SkipReason::NewerFormat)
+    };
+    let cipher = ciphers.iter().filter(held).find(|c| carries(c) == Some(true))?;
+    Some(Op::Patch(Patch {
+        id: id.to_owned(),
+        cipher_id: cipher.get("id").and_then(Value::as_str).map(str::to_owned),
+        organization_id: None,
+        base_revision: String::new(),
+        set: Vec::new(),
+        remove: Vec::new(),
+        append_lines: Vec::new(),
+        value: ValueChange::Set {
+            source: ValueSource::Field,
+            secret: Zeroizing::new(secret),
+            base_mark: [0; 32],
+            owned: false,
+        },
+        answer: None,
+    }))
+}
+
 /// The op the daemon's write turns into through bwss's glue: `plan_put` of
 /// the item with its new value and ACL lines, or `new_item_of` a new one.
-fn planned(built: &Built, op: &Value, id: &str) -> Result<Option<Op>, String> {
+fn planned(built: &Built, ciphers: &[Value], keys: &CoreKeys, op: &Value, id: &str) -> Result<Option<Op>, String> {
     let secret = operation_secret(op.get("value").and_then(Value::as_str).ok_or("operation has no value")?)?;
     match op.get("kind").and_then(Value::as_str) {
         Some("set-value") => {
-            let old = built.marked.get(id).ok_or_else(|| format!("bwss reads no item {id}"))?;
+            let Some(old) = built.marked.get(id) else {
+                return stale_patch(built, ciphers, keys, id, secret)
+                    .map(Some)
+                    .ok_or_else(|| format!("bwss reads no item {id}"));
+            };
             let mut new = old.item.clone();
             new.secret = Zeroizing::new(secret);
             for add in op.get("appendLines").and_then(Value::as_array).into_iter().flatten() {
-                if add.get("name").and_then(Value::as_str) != Some(crate::bw::fields::F_ACL) {
+                if add.get("name").and_then(Value::as_str) != Some(F_ACL) {
                     return Err("bwss appends lines to bwss:acl only".into());
                 }
                 new.acl.extend(
@@ -545,7 +652,7 @@ async fn written(v: &Value, ciphers: &[Value], op: &Value, keys: &CoreKeys) -> R
     let mut client = Client::new(server.clone(), SystemClock, urls, device).map_err(|e| e.to_string())?;
     client.login(&key).await.map_err(|e| e.to_string())?;
     let sync = client.sync().await.map_err(|e| e.to_string())?;
-    let built = build(&sync, keys, None);
+    let built = build(&sync, keys, &bindings(v));
     let fresh = op.get("fresh").cloned().map(normalize_keys);
     server.0.borrow_mut().fresh.clone_from(&fresh);
     let ns = &Namespace::BWSS;
@@ -559,7 +666,7 @@ async fn written(v: &Value, ciphers: &[Value], op: &Value, keys: &CoreKeys) -> R
                 sync::delete(&mut client, ns, keys, &OsRandom, cipher, id).await.map(|_| ())
             }
         },
-        _ => match planned(&built, op, id)? {
+        _ => match planned(&built, ciphers, keys, op, id)? {
             None => Ok(()),
             Some(Op::Create(item)) => sync::create(&mut client, ns, keys, &OsRandom, &item).await.map(|_| ()),
             Some(Op::Patch(patch)) => {
@@ -630,12 +737,17 @@ fn run(dir: &Path, v: &Value) -> Result<(), String> {
     let account = v.get("account").and_then(Value::as_str).ok_or("no account")?;
     let ciphers = server_ciphers(v);
     let expect = v.get("expect").ok_or("no expect")?;
-    if expect.get("plan").is_some() {
-        return Err("a plan expectation, but bwss has no sync planner".into());
+    if let Some(expected) = expect.get("plan") {
+        // bwss has no sync planner: a sync rebuilds the snapshot and sends nothing,
+        // so its plan is always empty; a vector that plans an action fails here.
+        let actual = json!([]);
+        if &actual != expected {
+            return Err(mismatch("plan", &actual, expected));
+        }
     }
     if let Some(expected) = expect.get("read") {
-        let keys = account_keys(dir, account)?;
-        let (actual, expected) = (actual_read(&ciphers, &keys, expected), expected_read(expected));
+        let keys = core_account_keys(dir, account)?;
+        let (actual, expected) = (actual_read(&ciphers, &keys, &bindings(v), expected), expected_read(expected));
         if actual != expected {
             return Err(mismatch("read", &actual, &expected));
         }
@@ -705,30 +817,19 @@ fn write_scenarios() {
     run_kind("write");
 }
 
-/// bwss has no planner, so a sync scenario never runs: each one must be
-/// listed as an expected failure, or it would otherwise go unrun.
 #[test]
-fn only_read_and_write_scenarios() {
-    let dir = vectors_dir();
-    let listed = expected_failures();
-    let others: Vec<String> = scenarios(&dir)
-        .into_iter()
-        .map(|(id, _)| id)
-        .filter(|id| !id.starts_with("read/") && !id.starts_with("write/") && !listed.contains_key(id))
-        .collect();
-    assert!(others.is_empty(), "bwss vectors of an unrun kind: {others:?}");
+fn sync_scenarios() {
+    run_kind("sync");
 }
 
+/// Every kind of scenario is run: one of a new kind fails here until bwss
+/// runs it.
 #[test]
-fn reasons_map_to_shared_codes() {
-    for (why, code) in [
-        ("c1: item type 3 is not supported", "wrong-type"),
-        ("c1: unknown bwss:location", "unknown-location"),
-        ("c1: unknown bwss:encoding", "unknown-encoding"),
-        ("c1: bwss:encoding=base64 on a value bwss does not own", "encoding-on-user-source"),
-        ("c1: _collections is reserved", "reserved-id"),
-        ("c1: value is not valid base64", "invalid-base64"),
-    ] {
-        assert_eq!(reason_code(why), code, "{why}");
-    }
+fn only_read_write_and_sync_scenarios() {
+    let others: Vec<String> = scenarios(&vectors_dir())
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| !["read/", "write/", "sync/"].iter().any(|k| id.starts_with(k)))
+        .collect();
+    assert!(others.is_empty(), "bwss vectors of an unrun kind: {others:?}");
 }

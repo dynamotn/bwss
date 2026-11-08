@@ -3,12 +3,11 @@
 mod acl;
 mod acl_confirm;
 mod backend;
-#[cfg_attr(not(test), expect(dead_code, reason = "the unlock moved to dybw-core; B4-B9 replace the rest"))]
-mod bw;
 mod config;
 mod core_ports;
 mod daemon;
 mod dbus;
+mod fields;
 mod fsutil;
 mod hardening;
 mod keyring;
@@ -34,12 +33,12 @@ use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::BusName;
 use zeroize::Zeroizing;
 
+use dybw_core::api::{origin_of, resolve_server_urls};
 use dybw_core::ports::Storage;
 use dybw_core::profile;
 
 use crate::backend::bitwarden::{ACCEPT_ROLLBACK, KDF_OFFERED, ROLLBACKS_HELD, kdf_offer, ran_kdf, rollbacks};
 use crate::backend::{Backend, bitwarden::BitwardenBackend, kdf_text, memory::MemoryBackend};
-use crate::bw::api::identity_origin;
 use crate::config::{BackendKind, Credentials, Paths, Trust};
 use crate::core_ports::storage::FileStorage;
 use crate::daemon::Daemon;
@@ -316,7 +315,7 @@ fn answering() -> anyhow::Result<(FileStorage, String, Prompter)> {
     let trust = Trust::system()?;
     let config = config::load(&paths, &trust)?;
     let profile = config.profile.as_deref().context("bwss serves no profile")?;
-    let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
+    let origin = origin_of(&resolve_server_urls(&config.server_url)?.identity)?;
     Ok((FileStorage::new(&paths, profile), origin, guarded_prompter(&config.pinentry, trust)))
 }
 
@@ -502,7 +501,7 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             for dir in [paths.profile_dir(profile), paths.devices(profile)] {
                 fsutil::ensure_private_dir(&dir).with_context(|| format!("{}", dir.display()))?;
             }
-            let origin = identity_origin(&config.server_url).map_err(anyhow::Error::msg)?;
+            let origin = origin_of(&resolve_server_urls(&config.server_url)?.identity)?;
             let creds = config::load_credentials(&paths.credentials(profile), &trust.user, &origin)?;
             let b = BitwardenBackend::new(&config, creds, &paths)?;
             let changes = b.changes();
@@ -637,7 +636,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let account = config::load_settings(&paths)?.account.with_context(|| {
                 format!("bwss serves no profile: set `default` or `[bwss] profile` in {}", paths.config.display())
             })?;
-            let origin = identity_origin(&account.server_url).map_err(anyhow::Error::msg)?;
+            let origin = origin_of(&resolve_server_urls(&account.server_url)?.identity)?;
             let client_secret = read_line_secret("API key client_secret: ", client_secret_stdin)?;
             let path = paths.credentials(&account.profile);
             config::save_credentials(
