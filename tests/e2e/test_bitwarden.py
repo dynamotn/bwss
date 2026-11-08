@@ -367,8 +367,21 @@ def test_a_queued_question_is_answered_with_bwss_answer(account):
         assert "waits for your answer" in status and "`bwss answer qa login|separate|cancel`" in status, status
         assert account.item(c["id"])["password"] == "web-pw"
 
+        # The command line is no consent: the daemon's pinentry must give the same answer.
+        d.pinentry(confirm="deny")
+        r = d.cli("answer", "qa", "login", check=False)
+        assert r.returncode != 0 and "stays queued" in r.stderr, r.stderr
+        d.pinentry(confirm="notok")
+        r = d.cli("answer", "qa", "login", check=False)
+        assert r.returncode != 0 and "not confirmed in the pinentry" in r.stderr, r.stderr
+        assert "1 queued" in d.cli("status").stdout
+        assert account.item(c["id"])["password"] == "web-pw"
+
+        d.pinentry(confirm="once")
         out = d.cli("answer", "qa", "login").stdout
-        assert "answering first-write-back for qa" in out, out
+        assert "answered first-write-back for qa: login" in out, out
+        desc = [p for p in d.prompts() if p.startswith("SETDESC")]
+        assert desc and '"qa"' in desc[-1], desc
         it = account.item(c["id"])
         assert it["password"] == "queued-pw" and it["history"][0] == "web-pw"
         assert "0 queued" in d.cli("status").stdout

@@ -1057,7 +1057,6 @@ async fn keep_separate_moves_the_value_to_a_field() {
 
 #[tokio::test]
 async fn a_queued_question_waits_for_bwss_answer() {
-    use crate::backend::bitwarden::{Answer, HISTORY_ANSWERS, HISTORY_QUESTIONS, asked};
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x"), hand_marked(&k, "c3", "y")], k).await;
     // Offline since the unlock: a live write would ask through the pinentry instead.
@@ -1069,7 +1068,7 @@ async fn a_queued_question_waits_for_bwss_answer() {
     }
     assert_eq!(v.queue_sizes().await, (3, 3));
 
-    // Sent, the first write-back of each login needs an answer: both wait.
+    // Sent, the first write-back of each login needs an answer: all wait.
     v.fake.with(|s| s.down = false);
     v.backend.refresh().await.unwrap();
     assert_eq!(v.queue_sizes().await, (3, 3), "the changes wait, never dropped");
@@ -1077,19 +1076,33 @@ async fn a_queued_question_waits_for_bwss_answer() {
     let status = v.backend.describe().await;
     assert!(status.contains("waits for your answer: the first change from this device"), "{status}");
     assert!(status.contains("`bwss answer gh login|separate|cancel`"), "{status}");
-    assert_eq!(asked(&v.storage(), HISTORY_QUESTIONS).await.len(), 3);
+    let first = HistoryQuestion::FirstWriteBack;
+    assert_eq!(v.backend.queued_question("gh").await.unwrap(), Some(first));
 
-    // An answer to another question than the one asked counts for nothing.
-    let stale = br#"[{"id":"gh","question":"EvictsForeign","answer":"login"}]"#;
-    v.storage().save(HISTORY_ANSWERS, stale).await.unwrap();
+    // A file is no consent: an answer written where B5 kept them is never read.
+    let planted = br#"[{"id":"gh","question":"FirstWriteBack","answer":"login"}]"#;
+    v.storage().save("history-answers", planted).await.unwrap();
     v.backend.refresh().await.unwrap();
     assert_eq!(v.queue_sizes().await, (3, 3));
-    assert_eq!(v.storage().load(HISTORY_ANSWERS).await.unwrap(), None, "an answer is used once");
+    assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "pw");
 
-    // `bwss answer`: gh goes to the login, x is cancelled, y keeps its own field.
-    crate::answer_history(true, &v.storage(), "gh", Answer::Login).await.unwrap();
-    crate::answer_history(true, &v.storage(), "x", Answer::Cancel).await.unwrap();
-    crate::answer_history(true, &v.storage(), "y", Answer::Separate).await.unwrap();
+    // An answer to another question than the one asked counts for nothing.
+    let stale = v.backend.answer_queued("gh", HistoryQuestion::EvictsForeign, Some(HistoryAnswer::WriteToLogin)).await;
+    assert!(matches!(&stale, Err(BackendError::Rejected(m)) if m.contains("no queued change of gh")), "{stale:?}");
+
+    // The answers the daemon confirmed: gh goes to the login, x is cancelled,
+    // y keeps its own field. Each is on disk at once.
+    v.backend.answer_queued("gh", first, Some(HistoryAnswer::WriteToLogin)).await.unwrap();
+    // A cancel that cannot be kept on disk leaves the change queued, in memory too.
+    let file = v.dir.join("state/queue.json");
+    std::fs::create_dir_all(crate::fsutil::temp_path(&file)).unwrap();
+    assert!(matches!(v.backend.answer_queued("x", first, None).await, Err(BackendError::Unavailable(_))));
+    assert_eq!(v.queued().await, 3);
+    std::fs::remove_dir(crate::fsutil::temp_path(&file)).unwrap();
+    v.backend.answer_queued("x", first, None).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (2, 2), "x had only its value to change: nothing is left of it");
+    v.backend.answer_queued("y", first, Some(HistoryAnswer::KeepSeparate)).await.unwrap();
+    assert!(!v.backend.describe().await.contains("waits for your answer"));
     v.backend.refresh().await.unwrap();
     assert_eq!(v.queue_sizes().await, (0, 0));
     let c = v.fake.cipher("c1");
@@ -1100,15 +1113,76 @@ async fn a_queued_question_waits_for_bwss_answer() {
     assert_eq!(v.dec(&v.fake.cipher("c2")["login"]["password"]), "pw", "the cancelled change is gone");
     assert_eq!(v.dec(&v.fake.cipher("c3")["login"]["password"]), "pw", "the login stays");
     assert_eq!(&*v.marked("c3").item.secret, b"queued", "the value is in its own field");
-    assert!(!v.backend.describe().await.contains("waits for your answer"));
-    assert_eq!(v.storage().load(HISTORY_QUESTIONS).await.unwrap(), None);
+    assert_eq!(v.backend.queued_question("gh").await.unwrap(), None);
 
     // The write is recorded: the next one to gh asks nothing, even after a restart.
     v.backend.lock().await;
+    assert!(matches!(v.backend.queued_question("gh").await, Err(BackendError::Locked)));
     v.backend.unlock(PASSWORD).await.unwrap();
     let item = ItemData { secret: Zeroizing::new(b"later".to_vec()), ..v.item_offline("gh").await };
     v.backend.put_item(&item).await.unwrap();
     assert_eq!(v.dec(&v.fake.cipher("c1")["login"]["password"]), "later");
+}
+
+#[tokio::test]
+async fn a_cancelled_queued_answer_keeps_the_other_changes() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
+    v.fake.with(|s| s.down = true);
+    *v.backend.client.lock().await = None;
+    let item =
+        ItemData { label: "Renamed".into(), secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    let first = HistoryQuestion::FirstWriteBack;
+    assert_eq!(v.backend.queued_question("gh").await.unwrap(), Some(first));
+
+    // An answer that cannot be kept on disk is not kept in memory either.
+    let queue = v.dir.join("state/queue.json");
+    std::fs::create_dir_all(crate::fsutil::temp_path(&queue)).unwrap();
+    let err = v.backend.answer_queued("gh", first, None).await.unwrap_err();
+    assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be kept on disk")), "{err}");
+    assert_eq!(v.backend.queued_question("gh").await.unwrap(), Some(first), "still asked");
+    std::fs::remove_dir(crate::fsutil::temp_path(&queue)).unwrap();
+
+    v.backend.answer_queued("gh", first, None).await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1), "the label change stays");
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (0, 0));
+    let m = v.marked("c1");
+    assert_eq!((m.item.label.as_str(), m.item.secret.as_slice()), ("Renamed", &b"pw"[..]));
+}
+
+#[tokio::test]
+async fn a_stuck_item_does_not_queue_writes_to_other_items() {
+    let k = SymmetricKey::generate();
+    let v = vault(vec![hand_marked(&k, "c1", "gh"), hand_marked(&k, "c2", "x")], k).await;
+    v.confirm_write_back("x", "c2").await;
+    v.fake.with(|s| s.down = true);
+    *v.backend.client.lock().await = None;
+    let item = ItemData { secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.backend.refresh().await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1), "gh waits for an answer");
+
+    // Another item's write is sent at once.
+    let puts = v.fake.count("PUT", "/api/ciphers/c2");
+    let other =
+        ItemData { label: "Other".into(), secret: Zeroizing::new(b"new".to_vec()), ..v.item_offline("x").await };
+    v.backend.put_item(&other).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c2"), puts + 1);
+    assert_eq!(v.queue_sizes().await, (1, 1));
+    assert_eq!(v.dec(&v.fake.cipher("c2")["login"]["password"]), "new");
+
+    // The same item's next write keeps its order: it queues behind the first.
+    let puts = v.fake.count("PUT", "/api/ciphers/c1");
+    let later = ItemData { label: "Later".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&later).await.unwrap();
+    assert_eq!(v.fake.count("PUT", "/api/ciphers/c1"), puts, "nothing sent for gh");
+    assert_eq!(v.queue_sizes().await, (1, 1), "merged into the queued change");
+    assert_eq!(v.item_offline("gh").await.label, "Later");
 }
 
 #[tokio::test]
@@ -1157,19 +1231,17 @@ async fn a_write_record_belongs_to_its_cipher() {
 }
 
 #[tokio::test]
-async fn records_and_questions_that_cannot_be_kept_ask_again() {
+async fn write_records_that_cannot_be_kept_ask_again() {
     let k = SymmetricKey::generate();
     let v = vault(vec![hand_marked(&k, "c1", "gh")], k).await;
     // Directories where the files go: writing them fails, for any user.
     std::fs::create_dir_all(v.dir.join("state/write-records/x")).unwrap();
-    std::fs::create_dir_all(v.dir.join("tool-state/core/history-questions/x")).unwrap();
     v.fake.with(|s| s.down = true);
     *v.backend.client.lock().await = None;
     let item = ItemData { secret: Zeroizing::new(b"queued".to_vec()), ..v.item_offline("gh").await };
     v.backend.put_item(&item).await.unwrap();
     v.fake.with(|s| s.down = false);
     v.backend.refresh().await.unwrap();
-    // Still asked and listed: only `bwss answer` cannot see it.
     assert!(v.backend.describe().await.contains("waits for your answer"));
     // The records do not open after a restart: the next write asks again.
     v.backend.lock().await;
@@ -1184,6 +1256,14 @@ async fn a_queued_change_of_an_item_never_readable_is_listed() {
         vec![("gh".into(), dybw_core::vault::Uninspectable::TooLarge)];
     let status = v.backend.describe().await;
     assert!(status.contains("a queued change of gh (gh) waits: it is larger than any item bwss reads"), "{status}");
+
+    // A label from the vault reaches the terminal on one line, without escapes.
+    if let Some(m) = v.backend.state.lock().await.as_mut().unwrap().built.marked.get_mut("gh") {
+        m.item.label = "evil\n\u{1b}[2Jline".into();
+    }
+    let status = v.backend.describe().await;
+    assert!(status.contains("a queued change of evil\u{fffd}\u{fffd}[2Jline (gh) waits"), "{status}");
+    assert!(!status.contains('\u{1b}'));
 }
 
 #[tokio::test]
@@ -1210,26 +1290,37 @@ async fn a_delete_of_an_item_the_cache_no_longer_holds_sends_nothing() {
 }
 
 #[tokio::test]
-async fn collection_changes_queue_behind_item_changes() {
+async fn collection_changes_queue_only_behind_collection_changes() {
     let v = github().await;
     v.fake.with(|s| s.down = true);
     let item = ItemData { label: "Queued".into(), ..v.item_offline("gh").await };
     v.backend.put_item(&item).await.unwrap();
+    v.backend.create_collection("Home").await.unwrap();
     v.fake.with(|s| s.down = false);
-    // The server is back, but the item change is still queued: nothing jumps ahead.
+    // The server is back. An item change queued does not hold a collection
+    // change, but a queued collection change does: the registry keeps its order.
     v.backend.create_collection("Work").await.unwrap();
-    assert_eq!(v.queue_sizes().await, (2, 2));
+    assert_eq!(v.queue_sizes().await, (3, 3));
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 0);
     // A collection change that cannot be kept on disk is refused.
     let queue = v.dir.join("state/queue.json");
     std::fs::create_dir_all(crate::fsutil::temp_path(&queue)).unwrap();
-    let err = v.backend.create_collection("Home").await.unwrap_err();
+    let err = v.backend.create_collection("Play").await.unwrap_err();
     assert!(matches!(&err, BackendError::Unavailable(m) if m.contains("cannot be queued on disk")), "{err}");
-    assert_eq!(v.queued().await, 2);
+    assert_eq!(v.queued().await, 3);
     std::fs::remove_dir(crate::fsutil::temp_path(&queue)).unwrap();
     v.backend.refresh().await.unwrap();
     assert_eq!(v.queue_sizes().await, (0, 0));
-    assert!(v.snapshot().await.collections.iter().any(|c| c.id == "work"));
+    let ids: Vec<_> = v.snapshot().await.collections.into_iter().map(|c| c.id).collect();
+    assert!(ids.contains(&"work".into()) && ids.contains(&"home".into()), "{ids:?}");
+
+    // With nothing queued for the registry, a collection change is sent at
+    // once, even beside a queued item change.
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&ItemData { label: "Again".into(), ..v.item_offline("gh").await }).await.unwrap();
+    v.fake.with(|s| s.down = false);
+    v.backend.create_collection("Live").await.unwrap();
+    assert_eq!(v.queue_sizes().await, (1, 1), "only the item change is queued");
 }
 
 #[tokio::test]
@@ -2171,6 +2262,8 @@ async fn commands_round_trip() {
     assert!(matches!(b.unlock("wrong").await, Err(BackendError::WrongPassword)));
     let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
     b.put_item_answered(&new_item("n1", "login"), answer).await.unwrap();
+    assert!(b.queued_question("n1").await.unwrap().is_none());
+    assert!(matches!(b.answer_queued("n1", answer.0, None).await, Err(BackendError::Rejected(_))));
     let work = b.create_collection("Work").await.unwrap();
     assert_eq!(work.id, "work");
     // The writes are already shown: nothing new on the server.

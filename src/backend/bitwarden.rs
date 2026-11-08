@@ -70,42 +70,8 @@ pub(crate) const ROLLBACKS_HELD: &str = "rollbacks-held";
 /// Storage key of the rollbacks `bwss sync --accept-rollback` accepted, for
 /// the next sync only.
 pub(crate) const ACCEPT_ROLLBACK: &str = "accept-rollback";
-/// Storage key of the history questions queued changes wait on (ADR 0016),
-/// which `bwss answer` answers.
-pub(crate) const HISTORY_QUESTIONS: &str = "history-questions";
-/// Storage key of the answers `bwss answer` gave, for the next sync only.
-pub(crate) const HISTORY_ANSWERS: &str = "history-answers";
-
 /// The core's client, as bwss runs it.
 pub(crate) type CoreClient = Client<HttpPort, SystemClock>;
-
-/// An answer to a history question, as `bwss answer` gives it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Answer {
-    /// Write to the login password.
-    Login,
-    /// Keep the app's value in a field of its own.
-    Separate,
-    /// Drop the change.
-    Cancel,
-}
-
-/// A queued change of item `id` that waits on `question`, with the answer
-/// `bwss answer` gave, if any.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Asked {
-    pub id: String,
-    pub question: HistoryQuestion,
-    #[serde(default)]
-    pub answer: Option<Answer>,
-}
-
-/// A list of questions kept in `key`; none when it is missing or unreadable.
-pub(crate) async fn asked(storage: &impl Storage, key: &str) -> Vec<Asked> {
-    let raw = storage.load(key).await.ok().flatten();
-    raw.and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
-}
 
 /// A version the server sent older than this device's copy (ADR 0019): it is
 /// held back, and accepted only as exactly this cipher at this revision.
@@ -1187,32 +1153,6 @@ impl Bitwarden {
         })
     }
 
-    /// The answers `bwss answer` left, taken: they are used once.
-    pub(super) async fn answers(&self) -> Vec<Asked> {
-        let answers = asked(&self.storage, HISTORY_ANSWERS).await;
-        if !answers.is_empty()
-            && let Err(e) = self.storage.remove(HISTORY_ANSWERS).await
-        {
-            tracing::warn!("could not clear the answers to history questions: {e}");
-        }
-        answers
-    }
-
-    /// Keeps the questions queued changes wait on, for `bwss answer`.
-    pub(super) async fn keep_questions(&self, questions: &[(String, HistoryQuestion)]) {
-        let list: Vec<Asked> =
-            questions.iter().map(|(id, q)| Asked { id: id.clone(), question: *q, answer: None }).collect();
-        let kept = if list.is_empty() {
-            self.storage.remove(HISTORY_QUESTIONS).await
-        } else {
-            // Plain data: it always serializes.
-            self.storage.save(HISTORY_QUESTIONS, &serde_json::to_vec(&list).unwrap_or_default()).await
-        };
-        if let Err(e) = kept {
-            tracing::warn!("could not keep the history questions for `bwss answer`: {e}");
-        }
-    }
-
     /// Rebuilds the keyring after the cache or the queue changed.
     pub(super) fn rebuild(&self, state: &mut Unlocked, queue: &Queue) {
         let built = build_view(
@@ -1367,8 +1307,6 @@ impl Bitwarden {
         let profile::Unlocked { keys: core_keys, mut sync, .. } = unlocked;
         // Accepted for an unlocked keyring only: one left by an earlier session is never applied.
         notices.extend(self.drop_accepted_rollbacks().await);
-        // Answers are given to the questions of this session only.
-        let _ = self.answers().await;
         // The offline copy is the base: the server may not go below it.
         let base = if from_cache { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
         let lost = match self.load_bindings(&core_keys.user) {
@@ -1452,9 +1390,8 @@ impl Bitwarden {
         }
         // Waits for a request in flight, then logs out.
         *self.client.lock().await = None;
-        // Accepted or answered for this session only.
+        // Accepted for this session only.
         let _ = self.drop_accepted_rollbacks().await;
-        let _ = self.answers().await;
     }
 
     pub(crate) async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
@@ -1532,6 +1469,27 @@ impl Bitwarden {
     ) -> Result<(), BackendError> {
         let mut queue = self.queue.lock().await;
         let result = self.put_locked(&mut queue, item, answer).await;
+        self.forget_if_locked(&mut queue).await;
+        result
+    }
+
+    /// The history question the queued change of `id` waits on (ADR 0016).
+    pub(crate) async fn queued_question(&self, id: &str) -> Result<Option<HistoryQuestion>, BackendError> {
+        let guard = self.state.lock().await;
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        Ok(state.questions.iter().find(|(i, _)| i == id).map(|(_, q)| *q))
+    }
+
+    /// Puts the user's answer, which the daemon confirmed, on the queued
+    /// change of `id`; `None` cancels its value change (ADR 0016).
+    pub(crate) async fn answer_queued(
+        &self,
+        id: &str,
+        question: HistoryQuestion,
+        answer: Option<HistoryAnswer>,
+    ) -> Result<(), BackendError> {
+        let mut queue = self.queue.lock().await;
+        let result = self.answer_locked(&mut queue, id, question, answer).await;
         self.forget_if_locked(&mut queue).await;
         result
     }
@@ -1646,6 +1604,19 @@ impl Backend for BitwardenBackend {
         answer: (HistoryQuestion, HistoryAnswer),
     ) -> Result<(), BackendError> {
         self.0.call(|r| Command::PutItem(item.clone(), Some(answer), r)).await?
+    }
+
+    async fn queued_question(&self, id: &str) -> Result<Option<HistoryQuestion>, BackendError> {
+        self.0.call(|r| Command::QueuedQuestion(id.to_owned(), r)).await?
+    }
+
+    async fn answer_queued(
+        &self,
+        id: &str,
+        question: HistoryQuestion,
+        answer: Option<HistoryAnswer>,
+    ) -> Result<(), BackendError> {
+        self.0.call(|r| Command::AnswerQueued(id.to_owned(), question, answer, r)).await?
     }
 
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {

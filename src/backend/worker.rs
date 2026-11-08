@@ -23,6 +23,8 @@ pub(crate) enum Command {
     CreateCollection(String, Reply<CollectionData>),
     DeleteCollection(String, Vec<String>, Reply<()>),
     PutItem(ItemData, Option<(HistoryQuestion, HistoryAnswer)>, Reply<()>),
+    QueuedQuestion(String, Reply<Option<HistoryQuestion>>),
+    AnswerQueued(String, HistoryQuestion, Option<HistoryAnswer>, Reply<()>),
     DeleteItem(ItemData, Reply<()>),
     AclTrust(Reply<AclTrust>),
     Describe(oneshot::Sender<String>),
@@ -123,6 +125,12 @@ async fn serve(vault: Rc<Bitwarden>, command: Command) {
         }
         Command::PutItem(item, answer, reply) => {
             let _ = reply.send(vault.put_item_answered(&item, answer).await);
+        }
+        Command::QueuedQuestion(id, reply) => {
+            let _ = reply.send(vault.queued_question(&id).await);
+        }
+        Command::AnswerQueued(id, question, answer, reply) => {
+            let _ = reply.send(vault.answer_queued(&id, question, answer).await);
         }
         Command::DeleteItem(item, reply) => {
             let _ = reply.send(vault.delete_item(&item).await);

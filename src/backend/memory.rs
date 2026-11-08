@@ -118,6 +118,8 @@ mod tests {
         };
         let answer = (HistoryQuestion::FirstWriteBack, HistoryAnswer::WriteToLogin);
         assert!(b.put_item_answered(&item, answer).await.is_ok());
+        assert!(matches!(b.queued_question("a").await, Ok(None)), "it never queues a question");
+        assert!(b.answer_queued("a", answer.0, None).await.is_err());
         assert_eq!(b.describe().await, "memory backend, 1 item(s)");
     }
 }

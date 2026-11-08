@@ -34,8 +34,8 @@ use tokio::sync::MutexGuard;
 use zeroize::Zeroizing;
 
 use super::bitwarden::{
-    Answer, Bitwarden, Built, CoreClient, KIND_COLLECTIONS, QUEUED, Unlocked, ciphers, copy_keys, queue_key,
-    read_registry, registry_with_queue, uninspectable_text, with_queue,
+    Bitwarden, Built, CoreClient, KIND_COLLECTIONS, QUEUED, Unlocked, ciphers, copy_keys, queue_key, read_registry,
+    registry_with_queue, uninspectable_text, with_queue,
 };
 use super::ops::{Queue, RegistryOp, new_item_of, target};
 use super::registry::{Entry, REGISTRY_ID, Registry};
@@ -44,6 +44,7 @@ use crate::bw::fields::{F_ACL, F_ATTR, F_COLLECTION, F_CONTENT_TYPE, F_ID, F_KIN
 use crate::bw::scan::{MarkedItem, ValueSource, normalize_collection};
 use crate::core_ports::random::OsRandom;
 use crate::model::{Attributes, CollectionData, ItemData, LOGIN_COLLECTION, now};
+use crate::prompter::one_line;
 
 /// Sends per registry write: the first one and up to two re-applications
 /// after an out-of-date rejection.
@@ -219,7 +220,8 @@ pub(super) fn status_lines(built: &Built) -> Vec<String> {
 
 /// `bwss status` lines for the queued ops that wait on the user or on an item.
 pub(super) fn queue_lines(state: &Unlocked, queue: &Queue) -> Vec<String> {
-    let label = |id: &str| state.built.marked.get(id).map_or(id, |m| m.item.label.as_str()).to_owned();
+    // Labels come from the vault: one line, no control characters, reaches the terminal.
+    let label = |id: &str| one_line(state.built.marked.get(id).map_or(id, |m| m.item.label.as_str()));
     let mut lines: Vec<String> = state
         .questions
         .iter()
@@ -702,16 +704,18 @@ impl Bitwarden {
         }
     }
 
-    /// Runs a live op, or queues it while anything else is queued, the
-    /// server cannot be reached, or the server holds an older copy of the
+    /// Runs a live op, or queues it while an op of the same item is queued,
+    /// the server cannot be reached, or the server holds an older copy of the
     /// item than this device (ADR 0019: never written over).
     async fn submit_locked(&self, queue: &mut Queue, op: Op) -> Result<(), BackendError> {
         let held = {
             let guard = self.state.lock().await;
             guard.as_ref().ok_or(BackendError::Locked)?.rollbacks.iter().any(|r| r.id == target(&op))
         };
-        // Keep order: while anything is queued, nothing jumps ahead (§8.3).
-        if !queue.is_empty() || held || !self.can_write().await {
+        // Keep order per item: while one of its ops is queued, the next one
+        // queues behind it; other items' writes go on (§8.3).
+        let behind = queue.ops.iter().any(|o| target(o) == target(&op));
+        if behind || held || !self.can_write().await {
             return self.enqueue(queue, op).await;
         }
         match self.run(&op).await {
@@ -726,7 +730,8 @@ impl Bitwarden {
 
     /// `submit_locked` for a collection registry change.
     async fn submit_registry(&self, queue: &mut Queue, op: RegistryOp) -> Result<(), BackendError> {
-        if !queue.is_empty() || !self.can_write().await {
+        // Only behind a queued collection change: the registry keeps its order.
+        if !queue.registry.is_empty() || !self.can_write().await {
             return self.enqueue_registry(queue, op).await;
         }
         match self.run_registry(&op.collection, &op.entry).await {
@@ -928,7 +933,6 @@ impl Bitwarden {
         if queue.is_empty() || !self.can_write().await {
             return Ok(());
         }
-        self.take_answers(queue).await;
         if queue.ops.iter().any(|o| matches!(o, Op::Create(n) if n.folder_id.is_none())) {
             let folder = self.ensure_keyring_folder().await.map_err(|f| refusal(f).0)?;
             for op in &mut queue.ops {
@@ -975,7 +979,6 @@ impl Bitwarden {
             state.stuck.clone_from(&report.stuck);
             self.rebuild(state, queue);
         }
-        self.keep_questions(&report.questions).await;
         if changed && let Err(e) = self.pull(queue, &[]).await {
             tracing::info!("the vault is read again at the next sync: {e}");
         }
@@ -1021,29 +1024,53 @@ impl Bitwarden {
         Ok(())
     }
 
-    /// Puts the answers `bwss answer` left on the ops they answer: only an
-    /// answer to the question the op is waiting on counts (ADR 0016). They
-    /// are used once.
-    async fn take_answers(&self, queue: &mut Queue) {
-        let answers = self.answers().await;
-        if answers.is_empty() {
-            return;
+    /// The user's confirmed answer to the question the queued change of `id`
+    /// waits on (ADR 0016), kept on disk at once. Only an answer to that very
+    /// question counts. A cancel drops the value change only; the op goes
+    /// when nothing else is left in it.
+    pub(super) async fn answer_locked(
+        &self,
+        queue: &mut Queue,
+        id: &str,
+        question: HistoryQuestion,
+        answer: Option<HistoryAnswer>,
+    ) -> Result<(), BackendError> {
+        let mut guard = self.state.lock().await;
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+        let none = || BackendError::Rejected(format!("no queued change of {id} waits for that answer"));
+        if !state.questions.contains(&(id.to_owned(), question)) {
+            return Err(none());
         }
-        let asked = self.state.lock().await.as_ref().map(|s| s.questions.clone()).unwrap_or_default();
-        for a in answers {
-            let Some(answer) = a.answer.filter(|_| asked.contains(&(a.id.clone(), a.question))) else { continue };
-            // Only a patch writes to a login password, so only a patch is asked about.
-            let Some(at) = queue.ops.iter().position(|o| target(o) == a.id) else { continue };
-            let Some(Op::Patch(p)) = queue.ops.get_mut(at) else { continue };
-            match answer {
-                Answer::Login => p.answer = Some((a.question, HistoryAnswer::WriteToLogin)),
-                Answer::Separate => p.answer = Some((a.question, HistoryAnswer::KeepSeparate)),
-                Answer::Cancel => {
-                    tracing::warn!(id = %a.id, "a queued change was cancelled by `bwss answer`");
-                    queue.ops.remove(at);
-                }
+        // Only a patch writes to a login password, so only a patch is asked about.
+        let at = queue.ops.iter().position(|o| target(o) == id).ok_or_else(none)?;
+        let Some(Op::Patch(p)) = queue.ops.get_mut(at) else { return Err(none()) };
+        let before = Op::Patch(p.clone());
+        let emptied = match answer {
+            Some(a) => {
+                p.answer = Some((question, a));
+                false
             }
+            None => {
+                tracing::warn!(id = %id, "a queued secret change was cancelled by `bwss answer`");
+                p.value = ValueChange::Keep;
+                is_empty(p)
+            }
+        };
+        if emptied {
+            queue.ops.remove(at);
         }
+        if let Err(e) = self.save_queue(queue, &queue_key(&state.core_keys.user)) {
+            // Not on disk: the answer is not kept in memory either.
+            if emptied {
+                queue.ops.insert(at, before);
+            } else if let Some(slot) = queue.ops.get_mut(at) {
+                *slot = before;
+            }
+            return Err(BackendError::Unavailable(format!("the answer cannot be kept on disk: {e}")));
+        }
+        state.questions.retain(|(i, _)| i != id);
+        self.rebuild(state, queue);
+        Ok(())
     }
 }
 

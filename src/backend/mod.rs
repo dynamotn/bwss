@@ -113,6 +113,22 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), BackendError> {
         self.put_item(item).await
     }
+    /// The history question the queued change of item `id` waits on
+    /// (ADR 0016); a backend that never asks has none.
+    async fn queued_question(&self, _id: &str) -> Result<Option<HistoryQuestion>, BackendError> {
+        Ok(None)
+    }
+    /// Puts the user's confirmed answer on the queued change of `id`; `None`
+    /// cancels its value change. Only the daemon calls it, once the user
+    /// confirmed the answer in its own pinentry (`cancel` needs none).
+    async fn answer_queued(
+        &self,
+        _id: &str,
+        _question: HistoryQuestion,
+        _answer: Option<HistoryAnswer>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Rejected("no queued change waits for an answer".into()))
+    }
     async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError>;
     /// How far the ACL lines of the items can be trusted on this device;
     /// [`BackendError::Locked`] while locked.

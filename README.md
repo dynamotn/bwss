@@ -191,7 +191,7 @@ password.
 | `bwss lock` | Lock the keyring and forget the keys. |
 | `bwss sync` | Pull changes from Bitwarden now (otherwise every `sync_interval_seconds`). |
 | `bwss sync --accept-rollback` | When `bwss status` lists items the server sent older than the copy on this device (kept until then), take the server's versions in this one sync, for example after restoring the server from a backup. |
-| `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the change. Then sync. |
+| `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the value change. The daemon asks you to confirm `login` and `separate` in its pinentry first. Then sync. |
 | `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
 | `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
 | `bwss index derived on` / `off` | Put item names, usernames, URIs and ids in the locked index on this device, or take them out (the default). |

@@ -729,6 +729,12 @@ impl ControlObj {
         Ok(())
     }
 
+    /// For `bwss answer`: the daemon confirms the answer in its own pinentry
+    /// (ADR 0016) before it is put on the queued change.
+    async fn answer_queued(&self, id: String, answer: String) -> Result<String, SecretError> {
+        self.daemon.answer_queued(&id, &answer).await
+    }
+
     /// (unlocked, item count, backend description)
     async fn status(&self) -> (bool, u32, String) {
         let (unlocked, items) = {

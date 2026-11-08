@@ -691,8 +691,11 @@ sequenceDiagram
   op's field changes and merges (`bwss:acl` union, registry union), write
   the value source with password history when it is the login password,
   and send the result.
-- Once an op is queued, later live ops for any item queue behind it.
-  The flush keeps order per item (dybw-core's queue): an item that has to
+- Order is kept per item. A live op queues when an op of the same item is
+  already queued, when that item's rollback is held, or when nothing can be
+  sent at all; other items' writes go on. A collection registry change
+  queues only behind a queued registry change.
+  The flush keeps order per item too (dybw-core's queue): an item that has to
   wait (it cannot be read now, keeps changing, or waits for an answer)
   keeps its ops queued in order, and the other items' ops go on. A cause
   every op shares (the network, the login, the clock) stops the flush.
@@ -706,7 +709,10 @@ sequenceDiagram
   did not write, bwss asks. A live write asks through the pinentry (write
   to the login, keep the app's value separate, cancel); a queued one waits,
   `bwss status` lists it and `bwss answer <id> login|separate|cancel`
-  answers it. What this device wrote to each login password is kept,
+  answers it. The command line is no consent: the daemon puts the same
+  question in its own pinentry, and applies `login` or `separate` only when
+  the user gives that answer there. `cancel` drops only the value change,
+  with no prompt; the item's other queued changes stay. What this device wrote to each login password is kept,
   sealed with the queue key, beside the queue.
 - ADR 0019: an op for an item whose server copy is held back as a rollback
   waits, queued and listed, until the rollback is accepted or the server

@@ -724,6 +724,33 @@ impl Daemon {
         Err(BackendError::Unavailable("the item keeps changing elsewhere; try again".into()))
     }
 
+    /// `bwss answer`: puts an answer on the queued change of `id` (ADR 0016).
+    /// The command line alone is no consent: `login` and `separate` count
+    /// only once the user gives the same answer in this daemon's pinentry, to
+    /// the same question a live write asks. `cancel` writes nothing, so it
+    /// needs no confirmation.
+    pub async fn answer_queued(&self, id: &str, answer: &str) -> SResult<String> {
+        let wanted = match answer {
+            "login" => Some(HistoryAnswer::WriteToLogin),
+            "separate" => Some(HistoryAnswer::KeepSeparate),
+            "cancel" => None,
+            other => return Err(SecretError::Failed(format!("unknown answer {other:?}"))),
+        };
+        let stays = |why: &str| SecretError::Failed(format!("{why}; the change stays queued"));
+        let question =
+            self.backend.queued_question(id).await?.ok_or_else(|| stays(&format!("no queued change of {id} waits")))?;
+        if let Some(wanted) = wanted {
+            let label = self.keyring.lock().await.item(id).map_or_else(|| id.to_owned(), |i| i.label.clone());
+            match self.prompter.history(&history_prompt(&label, question)).await {
+                Ok(Some(given)) if given == wanted => {}
+                Ok(_) => return Err(stays("not confirmed in the pinentry")),
+                Err(e) => return Err(stays(&format!("the pinentry could not ask ({e})"))),
+            }
+        }
+        self.backend.answer_queued(id, question, wanted).await?;
+        Ok(format!("answered {} for {id}: {answer}", question.code()))
+    }
+
     /// The user's answer to a history question; cancel, or a prompt that
     /// could not be put, writes nothing.
     async fn ask_history(&self, label: &str, q: HistoryQuestion) -> Result<HistoryAnswer, BackendError> {
@@ -1180,6 +1207,9 @@ mod tests {
         answered: std::sync::Mutex<Vec<(HistoryQuestion, HistoryAnswer)>>,
         /// An answered write is asked again, as one whose copy keeps changing.
         asks_again: AtomicBool,
+        /// The question a queued change waits on, and the answers put on it.
+        queued: std::sync::Mutex<Option<HistoryQuestion>>,
+        queued_answers: std::sync::Mutex<Vec<(String, HistoryQuestion, Option<HistoryAnswer>)>>,
     }
 
     fn unreachable() -> BackendError {
@@ -1202,6 +1232,8 @@ mod tests {
                 asks: std::sync::Mutex::new(None),
                 answered: std::sync::Mutex::new(Vec::new()),
                 asks_again: AtomicBool::new(false),
+                queued: std::sync::Mutex::new(None),
+                queued_answers: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1257,6 +1289,19 @@ mod tests {
                 return Err(BackendError::Ask(answer.0));
             }
             self.inner.put_item(item).await
+        }
+        async fn queued_question(&self, _id: &str) -> Result<Option<HistoryQuestion>, BackendError> {
+            Ok(*self.queued.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+        async fn answer_queued(
+            &self,
+            id: &str,
+            question: HistoryQuestion,
+            answer: Option<HistoryAnswer>,
+        ) -> Result<(), BackendError> {
+            let mut answers = self.queued_answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            answers.push((id.to_owned(), question, answer));
+            Ok(())
         }
         async fn delete_item(&self, item: &ItemData) -> Result<(), BackendError> {
             self.inner.delete_item(item).await
@@ -1640,6 +1685,57 @@ mod tests {
         assert!(err.to_string().contains("keeps changing elsewhere"), "{err}");
         assert_eq!(backend.answered.lock().unwrap().len(), 2, "each answer was sent");
         assert_eq!(pin.confirms(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_queued_answer_needs_the_users_consent_in_the_pinentry() {
+        let evicts = HistoryQuestion::EvictsForeign;
+        let daemon = |prompter: Prompter| async move {
+            let state = tempfile::tempdir().unwrap();
+            let (d, backend) = synced_daemon_and_backend(&[], prompter, state.path()).await;
+            *backend.queued.lock().unwrap() = Some(evicts);
+            (d, backend, state)
+        };
+        let answers = |b: &TestBackend| b.queued_answers.lock().unwrap().clone();
+
+        // Confirmed with the same answer, to the question a live write asks.
+        let pin = ScriptedPinentry::new(true);
+        let (d, backend, _s) = daemon(pin.prompter()).await;
+        let done = d.answer_queued("x", "login").await.unwrap();
+        assert_eq!(done, "answered evicts-foreign-history for x: login");
+        assert_eq!(answers(&backend), [("x".to_owned(), evicts, Some(HistoryAnswer::WriteToLogin))]);
+        let desc = pin.log().into_iter().find(|l| l.starts_with("SETDESC")).unwrap_or_default();
+        assert!(desc.contains("\"l\"") && desc.contains("oldest password in its history"), "{desc}");
+        // Cancel writes nothing: no prompt.
+        d.answer_queued("x", "cancel").await.unwrap();
+        assert_eq!(answers(&backend).last(), Some(&("x".to_owned(), evicts, None)));
+        assert_eq!(pin.confirms(), 1);
+
+        // Cancelled, or another answer, at the pinentry: nothing is put, the change stays queued.
+        for (pin, asked) in [
+            (ScriptedPinentry::new(false), "login"),
+            (ScriptedPinentry::answering_confirm("ERR 83886194 Not confirmed"), "login"),
+            (ScriptedPinentry::new(true), "separate"),
+        ] {
+            let (d, backend, _s) = daemon(pin.prompter()).await;
+            let err = d.answer_queued("x", asked).await.unwrap_err().to_string();
+            assert!(err.contains("not confirmed in the pinentry; the change stays queued"), "{err}");
+            assert!(answers(&backend).is_empty());
+        }
+        let notok = ScriptedPinentry::answering_confirm("ERR 83886194 Not confirmed");
+        let (d, backend, _s) = daemon(notok.prompter()).await;
+        d.answer_queued("x", "separate").await.unwrap();
+        assert_eq!(answers(&backend), [("x".to_owned(), evicts, Some(HistoryAnswer::KeepSeparate))]);
+
+        // A pinentry that cannot ask, an unknown answer, no question: nothing is put.
+        let (d, backend, _s) = daemon(Prompter::new("/nonexistent/bwss-pinentry", Duration::from_secs(1))).await;
+        let err = d.answer_queued("x", "login").await.unwrap_err().to_string();
+        assert!(err.contains("the pinentry could not ask"), "{err}");
+        assert!(d.answer_queued("x", "maybe").await.unwrap_err().to_string().contains("unknown answer"));
+        *backend.queued.lock().unwrap() = None;
+        let err = d.answer_queued("x", "cancel").await.unwrap_err().to_string();
+        assert!(err.contains("no queued change of x waits"), "{err}");
+        assert!(answers(&backend).is_empty());
     }
 
     #[tokio::test]
