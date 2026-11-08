@@ -5,6 +5,8 @@ mod acl_confirm;
 mod backend;
 mod bw;
 mod config;
+#[allow(dead_code, reason = "the host ports are wired in by later tasks")]
+mod core_ports;
 mod daemon;
 mod dbus;
 mod fsutil;
