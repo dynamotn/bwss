@@ -491,7 +491,8 @@ Unchanged from `legacy`:
 - Lock on request, after `lock_timeout_minutes` (default 60), and on SIGTERM: keys and
   decrypted items are zeroized, the API session is dropped. A lock always
   reaches the vault, even while an unlock is in flight; an unlock or a pull
-  that returns after it is dropped, never shown.
+  that returns after it is dropped, never shown, and a flush stops after
+  the write in flight.
   `lock_timeout_minutes = 0` turns off the idle lock only.
 - Lock when the machine sleeps or the screen locks (TM-013). bwss listens on
   the system bus to systemd-logind for `Manager.PrepareForSleep(true)` and
@@ -780,10 +781,12 @@ sequenceDiagram
   The flush keeps order per item too (dybw-core's queue): an item that has to
   wait (it cannot be read now, keeps changing, or waits for an answer)
   keeps its ops queued in order, and the other items' ops go on. A cause
-  every op shares (the network, the login, the clock) stops the flush.
+  every op shares (the network, the login, the clock) stops the flush, and
+  so does a lock, after the op in flight. `queue.json` is saved after every
+  op, so an op the server took is never replayed.
   Collection registry changes are replayed after the item ops, in order.
 - Writes go through dybw-core (`sync::{update, create, delete}` live,
-  `sync::queue::{enqueue, flush}` queued). ACL lines are a `bwss:acl` line
+  `sync::{enqueue, flush_until}` queued). ACL lines are a `bwss:acl` line
   union (`append_lines`), so a retry after an out-of-date answer keeps the
   lines another device added.
 - ADR 0016: before a write to a login password that is the first from this

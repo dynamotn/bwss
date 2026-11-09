@@ -1588,6 +1588,48 @@ async fn a_flush_stops_when_the_keyring_locks_and_the_write_stays_on_disk() {
     assert_eq!(v.fake.count("POST", "/api/ciphers"), 1, "and goes out then");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lock_stops_a_flush_after_the_write_in_flight() {
+    let v = vault(vec![], SymmetricKey::generate(&OsRandom).unwrap()).await;
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    v.backend.put_item(&new_item("n2", "login")).await.unwrap();
+    assert_eq!(v.queue_file(), 2);
+    v.fake.with(|s| s.down = false);
+
+    let backend = v.backend.clone();
+    // The lock comes while the first create is on the server; it waits for
+    // that one only.
+    let result = lock_during(&v, "POST", "/api/ciphers", async move { backend.refresh().await }).await;
+    assert!(matches!(result, Err(BackendError::Locked)), "{result:?}");
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 1, "the second create is not sent");
+    assert_eq!(v.queue_file(), 1, "queue.json lost the create the server took, and only that one");
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert_eq!(v.fake.count("POST", "/api/ciphers"), 2, "the other goes out at the next unlock");
+    assert_eq!(v.queue_file(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_json_loses_each_op_as_the_server_takes_it() {
+    let v = github().await;
+    v.fake.with(|s| s.down = true);
+    v.backend.put_item(&new_item("n1", "login")).await.unwrap();
+    let item = ItemData { label: "Mine".into(), ..v.item_offline("gh").await };
+    v.backend.put_item(&item).await.unwrap();
+    assert_eq!(v.queue_file(), 2);
+    v.fake.with(|s| s.down = false);
+
+    let mut gate = Gate::hold(&v.fake, "PUT", "/api/ciphers/c1");
+    let backend = v.backend.clone();
+    let local = tokio::task::LocalSet::new();
+    let flushing = local.spawn_local(async move { backend.refresh().await });
+    local.run_until(gate.arrived()).await;
+    assert_eq!(v.queue_file(), 1, "the create the server took is off the disk before the next op goes");
+    gate.open();
+    local.run_until(flushing).await.unwrap().unwrap();
+    assert_eq!(v.queue_file(), 0);
+}
+
 // --- deleting ----------------------------------------------------------------------
 
 const MARKS: [&str; 3] = ["bwss:id", "bwss:attr:service", "obsidian:id"];

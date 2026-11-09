@@ -17,6 +17,7 @@
 //! The collection registry and the keyring folder stay bwss's own writes.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use dybw_core::api::ApiError;
 use dybw_core::crypto::SymmetricKey as CoreKey;
@@ -944,7 +945,8 @@ impl Bitwarden {
         }
         // queue.json must lose every op the server accepted, even when the
         // keyring locks during the flush (R12c): these copies live until the
-        // flush ends.
+        // flush stops, which a lock makes it do after the op in flight.
+        let generation = self.lock_generation.load(Ordering::SeqCst);
         let (keys, seal, sync, mut records, held) = self
             .with_state(|s| {
                 let held: HashSet<String> = s.rollbacks.iter().map(|r| r.id.clone()).collect();
@@ -963,7 +965,16 @@ impl Bitwarden {
             let (mut ops, waiting): (Vec<Op>, Vec<Op>) =
                 std::mem::take(&mut queue.ops).into_iter().partition(|o| !held.contains(target(o)));
             let now = client.now_ms();
-            let report = sync::flush(&mut ops, client, NS, &keys, &mut records, &OsRandom, now, &sync).await;
+            let registry = &queue.registry;
+            // Saved after every op, so a crash or a lock never replays one the server took.
+            let mut after_op = |left: &[Op], records: &Records| {
+                let ops = left.iter().chain(&waiting).cloned().collect();
+                let _ = self.save_queue(&Queue { ops, registry: registry.clone() }, records, &seal.0, &seal.1);
+                self.lock_generation.load(Ordering::SeqCst) == generation
+            };
+            let report =
+                sync::flush_until(&mut ops, client, NS, &keys, &mut records, &OsRandom, now, &sync, &mut after_op)
+                    .await;
             ops.extend(waiting);
             queue.ops = ops;
             report
