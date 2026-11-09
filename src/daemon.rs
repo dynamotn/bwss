@@ -285,6 +285,8 @@ pub struct Daemon {
     pub prompts: std::sync::Mutex<Vec<PromptEntry>>,
     registered: Mutex<BTreeSet<String>>,
     counter: AtomicU64,
+    /// Bumped by every `lock`: an unlock that saw it change meanwhile is dropped.
+    locks: AtomicU64,
     last_activity: std::sync::Mutex<Instant>,
     /// Only one interactive unlock (and one access prompt) at a time.
     unlock_gate: Mutex<()>,
@@ -325,6 +327,7 @@ impl Daemon {
             prompts: std::sync::Mutex::new(Vec::new()),
             registered: Mutex::new(BTreeSet::new()),
             counter: AtomicU64::new(1),
+            locks: AtomicU64::new(0),
             last_activity: std::sync::Mutex::new(Instant::now()),
             unlock_gate: Mutex::new(()),
             failure_gate: Mutex::new(()),
@@ -467,8 +470,18 @@ impl Daemon {
     // --- locking ---------------------------------------------------------------
 
     pub async fn unlock_with_password(self: &Arc<Self>, password: &str) -> Result<(), BackendError> {
+        let locks = self.locks.load(Ordering::SeqCst);
         let snap = self.backend.unlock(password).await?;
-        let diff = self.keyring.lock().await.load(snap);
+        let mut keyring = self.keyring.lock().await;
+        // A lock came in while the backend unlocked: it wins. Checked under
+        // the keyring, so a later lock finds this unlock done and undoes it.
+        if self.locks.load(Ordering::SeqCst) != locks {
+            drop((keyring, snap));
+            self.backend.lock().await;
+            return Err(BackendError::Locked);
+        }
+        let diff = keyring.load(snap);
+        drop(keyring);
         self.prune_confirmations().await;
         self.touch();
         self.publish(diff).await;
@@ -630,18 +643,18 @@ impl Daemon {
     }
 
     pub async fn lock(self: &Arc<Self>) {
-        let before: Vec<(String, String)>;
-        {
+        self.locks.fetch_add(1, Ordering::SeqCst);
+        let before = {
             let mut k = self.keyring.lock().await;
-            if !k.is_unlocked() {
-                return;
-            }
-            before = k.item_refs();
+            let before = k.is_unlocked().then(|| k.item_refs());
             k.lock();
-        }
+            before
+        };
+        // Even when the keyring is not unlocked: an unlock in flight may hold keys.
         self.backend.lock().await;
         // After the backend forgot its keys, so no reader can open the set again.
         *self.confirmed.lock().await = None;
+        let Some(before) = before else { return };
         let after: BTreeSet<(String, String)> = self.keyring.lock().await.item_refs().into_iter().collect();
         let diff = Diff { deleted: before.into_iter().filter(|r| !after.contains(r)).collect(), ..Default::default() };
         self.publish(diff).await;
@@ -649,12 +662,19 @@ impl Daemon {
     }
 
     pub async fn refresh(self: &Arc<Self>) {
+        let locks = self.locks.load(Ordering::SeqCst);
         if !self.keyring.lock().await.is_unlocked() {
             return;
         }
         match self.backend.refresh().await {
             Ok(Some(snap)) => {
-                let diff = self.keyring.lock().await.load(snap);
+                let mut keyring = self.keyring.lock().await;
+                // Read before a lock that came in meanwhile: loading it would unlock again.
+                if self.locks.load(Ordering::SeqCst) != locks {
+                    return;
+                }
+                let diff = keyring.load(snap);
+                drop(keyring);
                 self.prune_confirmations().await;
                 self.publish(diff).await;
             }
@@ -1199,9 +1219,13 @@ mod tests {
         /// ACL lines may come from other devices, as Bitwarden's do, and every
         /// refresh brings a new snapshot, as a sync with changes would.
         per_device: Option<dybw_core::crypto::SymmetricKey>,
-        /// How many times `unlock` and `refresh` ran.
+        /// How many times `unlock`, `lock` and `refresh` ran.
         unlocks: AtomicU64,
+        locks: AtomicU64,
         refreshes: AtomicU64,
+        /// `unlock` and `refresh` do their work, then wait at the gate like a gated `put_item`.
+        gated_unlocks: AtomicBool,
+        gated_refreshes: AtomicBool,
         /// How many of the next unlocks fail as if the server were unreachable.
         unreachable_unlocks: AtomicU64,
         /// Writes and the ACL trust fail as if the server were unreachable.
@@ -1232,7 +1256,10 @@ mod tests {
                 per_device: per_device
                     .then(|| dybw_core::crypto::SymmetricKey::generate(&crate::core_ports::random::OsRandom).unwrap()),
                 unlocks: AtomicU64::new(0),
+                locks: AtomicU64::new(0),
                 refreshes: AtomicU64::new(0),
+                gated_unlocks: AtomicBool::new(false),
+                gated_refreshes: AtomicBool::new(false),
                 unreachable_unlocks: AtomicU64::new(0),
                 failing_puts: AtomicBool::new(false),
                 failing_trust: AtomicBool::new(false),
@@ -1253,18 +1280,29 @@ mod tests {
                 self.unreachable_unlocks.fetch_sub(1, Ordering::Relaxed);
                 return Err(unreachable());
             }
-            self.inner.unlock(password).await
+            let snap = self.inner.unlock(password).await?;
+            if self.gated_unlocks.load(Ordering::Relaxed) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(snap)
         }
         async fn lock(&self) {
+            self.locks.fetch_add(1, Ordering::Relaxed);
             self.inner.lock().await;
         }
         async fn refresh(&self) -> Result<Option<Snapshot>, BackendError> {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
             let changed = self.inner.refresh().await?;
-            match self.per_device {
-                Some(_) => Ok(Some(self.inner.unlock("pw").await?)),
-                None => Ok(changed),
+            let snap = match self.per_device {
+                Some(_) => Some(self.inner.unlock("pw").await?),
+                None => changed,
+            };
+            if self.gated_refreshes.load(Ordering::Relaxed) {
+                self.entered.notify_one();
+                self.release.notified().await;
             }
+            Ok(snap)
         }
         async fn create_collection(&self, label: &str) -> Result<CollectionData, BackendError> {
             self.inner.create_collection(label).await
@@ -1380,6 +1418,65 @@ mod tests {
         // The backend stored it, so the next unlock shows it.
         d.unlock_with_password("pw").await.unwrap();
         assert_eq!(d.keyring.lock().await.item_refs().len(), 1);
+    }
+
+    /// A daemon, still locked, whose backend unlock waits at the gate.
+    fn daemon_with_a_gated_unlock() -> (Arc<Daemon>, Arc<TestBackend>, tokio::task::JoinHandle<Result<(), BackendError>>)
+    {
+        let backend = Arc::new(TestBackend::new(false, false));
+        backend.gated_unlocks.store(true, Ordering::Relaxed);
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, Config::default());
+        let unlocking = tokio::spawn({
+            let d = d.clone();
+            async move { d.unlock_with_password("pw").await }
+        });
+        (d, backend, unlocking)
+    }
+
+    #[tokio::test]
+    async fn a_lock_during_an_unlock_reaches_the_backend() {
+        // logind's PrepareForSleep while the unlock waits on the server.
+        let (d, backend, unlocking) = daemon_with_a_gated_unlock();
+        backend.entered.notified().await;
+        d.lock().await;
+        assert_eq!(backend.locks.load(Ordering::Relaxed), 1, "the backend forgot its keys at once");
+        backend.release.notify_one();
+        let _ = unlocking.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unlock_that_returns_after_a_lock_is_not_loaded() {
+        let (d, backend, unlocking) = daemon_with_a_gated_unlock();
+        backend.entered.notified().await;
+        d.lock().await;
+        backend.release.notify_one();
+        assert!(matches!(unlocking.await.unwrap(), Err(BackendError::Locked)));
+        let k = d.keyring.lock().await;
+        assert!(!k.is_unlocked());
+        assert!(k.item_refs().is_empty());
+        drop(k);
+        // The backend's own unlock finished after the lock: it is locked again.
+        assert_eq!(backend.locks.load(Ordering::Relaxed), 2);
+        assert!(matches!(backend.inner.acl_trust().await, Err(BackendError::Locked)));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_returns_after_a_lock_is_not_loaded() {
+        let backend = Arc::new(TestBackend::new(false, true));
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None, None), backend.clone(), prompter, Config::default());
+        d.unlock_with_password("pw").await.unwrap();
+        backend.gated_refreshes.store(true, Ordering::Relaxed);
+        let refreshing = tokio::spawn({
+            let d = d.clone();
+            async move { d.refresh().await }
+        });
+        backend.entered.notified().await;
+        d.lock().await;
+        backend.release.notify_one();
+        refreshing.await.unwrap();
+        assert!(!d.keyring.lock().await.is_unlocked(), "the snapshot read before the lock stays out");
     }
 
     #[tokio::test]
