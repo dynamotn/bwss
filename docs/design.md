@@ -489,7 +489,9 @@ Unchanged from `legacy`:
   keyring. At the global limit, departed clients are reaped first, then the
   oldest session of the client holding the most is closed.
 - Lock on request, after `lock_timeout_minutes` (default 60), and on SIGTERM: keys and
-  decrypted items are zeroized, the API session is dropped.
+  decrypted items are zeroized, the API session is dropped. A lock always
+  reaches the vault, even while an unlock is in flight; an unlock or a pull
+  that returns after it is dropped, never shown.
   `lock_timeout_minutes = 0` turns off the idle lock only.
 - Lock when the machine sleeps or the screen locks (TM-013). bwss listens on
   the system bus to systemd-logind for `Manager.PrepareForSleep(true)` and
@@ -724,7 +726,9 @@ this device see it before the server does.
    - **rollbacks** (ADR 0019): a bound cipher the server sends older than
      the offline copy keeps the copy; `bwss status` lists it, and `bwss sync
      --accept-rollback` takes the server's versions of exactly those ciphers
-     in the next sync.
+     in the next sync. With bindings from an earlier unlock but no readable
+     offline copy there is nothing to compare, and `bwss status` says that
+     rollback protection was off for this unlock.
 4. Load the queue (format 4) and re-apply every queued op to the loaded
    cache, so pending writes stay visible.
 5. Scan (dybw-core): for every personal login or secure note not in the
@@ -1156,7 +1160,8 @@ longer served.
 | `daemon.rs`, `dbus.rs` | No `vault` collection or read-only checks; delete calls the §5.4 rule |
 | `acl.rs`, `acl_confirm.rs` | Caller identity pinned per bus name; interpreter detection; the device-local confirmation set (§6) |
 | `config.rs`, `migrate.rs` | The shared dybw file (§10): registry validation, profile resolution, the `pinentry` rule, origin-bound credentials, `bwss config migrate` |
-| `keyring.rs`, `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl`, `bwss derive` and `bwss config migrate` |
+| `keyring.rs` | Derived attributes stay out of the locked index unless `bwss derive on` (ADR 0015); `bwss:id` is always indexed |
+| `session.rs`, `prompter.rs`, `fsutil.rs`, `main.rs` | Unchanged apart from removing `whole_vault`; `main.rs` adds `bwss acl`, `bwss derive`, `bwss config migrate`, `bwss kdf accept` (ADR 0017), `bwss security accept` (ADR 0019), `bwss answer` (ADR 0016) and `bwss sync --accept-rollback` (ADR 0019) |
 
 ## 14. Compatibility with `legacy`
 
