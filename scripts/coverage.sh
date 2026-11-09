@@ -46,5 +46,11 @@ cargo llvm-cov report --ignore-filename-regex "${ignore}" --lcov --output-path "
 echo "lcov data: ${lcov}"
 { mkdir -p /src/target && cp "${lcov}" /src/target/lcov.info; } \
   || echo "note: /src is not writable, lcov.info was not copied"
-cargo llvm-cov report --ignore-filename-regex "${ignore}" --show-missing-lines \
-  --fail-under-lines "${COVERAGE_MIN:-100}"
+cargo llvm-cov report --ignore-filename-regex "${ignore}" --show-missing-lines
+# llvm-cov's totals (and lcov's LF/LH) count the best copy of a function, not the
+# union of the unit and e2e builds; the DA records are per line over all of them.
+awk -F'[:,]' -v min="${COVERAGE_MIN:-100}" '
+  /^DA:/ { n++; if ($3 > 0) hit++ }
+  END { pct = n ? 100 * hit / n : 0
+        printf "lines (unit + e2e): %d/%d = %.2f%%\n", hit, n, pct
+        exit !(n > 0 && pct >= min) }' "${lcov}"
