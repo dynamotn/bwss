@@ -2346,6 +2346,42 @@ async fn lock_during_a_flush_wins() {
     assert!(b.describe().await.contains("0 queued change(s)"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_during_the_sync_of_a_refresh_clears_the_queue() {
+    let (fake, b, _dir) = handle(vec![]).await;
+    fake.with(|s| s.down = true);
+    b.put_item(&new_item("n1", "login")).await.unwrap();
+    fake.with(|s| s.down = false);
+    // The queued create keeps failing and the server moved on: the refresh
+    // reads the vault again, holding the queue.
+    fake.fault("POST", "/api/ciphers", 503, 10);
+    fake.with(|s| s.rev += 1);
+
+    let b = Arc::new(b);
+    let mut gate = Gate::hold(&fake, "GET", "/api/sync?excludeDomains=true");
+    let refreshing = tokio::spawn({
+        let b = b.clone();
+        async move { b.refresh().await }
+    });
+    gate.arrived().await;
+    let locking = tokio::spawn({
+        let b = b.clone();
+        async move { b.lock().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !matches!(b.acl_trust().await, Err(BackendError::Locked)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lock drops the keys while the refresh waits on /sync");
+    gate.open();
+    assert!(matches!(refreshing.await.unwrap(), Err(BackendError::Locked)));
+    locking.await.unwrap();
+    // The queued plaintext left memory with the keys.
+    assert!(b.describe().await.contains("0 queued change(s)"));
+}
+
 #[tokio::test]
 async fn a_panicking_worker_fails_calls_instead_of_hanging() {
     let (_fake, b, _dir) = handle(vec![]).await;

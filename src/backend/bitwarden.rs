@@ -1631,8 +1631,11 @@ impl Bitwarden {
             }
         }
         {
-            let queue = self.queue.lock().await;
-            self.pull(&queue, &accept).await?;
+            let mut queue = self.queue.lock().await;
+            let pulled = self.pull(&queue, &accept).await;
+            // A lock during `/sync` could not clear the queue this holds.
+            self.forget_if_locked(&mut queue).await;
+            pulled?;
         }
         if accepting
             && let Some(note) = self.drop_accepted_rollbacks().await
