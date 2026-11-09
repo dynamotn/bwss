@@ -3152,6 +3152,28 @@ async fn lost_bindings_do_not_switch_rollback_detection_off() {
 }
 
 #[tokio::test]
+async fn an_unlock_without_the_offline_copy_says_rollback_protection_was_off() {
+    const OFF: &str = "rollback protection was off for this unlock: the offline copy was missing or unreadable";
+    let v = github().await;
+    assert!(!v.backend.describe().await.contains(OFF), "a first unlock has nothing to compare");
+    let cache = v.dir.join("cache/sync.json");
+    for broken in [None, Some("{ not json")] {
+        v.backend.lock().await;
+        match broken {
+            None => std::fs::remove_file(&cache).unwrap(),
+            Some(text) => std::fs::write(&cache, text).unwrap(),
+        }
+        v.backend.unlock(PASSWORD).await.unwrap();
+        let status = v.backend.describe().await;
+        assert!(status.contains(OFF), "{broken:?}: {status}");
+    }
+    // With the copy back, the next unlock compares again.
+    v.backend.lock().await;
+    v.backend.unlock(PASSWORD).await.unwrap();
+    assert!(!v.backend.describe().await.contains(OFF));
+}
+
+#[tokio::test]
 async fn bindings_that_cannot_be_read_or_kept_do_not_stop_the_unlock() {
     let k = SymmetricKey::generate(&OsRandom).unwrap();
     let (fake, config, creds, paths, dir) = server(vec![hand_marked(&k, "c1", "gh")], &k);

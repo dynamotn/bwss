@@ -1499,7 +1499,14 @@ impl Bitwarden {
         notices.extend(self.drop_accepted_rollbacks().await);
         // The offline copy is the base: the server may not go below it.
         let base = if from_cache { None } else { load_cache(&self.cache_path, &self.email).ok().flatten() };
-        let lost = match self.load_bindings(&core_keys.user) {
+        let bindings = self.load_bindings(&core_keys.user);
+        // Bindings mean an earlier unlock wrote the offline copy too.
+        if base.is_none() && !from_cache && matches!(bindings, Ok(Some(_))) {
+            let note = "rollback protection was off for this unlock: the offline copy was missing or unreadable";
+            tracing::warn!("{note}");
+            notices.push(note.to_owned());
+        }
+        let lost = match bindings {
             Ok(Some(bound)) => Ok(bound),
             Ok(None) if base.is_none() && !from_cache => Ok(Bindings::new()),
             Ok(None) => Err("are missing".to_owned()),
