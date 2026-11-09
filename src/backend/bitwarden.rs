@@ -1764,21 +1764,28 @@ fn report_rollbacks(ids: &[Rollback]) {
     }
 }
 
-/// What the daemon sees: a handle on the worker thread that owns the vault.
-pub struct BitwardenBackend(WorkerHandle, watch::Receiver<()>);
+/// What the daemon sees: a handle on the worker thread that owns the vault,
+/// with the hub's changes and the worker's own locks.
+pub struct BitwardenBackend(WorkerHandle, watch::Receiver<()>, watch::Receiver<()>);
 
 impl BitwardenBackend {
     pub fn new(config: &Config, creds: Credentials, paths: &Paths) -> anyhow::Result<Self> {
         let (config, paths) = (config.clone(), paths.clone());
         let (changes, follow) = watch::channel(());
         let init = move || Ok(Bitwarden { changes, ..Bitwarden::new(&config, creds, &paths)? });
-        Worker::spawn(init).map(|worker| Self(worker, follow))
+        Worker::spawn(init).map(|(worker, locks)| Self(worker, follow, locks))
     }
 
     /// Marked changed whenever the notifications hub reports a change made
     /// elsewhere while unlocked.
     pub fn changes(&self) -> watch::Receiver<()> {
         self.1.clone()
+    }
+
+    /// Marked whenever the worker locked the vault by itself (a panic);
+    /// closed once it stopped. Either way the daemon must lock its keyring.
+    pub fn locks(&self) -> watch::Receiver<()> {
+        self.2.clone()
     }
 
     #[cfg(test)]
@@ -1788,7 +1795,7 @@ impl BitwardenBackend {
 
     #[cfg(test)]
     pub(super) fn stopped_for_test() -> Self {
-        Self(WorkerHandle::stopped(), watch::channel(()).1)
+        Self(WorkerHandle::stopped(), watch::channel(()).1, watch::channel(()).1)
     }
 }
 

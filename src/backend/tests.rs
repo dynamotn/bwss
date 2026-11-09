@@ -2416,6 +2416,47 @@ async fn calls_after_a_restart_see_a_locked_vault() {
     assert!(b.acl_trust().await.is_ok());
 }
 
+/// A daemon over the vault worker, unlocked and holding item `n1`, that
+/// follows the locks the worker makes by itself.
+async fn daemon_on_the_worker() -> (Fake, Arc<crate::daemon::Daemon>, Arc<BitwardenBackend>, tempfile::TempDir) {
+    let (fake, b, dir) = handle(vec![]).await;
+    b.put_item(&new_item("n1", "login")).await.unwrap();
+    let b = Arc::new(b);
+    let prompter = crate::prompter::Prompter::new("false", std::time::Duration::from_secs(1));
+    let d =
+        crate::daemon::Daemon::new(crate::keyring::Keyring::new(None, None), b.clone(), prompter, Config::default());
+    d.follow_backend_locks(b.locks());
+    d.unlock_with_password(PASSWORD).await.unwrap();
+    assert!(d.keyring.lock().await.item("n1").is_some());
+    (fake, d, b, dir)
+}
+
+/// Waits until the daemon's keyring is locked, then checks `n1` is not served.
+async fn daemon_locks(d: &crate::daemon::Daemon) {
+    let locked = async {
+        while d.keyring.lock().await.is_unlocked() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), locked).await.expect("the daemon locks its keyring");
+    let k = d.keyring.lock().await;
+    assert!(k.item("n1").is_none() && k.item_locked("n1"), "no secret is served");
+}
+
+#[tokio::test]
+async fn a_worker_that_locks_after_a_panic_locks_the_daemon() {
+    let (_fake, d, b, _dir) = daemon_on_the_worker().await;
+    assert!(b.panic_for_test(false).await.is_err());
+    daemon_locks(&d).await;
+}
+
+#[tokio::test]
+async fn a_worker_that_stops_locks_the_daemon() {
+    let (_fake, d, b, _dir) = daemon_on_the_worker().await;
+    assert!(b.panic_for_test(true).await.is_err());
+    daemon_locks(&d).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lock_during_an_unlock_wins() {
     let (fake, b, _dir) = handle(vec![]).await;

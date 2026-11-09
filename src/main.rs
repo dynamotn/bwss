@@ -494,8 +494,8 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     for dir in [&paths.cache, &paths.state, &paths.tool_state] {
         fsutil::ensure_private_dir(dir).with_context(|| format!("{}", dir.display()))?;
     }
-    let (backend, index, changes): (Arc<dyn Backend>, _, _) = match config.backend {
-        BackendKind::Memory => (Arc::new(MemoryBackend::new(config.memory_password.clone())), None, None),
+    let (backend, index, changes, locks): (Arc<dyn Backend>, _, _, _) = match config.backend {
+        BackendKind::Memory => (Arc::new(MemoryBackend::new(config.memory_password.clone())), None, None, None),
         BackendKind::Bitwarden => {
             let profile = config.profile.as_deref().context("bwss serves no profile")?;
             for dir in [paths.profile_dir(profile), paths.devices(profile)] {
@@ -504,8 +504,8 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
             let origin = origin_of(&resolve_server_urls(&config.server_url)?.identity)?;
             let creds = config::load_credentials(&paths.credentials(profile), &trust.user, &origin)?;
             let b = BitwardenBackend::new(&config, creds, &paths)?;
-            let changes = b.changes();
-            (Arc::new(b), Some(paths.locked_index()), Some(changes))
+            let (changes, locks) = (b.changes(), b.locks());
+            (Arc::new(b), Some(paths.locked_index()), Some(changes), Some(locks))
         }
     };
     let prompter = guarded_prompter(&config.pinentry, trust);
@@ -523,6 +523,10 @@ async fn run_daemon(replace: bool) -> anyhow::Result<()> {
     // Live pulls when the notifications hub reports a change; the timer above stays the fallback.
     if let Some(changes) = changes {
         spawn_live(daemon.clone(), changes, Duration::from_secs(2));
+    }
+    // The vault worker locked itself or stopped: so does the keyring.
+    if let Some(locks) = locks {
+        daemon.follow_backend_locks(locks);
     }
     // Idle lock.
     if config.lock_timeout_minutes > 0 {

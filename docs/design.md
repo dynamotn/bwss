@@ -1140,7 +1140,10 @@ is `Send + Sync` and sends one command per `Backend` method; only `Send`
 reply data comes back. Each command runs as a task of its own, so a `lock`
 is handled between two awaits of a running unlock or flush. A command that
 panics fails its call, the vault is locked, and the worker goes on; if that
-lock fails, the worker stops, and every later call fails.
+lock fails, the worker stops, and every later call fails. Either way the
+daemon hears of it (a watch channel the worker marks, and which closes when
+the worker stops) and locks its keyring, so the secrets it holds are no
+longer served.
 
 | Module | Change from `legacy` |
 |---|---|

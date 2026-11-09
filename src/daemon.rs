@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use zbus::{Connection, OwnedObjectPath, message::Header, object_server::SignalEmitter};
 use zeroize::Zeroizing;
 
@@ -659,6 +659,20 @@ impl Daemon {
         let diff = Diff { deleted: before.into_iter().filter(|r| !after.contains(r)).collect(), ..Default::default() };
         self.publish(diff).await;
         tracing::info!("keyring locked");
+    }
+
+    /// Locks the keyring whenever `locks` is marked or closes: the backend
+    /// locked itself or stopped, and the keyring must not serve what it holds.
+    pub fn follow_backend_locks(self: &Arc<Self>, mut locks: watch::Receiver<()>) -> tokio::task::JoinHandle<()> {
+        let d = self.clone();
+        tokio::spawn(async move {
+            while locks.changed().await.is_ok() {
+                tracing::warn!("the vault locked itself; the keyring is locked");
+                d.lock().await;
+            }
+            tracing::warn!("the vault worker stopped; the keyring is locked");
+            d.lock().await;
+        })
     }
 
     pub async fn refresh(self: &Arc<Self>) {

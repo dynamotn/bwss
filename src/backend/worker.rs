@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use dybw_core::vault::write::{HistoryAnswer, HistoryQuestion};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
 use super::bitwarden::Bitwarden;
@@ -69,45 +69,52 @@ pub(crate) struct Worker {
 
 impl Worker {
     /// Starts the worker thread and builds the vault there with `init`.
+    /// The receiver is marked whenever the worker locked the vault by itself,
+    /// after a panic, and closed once the worker stopped.
     pub(crate) fn spawn(
         init: impl FnOnce() -> anyhow::Result<Bitwarden> + Send + 'static,
-    ) -> anyhow::Result<WorkerHandle> {
+    ) -> anyhow::Result<(WorkerHandle, watch::Receiver<()>)> {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let (commands, inbox) = mpsc::channel(64);
+        let (locked, locks) = watch::channel(());
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new().name("bwss-vault".into()).spawn(move || match init() {
             Ok(vault) => {
                 let _ = ready.send(Ok(()));
-                Worker { vault: Rc::new(vault) }.run(&runtime, inbox);
+                Worker { vault: Rc::new(vault) }.run(&runtime, inbox, locked);
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
             }
         })?;
         started.recv()??;
-        Ok(WorkerHandle(commands))
+        Ok((WorkerHandle(commands), locks))
     }
 
     /// Serves commands until every handle is dropped. Each command runs as a
     /// task of its own, so a `lock` is handled between two awaits of a running
     /// unlock or flush, and a panic stays inside its task: the vault is then
-    /// locked and the worker goes on. If that lock panics too, the worker
-    /// stops: its tasks and the vault are dropped, and every call fails.
-    fn run(self, runtime: &tokio::runtime::Runtime, mut inbox: mpsc::Receiver<Command>) {
+    /// locked, `locked` marked so the daemon locks its keyring too, and the
+    /// worker goes on. If that lock panics too, the worker stops: its tasks
+    /// and the vault are dropped, every call fails, and `locked` closes.
+    fn run(self, runtime: &tokio::runtime::Runtime, mut inbox: mpsc::Receiver<Command>, locked: watch::Sender<()>) {
         let local = tokio::task::LocalSet::new();
         let stop = Rc::new(tokio::sync::Notify::new());
+        let locked = Rc::new(locked);
         local.block_on(runtime, async move {
             loop {
+                // A stop wins over the commands still waiting: none of them runs.
                 let next = tokio::select! {
-                    command = inbox.recv() => command,
+                    biased;
                     () = stop.notified() => None,
+                    command = inbox.recv() => command,
                 };
                 let Some(command) = next else { break };
-                let (vault, stop) = (self.vault.clone(), stop.clone());
+                let (vault, stop, locked) = (self.vault.clone(), stop.clone(), locked.clone());
                 tokio::task::spawn_local(async move {
                     let task = tokio::task::spawn_local(serve(vault.clone(), command));
                     if task.await.is_err_and(|e| e.is_panic()) {
-                        tracing::error!("a vault command panicked; the keyring is locked");
+                        tracing::error!("a vault command panicked; the vault and the keyring are locked");
                         let locking = async move {
                             #[cfg(test)]
                             if PANIC_AGAIN.take() {
@@ -116,10 +123,11 @@ impl Worker {
                             vault.lock().await;
                         };
                         if tokio::task::spawn_local(locking).await.is_err() {
-                            // Fail closed: the keys may still be held, so nothing is served again.
-                            tracing::error!("locking the keyring after a panic panicked too; the vault worker stops");
+                            // Fail closed: the keys may still be held, so no call reaches them again.
+                            tracing::error!("locking the vault after a panic panicked too; the vault worker stops");
                             stop.notify_one();
                         }
+                        locked.send_replace(());
                     }
                 });
             }
