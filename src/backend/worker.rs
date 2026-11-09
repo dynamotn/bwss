@@ -103,13 +103,7 @@ impl Worker {
         let locked = Rc::new(locked);
         local.block_on(runtime, async move {
             loop {
-                // A stop wins over the commands still waiting: none of them runs.
-                let next = tokio::select! {
-                    biased;
-                    () = stop.notified() => None,
-                    command = inbox.recv() => command,
-                };
-                let Some(command) = next else { break };
+                let Some(command) = next_command(&stop, &mut inbox).await else { break };
                 let (vault, stop, locked) = (self.vault.clone(), stop.clone(), locked.clone());
                 tokio::task::spawn_local(async move {
                     let task = tokio::task::spawn_local(serve(vault.clone(), command));
@@ -132,6 +126,16 @@ impl Worker {
                 });
             }
         });
+    }
+}
+
+/// The next command to serve; `None` once the worker stops or every handle
+/// is gone. A stop wins over the commands still waiting: none of them runs.
+async fn next_command(stop: &tokio::sync::Notify, inbox: &mut mpsc::Receiver<Command>) -> Option<Command> {
+    tokio::select! {
+        biased;
+        () = stop.notified() => None,
+        command = inbox.recv() => command,
     }
 }
 
@@ -176,6 +180,26 @@ async fn serve(vault: Rc<Bitwarden>, command: Command) {
         Command::Panic(again, _reply) => {
             PANIC_AGAIN.set(again);
             panic!("a test made the vault worker panic")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stop_wins_over_a_waiting_command() {
+        // An unbiased select picks either ready branch at random: 64 tries
+        // catch it with near certainty.
+        for _ in 0..64 {
+            let (commands, mut inbox) = mpsc::channel(1);
+            let stop = tokio::sync::Notify::new();
+            let (reply, _answer) = oneshot::channel();
+            commands.try_send(Command::Describe(reply)).ok();
+            stop.notify_one();
+            assert!(next_command(&stop, &mut inbox).await.is_none(), "the stop wins");
+            assert!(inbox.try_recv().is_ok(), "the command was never taken");
         }
     }
 }
