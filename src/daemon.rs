@@ -969,22 +969,28 @@ impl Daemon {
                 item.modified = t;
                 item
             }
-            None => ItemData {
-                id: crate::model::new_item_id(),
-                collection: collection.to_owned(),
-                label,
-                attributes,
-                secret,
-                content_type,
-                created: t,
-                modified: t,
-                // Only an identified executable or script file gets a line: a
-                // bare interpreter's would cover every script it runs.
-                acl: match crate::acl::kind(caller) {
-                    CallerKind::App | CallerKind::Script => vec![caller.to_owned()],
-                    CallerKind::Unknown | CallerKind::Interpreter => vec![],
-                },
-            },
+            None => {
+                let id = crate::model::new_item_id();
+                // The caller's `bwss:*` never reach the keyring: only the item's own id.
+                let mut attributes = own_attributes(&attributes);
+                attributes.insert("bwss:id".to_owned(), id.clone());
+                ItemData {
+                    id,
+                    collection: collection.to_owned(),
+                    label,
+                    attributes,
+                    secret,
+                    content_type,
+                    created: t,
+                    modified: t,
+                    // Only an identified executable or script file gets a line: a
+                    // bare interpreter's would cover every script it runs.
+                    acl: match crate::acl::kind(caller) {
+                        CallerKind::App | CallerKind::Script => vec![caller.to_owned()],
+                        CallerKind::Unknown | CallerKind::Interpreter => vec![],
+                    },
+                }
+            }
         };
         let is_new = self.keyring.lock().await.item(&item.id).is_none();
         if collection != SESSION_COLLECTION {
@@ -1595,6 +1601,21 @@ mod tests {
         assert_eq!(&*k.item("b").unwrap().secret, b"new");
         assert_eq!(&*k.item("a").unwrap().secret, b"old-a", "never the other attribute-less item");
         assert_eq!(k.item_refs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_new_item_keeps_no_bwss_attribute_of_the_caller() {
+        let d = bare_daemon(&["a"]).await;
+        let forged = [("k", "v"), ("bwss:id", "a"), ("bwss:name", "x")];
+        let new = NewItem { replace: false, ..replacing(&forged) };
+        let path = d.create_item(LOGIN_COLLECTION, new, "/usr/bin/git").await.unwrap();
+        let id = path.as_str().rsplit('/').next().unwrap().to_owned();
+        assert_ne!(id, "a");
+        let k = d.keyring.lock().await;
+        let expected = Attributes::from([("k".to_owned(), "v".to_owned()), ("bwss:id".to_owned(), id.clone())]);
+        assert_eq!(k.item(&id).unwrap().attributes, expected);
+        let (found, _) = k.search(&Attributes::from([("bwss:id".to_owned(), "a".to_owned())]), None);
+        assert_eq!(found.len(), 1, "only the item that is a");
     }
 
     #[tokio::test]
