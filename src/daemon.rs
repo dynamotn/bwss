@@ -971,9 +971,12 @@ impl Daemon {
             }
             None => {
                 let id = crate::model::new_item_id();
-                // The caller's `bwss:*` never reach the keyring: only the item's own id.
+                // The caller's `bwss:*` never reach the keyring: only the item's
+                // own id, as a Bitwarden snapshot shows it (the memory backend shows none).
                 let mut attributes = own_attributes(&attributes);
-                attributes.insert("bwss:id".to_owned(), id.clone());
+                if self.config.backend == crate::config::BackendKind::Bitwarden {
+                    attributes.insert("bwss:id".to_owned(), id.clone());
+                }
                 ItemData {
                     id,
                     collection: collection.to_owned(),
@@ -1616,6 +1619,18 @@ mod tests {
         assert_eq!(k.item(&id).unwrap().attributes, expected);
         let (found, _) = k.search(&Attributes::from([("bwss:id".to_owned(), "a".to_owned())]), None);
         assert_eq!(found.len(), 1, "only the item that is a");
+        drop(k);
+
+        // The memory backend shows no `bwss:id`, so its new items carry none either.
+        let config = Config { backend: crate::config::BackendKind::Memory, ..Config::default() };
+        let prompter = Prompter::new("false", Duration::from_secs(1));
+        let d = Daemon::new(Keyring::new(None, None), Arc::new(MemoryBackend::new("pw")), prompter, config);
+        d.unlock_with_password("pw").await.unwrap();
+        let new = NewItem { replace: false, ..replacing(&forged) };
+        let path = d.create_item(LOGIN_COLLECTION, new, "/usr/bin/git").await.unwrap();
+        let id = path.as_str().rsplit('/').next().unwrap().to_owned();
+        let own = Attributes::from([("k".to_owned(), "v".to_owned())]);
+        assert_eq!(d.keyring.lock().await.item(&id).unwrap().attributes, own);
     }
 
     #[tokio::test]
