@@ -534,7 +534,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dybw-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=96e39d3#96e39d309859494a15f319b7ae9b2fa78a749323"
+source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=cd962fa#cd962fa9dc76c2856565f20dd3d08277bea460e5"
 dependencies = [
  "aes",
  "aes-gcm",
