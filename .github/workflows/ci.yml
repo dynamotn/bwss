@@ -25,10 +25,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/dybw-core-token
-        with:
-          token: ${{ secrets.DYBW_CORE_TOKEN }}
-          user: ${{ secrets.DYBW_CORE_TOKEN_USER }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           toolchain: stable
@@ -48,10 +44,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/dybw-core-token
-        with:
-          token: ${{ secrets.DYBW_CORE_TOKEN }}
-          user: ${{ secrets.DYBW_CORE_TOKEN_USER }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           toolchain: stable
@@ -93,10 +85,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/dybw-core-token
-        with:
-          token: ${{ secrets.DYBW_CORE_TOKEN }}
-          user: ${{ secrets.DYBW_CORE_TOKEN_USER }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           toolchain: stable
@@ -136,14 +124,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build the end-to-end image
-        # The image fetches the crates; the token is a BuildKit secret, never a layer.
-        env:
-          DYBW_CORE_TOKEN: ${{ secrets.DYBW_CORE_TOKEN }}
-          DYBW_CORE_TOKEN_USER: ${{ secrets.DYBW_CORE_TOKEN_USER || 'oauth2' }}
-        run: >-
-          DOCKER_BUILDKIT=1 docker build -t bwss-e2e -f tests/e2e/Dockerfile
-          --secret id=dybw_core_token,env=DYBW_CORE_TOKEN
-          --secret id=dybw_core_token_user,env=DYBW_CORE_TOKEN_USER .
+        run: docker build -t bwss-e2e -f tests/e2e/Dockerfile .
       - name: Wait for Vaultwarden
         run: |
           for _ in $(seq 60); do curl -fsS http://127.0.0.1:8080/alive && exit 0; sleep 2; done
@@ -168,10 +149,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/dybw-core-token
-        with:
-          token: ${{ secrets.DYBW_CORE_TOKEN }}
-          user: ${{ secrets.DYBW_CORE_TOKEN_USER }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable ref; the input pins 1.89
         with:
           toolchain: "1.89"
@@ -187,6 +164,3 @@ jobs:
         arch: [x86_64, aarch64]
     with:
       arch: ${{ matrix.arch }}
-    secrets:
-      DYBW_CORE_TOKEN: ${{ secrets.DYBW_CORE_TOKEN }}
-      DYBW_CORE_TOKEN_USER: ${{ secrets.DYBW_CORE_TOKEN_USER }}

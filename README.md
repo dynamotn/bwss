@@ -81,7 +81,7 @@ cargo install --path .            # puts bwss in ~/.cargo/bin (Rust 1.89 or newe
 ```
 
 cargo fetches dybw-core from `https://gitlab.com/dynamo-tools/dybw-core.git`,
-so git must be able to read that repository.
+a public repository (MIT), so no credentials are needed.
 
 **2. Connect your account.** bwss shares one config file with the other dybw
 tools, `~/.config/dybw/config.toml`: your account is a profile there, and
@@ -373,11 +373,7 @@ and runs the tests as a non-root user, since bwss trusts no pinentry for root.
 Most tests need a throwaway Vaultwarden, which the test container joins:
 
 ```sh
-# dybw-core is private: pass a GitLab token that can read it, from a file
-# only you can read (never on the command line). The image fetches the
-# crates with it; the token is a build secret, never stored in the image.
-docker build -t bwss-e2e -f tests/e2e/Dockerfile \
-  --secret id=dybw_core_token,src="$HOME/.config/dybw-core-token" .
+docker build -t bwss-e2e -f tests/e2e/Dockerfile .
 
 # Recreate Vaultwarden for every run: a third run on one container hits HTTP 429.
 docker rm -f bw-it
@@ -416,11 +412,6 @@ CI runs the same checks on both forges:
   Releases go to the Generic Package Registry and are linked from the release.
   aarch64 builds need an arm64 runner (`ARM64_RUNNER_TAG`, default
   `saas-linux-small-arm64`).
-
-dybw-core is a private repository, so CI fetches it with a token. On GitHub
-set the secret `DYBW_CORE_TOKEN` (a GitLab token that can read it) and,
-unless its user name is `oauth2`, `DYBW_CORE_TOKEN_USER`. On GitLab the
-job token is used: add this project to dybw-core's job token allowlist.
 
 The design is in [`docs/design.md`](docs/design.md): the item model,
 collections, writing and deletion, access control, locking, the offline queue,
