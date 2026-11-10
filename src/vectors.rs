@@ -445,6 +445,10 @@ fn canonical(method: &str, cipher: Option<&str>, body: &Map<String, Value>, user
         "hasItemKey": body.get("key").and_then(Value::as_str).is_some_and(|k| !k.is_empty()),
         "extra": extra,
     });
+    // A field-level body's part as sent; compared only when the expectation lists it (see `written`).
+    if let (None, Some(part), Some(o)) = (&blob, body.get("secureNote"), request.as_object_mut()) {
+        o.insert("secureNote".into(), part.clone());
+    }
     if let (Some(content), Some(o)) = (&blob, request.as_object_mut()) {
         o.insert("blob".into(), json!(true));
         // The sealed content's unknown keys, listed only when there are any (README, canonical body).
@@ -777,7 +781,18 @@ fn run(dir: &Path, v: &Value) -> Result<(), String> {
     if let Some(expected) = expect.get("write") {
         let op = v.get("operation").ok_or("a write expectation with no operation")?;
         let keys = core_account_keys(dir, account)?;
-        let (actual, expected) = (actual_write(v, &ciphers, op, &keys)?, expected_write(expected));
+        let (mut actual, expected) = (actual_write(v, &ciphers, op, &keys)?, expected_write(expected));
+        // `secureNote` is compared only where the expectation lists it.
+        if let Some(sent) = actual.get_mut("requests").and_then(Value::as_array_mut) {
+            let want = expected.get("requests").and_then(Value::as_array);
+            for (i, s) in sent.iter_mut().enumerate() {
+                if want.and_then(|w| w.get(i)).is_none_or(|w| w.get("secureNote").is_none())
+                    && let Some(o) = s.as_object_mut()
+                {
+                    o.remove("secureNote");
+                }
+            }
+        }
         if actual != expected {
             return Err(mismatch("write", &actual, &expected));
         }
