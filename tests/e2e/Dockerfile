@@ -21,6 +21,11 @@ RUN rustup component add llvm-tools-preview clippy \
 # as an ordinary user. The build stays root (CARGO_HOME, the /target volume).
 RUN useradd --create-home --uid 1000 tester
 
+# dybw-core is public: the crates are fetched here, into the image's
+# CARGO_HOME, so the test runs need no network. The sources are bind-mounted
+# from the build context for this step only.
+RUN --mount=type=bind,target=/fetch cargo fetch --locked --manifest-path /fetch/Cargo.toml
+
 ENV CARGO_TARGET_DIR=/target BWSS_BIN=/target/release/bwss PYTHONDONTWRITEBYTECODE=1
 WORKDIR /src
 CMD ["sh", "-c", "cargo build --release --locked && setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester dbus-run-session -- python3 -m pytest -q -p no:cacheprovider tests/e2e"]
