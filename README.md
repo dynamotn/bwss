@@ -343,7 +343,7 @@ it with secrets you cannot recover from Bitwarden itself.
 
 | Check | Result |
 |---|---|
-| Unit tests on Linux (mapping, write-back, the core's glue, sessions, keyring, access control, config, logind); the crypto's known-answer vectors are dybw-core's | 448 pass, 1 ignored (perf) |
+| Unit tests on Linux (mapping, write-back, the core's glue, sessions, keyring, access control, config, logind); the crypto's known-answer vectors are dybw-core's | 453 pass, 1 ignored (perf) |
 | dybw-core's conformance vectors (read, write, sync) | all pass but the 2 organization ones (not supported yet) |
 | End-to-end against Vaultwarden 1.37.4 | 108 pass |
 | Line coverage of `src/`, unit and end-to-end combined | 100% |

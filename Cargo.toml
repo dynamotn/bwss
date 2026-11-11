@@ -32,7 +32,7 @@ async-trait = "0.1.92"
 base64 = "0.23.1"
 cbc = { version = "0.2.1", features = ["alloc", "zeroize"] }
 clap = { version = "4.6.7", features = ["derive"] }
-dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "a3d6e0a" }
+dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "928e7f999a8cbc6ef4ae44e2438e182507e8bea6" }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 hex = "0.4.3"
 hkdf = "0.13.0"

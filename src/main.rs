@@ -939,7 +939,7 @@ mod tests {
         let (changes, follow) = watch::channel(());
         let live = spawn_live(d, follow, Duration::from_millis(300));
         let mut hub = Hub::new(HubOptions { settle_ms: 1, min_interval_ms: 1, ..HubOptions::default() }, "me".into());
-        let url = async || Some(hub_url(&base, "token"));
+        let url = async |_| Some(hub_url(&base, "token"));
         let notify = || changes.send_replace(());
         let hub = run_hub(&WsEvents, &crate::core_ports::clock::SystemClock, url, &mut hub, notify, || false);
         tokio::select! {
@@ -984,7 +984,7 @@ mod tests {
         let timer = spawn_sync(d, Duration::from_secs(300));
         let dead = DeadHub(std::cell::Cell::new(0));
         let mut hub = Hub::new(HubOptions::default(), "me".into());
-        let url = async || Some("ws://hub.invalid/hub".to_owned());
+        let url = async |_| Some("ws://hub.invalid/hub".to_owned());
         let notify = || changes.send_replace(());
         let clock = PausedClock(tokio::time::Instant::now());
         let hub = run_hub(&dead, &clock, url, &mut hub, notify, || false);
@@ -992,8 +992,9 @@ mod tests {
             () = hub => unreachable!("the hub keeps trying"),
             () = tokio::time::sleep(Duration::from_secs(301)) => {}
         }
-        // Backing off 2, 5, 15 and 60 s: tries at 0, 2, 7, 22 and 82 s, the next at 382 s.
-        assert_eq!(dead.0.get(), 5, "a dead hub is retried with back-off, not hammered");
+        // A refused first connect is retried at once with a renewed token, then backed off 2, 5, 15 and 60 s:
+        // connects at 0, 0 (renewed), 2, 7, 22 and 82 s, the next at 382 s.
+        assert_eq!(dead.0.get(), 6, "a dead hub is retried with back-off, not hammered");
         assert_eq!(pulls(), 1, "the timer pulled at 300 s; the dead hub reported nothing");
         live.abort();
         timer.abort();

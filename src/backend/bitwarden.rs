@@ -1121,11 +1121,9 @@ impl Bitwarden {
     /// Follows the hub until the unlock of `generation` is over.
     pub(super) async fn follow_hub(&self, generation: u64) {
         // The URL carries the access token: it is never logged.
-        // shortcut: an expired token is renewed by the next periodic refresh, not here; until then the hub's
-        // reconnects back off. Renew here if that gap shows in practice.
-        let url = async || {
-            let client = self.client.lock().await;
-            Some(hub_url(&self.urls.notifications, client.as_ref()?.access_token()?))
+        let url = async |renew: bool| {
+            let mut c = self.client.lock().await;
+            Some(hub_url(&self.urls.notifications, c.as_mut()?.hub_token(renew).await.ok()?))
         };
         let mut hub = Hub::new(HubOptions::default(), self.device.identifier.clone());
         let locked = || self.lock_generation.load(Ordering::SeqCst) != generation;
