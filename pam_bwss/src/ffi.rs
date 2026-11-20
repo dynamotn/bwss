@@ -3,6 +3,8 @@
 //! `hooks` and `contract`.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
+use std::io::Error;
+use std::io::ErrorKind::Interrupted;
 use std::mem::MaybeUninit;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -122,9 +124,11 @@ pub fn write_as(uid: uid_t, gid: gid_t, entries: &[(&CStr, &[u8])]) {
         exit_child();
     }
     let mut status = 0;
-    let interrupted = || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
     // SAFETY: a plain syscall; a host that reaps children itself makes it fail with ECHILD, which is fine.
-    while pid > 0 && unsafe { libc::waitpid(pid, &mut status, 0) } < 0 && interrupted() {}
+    let wait = || unsafe { libc::waitpid(pid, &mut status, 0) };
+    // Waits for the child (none when the fork failed), again after a signal.
+    let interrupted = |rc: &c_int| *rc < 0 && Error::last_os_error().kind() == Interrupted;
+    let _ = (pid > 0).then(|| std::iter::repeat_with(wait).find(|rc| !interrupted(rc)));
 }
 
 fn in_child(uid: uid_t, gid: gid_t, entries: &[(&CStr, &[u8])]) {
