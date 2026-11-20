@@ -3,7 +3,10 @@
 # @brief Line coverage of src/ over the unit and end-to-end tests combined.
 # @description Runs inside the bwss-e2e image (tests/e2e/Dockerfile), with a
 #   reachable Vaultwarden at BW_E2E_URL and the sources mounted at /src.
-#   COVERAGE_MIN (default 100) is the line-coverage threshold. See README.
+#   COVERAGE_MIN (default 100) is the line-coverage threshold. PAM_E2E=1
+#   adds pam_bwss and its tests (tests/pam), which run as root and need the
+#   keyring syscalls and /proc/keys (docker run --security-opt
+#   seccomp=unconfined --security-opt systempaths=unconfined). See README.
 set -euo pipefail
 
 ignore='(^|/)src/(perf|backend/tests)\.rs$'
@@ -31,13 +34,19 @@ cargo llvm-cov clean --workspace
 # their .profraw files (written at exit, hence SIGTERM in the fixtures).
 chmod 1777 "${profile_dir}"
 
-cargo build --locked
-cargo test --locked
+workspace=()
+if [[ "${PAM_E2E:-0}" == 1 ]]; then workspace=(--workspace); fi
+cargo build --locked "${workspace[@]}"
+cargo test --locked "${workspace[@]}"
 
 # bwss refuses uid 0, so the end-to-end tests run as an ordinary user.
 BWSS_BIN="${profile_dir}/debug/bwss" \
   setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester \
   dbus-run-session -- python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
+
+if [[ "${PAM_E2E:-0}" == 1 ]]; then
+  PAM_BWSS_SO="${profile_dir}/debug/libpam_bwss.so" python3 -m pytest -q -rf -p no:cacheprovider tests/pam
+fi
 
 # The lcov data stays in the target volume; it is copied next to the sources
 # only when they are mounted writable.

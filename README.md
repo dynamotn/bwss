@@ -336,6 +336,70 @@ slip code into an allowed script through the environment (`PYTHONPATH`,
 allowed binary to pose as it. bwss stops quiet cross-app reads, not a
 determined local attacker.
 
+## 🔑 Unlock at login: `pam_bwss`
+
+`pam_bwss.so` is a small PAM module (dybw ADR 0006) that hands your Linux
+login password to the process that unlocks your vault with it, through your
+kernel keyring. It reads the password the stack already collected and never
+prompts; it talks to no bus, socket or network, runs no KDF, logs nothing
+and writes no file. Every hook returns `PAM_IGNORE`, so it never changes the
+outcome of a login. A login without a password (fingerprint, SSH key,
+automatic login) leaves nothing.
+
+| When | It adds to your user keyring (`@u`) |
+|---|---|
+| session open, after a password login | `dybw:login`: the password |
+| session close | `dybw:lock`: a lock request (the session id, no secret) |
+| password change | `dybw:login-old`, then `dybw:login`: the old and the new password |
+
+Each entry is a `user` key that only you can view, read and search, and the
+kernel drops it after 60 seconds. The consumer, the `login` protector of the
+dybw agent, is not released yet: until then the entries simply expire.
+
+Build it with a glibc toolchain (the static musl release cannot build it),
+then install it as root into your distribution's module directory:
+
+```sh
+cargo build --locked --release -p pam_bwss
+# Debian, Ubuntu: /usr/lib/x86_64-linux-gnu/security; Arch: /usr/lib/security;
+# Fedora: /usr/lib64/security
+sudo install -o root -g root -m 644 target/release/libpam_bwss.so /usr/lib/security/pam_bwss.so
+```
+
+bwss never edits `/etc/pam.d`; add the lines yourself. Each is `optional`
+and goes **after** `pam_unix`, never between a `[success=N]` line and the
+module it jumps to.
+
+- **Debian, Ubuntu**: save this as `/usr/share/pam-configs/bwss`, then run
+  `sudo pam-auth-update` and tick it:
+
+  ```
+  Name: Hand the login password to the dybw agent (pam_bwss)
+  Default: no
+  Priority: 0
+  Auth-Type: Additional
+  Auth:
+  	optional	pam_bwss.so
+  Session-Type: Additional
+  Session:
+  	optional	pam_bwss.so
+  Password-Type: Additional
+  Password:
+  	optional	pam_bwss.so
+  ```
+
+- **Arch, Fedora and others**: at the end of the matching section of
+  `/etc/pam.d/login` and of your display manager's file (`gdm-password`,
+  `sddm`, `lightdm`), and of `/etc/pam.d/passwd` for the `password` line:
+
+  ```
+  auth      optional  pam_bwss.so
+  session   optional  pam_bwss.so
+  password  optional  pam_bwss.so
+  ```
+
+Keep a root shell open while you try a new PAM stack.
+
 ## 🧪 Status
 
 bwss is **young**: tested, but not yet battle-tested. Try it before you trust
@@ -346,6 +410,7 @@ it with secrets you cannot recover from Bitwarden itself.
 | Unit tests on Linux (mapping, write-back, the core's glue, sessions, keyring, access control, config, logind); the crypto's known-answer vectors are dybw-core's | 453 pass, 1 ignored (perf) |
 | dybw-core's conformance vectors (read, write, sync) | all pass but the 2 organization ones (not supported yet) |
 | End-to-end against Vaultwarden 1.37.4 | 108 pass |
+| `pam_bwss` under `pamtester` (keyring entries, timeout, permissions, empty token, lock, password change, nothing on disk) | 10 pass |
 | Line coverage of `src/`, unit and end-to-end combined | 100% |
 | `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
 
@@ -355,7 +420,7 @@ screen locking under a real systemd-logind, and end-to-end tests on x86_64.
 
 **Roadmap**:
 
-- `pam_bwss`, to unlock at login;
+- the consumer of `pam_bwss` (the `login` protector), to unlock at login;
 - the Flatpak secret portal;
 - `bwss import`, to mark existing Bitwarden logins from any folder;
 - organization collections.
@@ -392,9 +457,24 @@ docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
   bwss-e2e scripts/coverage.sh
 ```
 
+`pam_bwss` has its own suite, which runs as root, adds a user and writes
+`/etc/pam.d/bwss-test-*` inside the container. Docker's defaults block the
+keyring syscalls and hide `/proc/keys`, so it needs two more options:
+
+```sh
+docker run --rm --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
+  -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e \
+  sh -c 'cargo build --locked -p pam_bwss && PAM_BWSS_SO=/target/debug/libpam_bwss.so python3 -m pytest -q tests/pam'
+```
+
+The kernel keyring is not namespaced: the test user's keys (uid 4242) live in
+the Docker host's kernel until they expire.
+
 `scripts/coverage.sh` builds an instrumented debug build, runs both suites,
 prints the uncovered lines of every file and fails below `COVERAGE_MIN`
-(default 100; pass `-e COVERAGE_MIN=0` to only measure). It excludes only
+(default 100; pass `-e COVERAGE_MIN=0` to only measure). With `-e PAM_E2E=1`
+and the two options above it also measures `pam_bwss` over its suite, as the
+GitHub gate does. It excludes only
 `src/perf.rs` and `src/backend/tests.rs`. The lcov data is written to
 `/target/lcov.info` in the `bwss-target` volume, and copied to
 `target/lcov.info` when `/src` is writable.
@@ -404,11 +484,12 @@ CI runs the same checks on both forges:
 - **GitHub** (`.github/workflows/`): fmt and clippy; unit tests on x86_64,
   aarch64 and macOS; `cargo audit`; an MSRV check against `rust-version`; the
   end-to-end suite against a Vaultwarden service container; and the 100%
-  coverage gate, which uploads `lcov.info`. It also builds static musl
+  coverage gate, `pam_bwss` included, which uploads `lcov.info`. It also builds static musl
   binaries for x86_64 and aarch64, and a `v*` tag creates a release with those
   binaries and their checksums. Actions are pinned to commit SHAs, and the
   release path uses no caches.
-- **GitLab** (`.gitlab-ci.yml`): the same jobs except the MSRV check.
+- **GitLab** (`.gitlab-ci.yml`): the same jobs except the MSRV check and the
+  `pam_bwss` suite, which its Docker runners' seccomp profile blocks.
   Releases go to the Generic Package Registry and are linked from the release.
   aarch64 builds need an arm64 runner (`ARM64_RUNNER_TAG`, default
   `saas-linux-small-arm64`).

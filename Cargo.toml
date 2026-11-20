@@ -8,6 +8,12 @@ readme = "README.md"
 keywords = ["keyring", "secret-service", "bitwarden", "dbus", "libsecret"]
 categories = ["command-line-utilities", "cryptography"]
 
+[workspace]
+members = [".", "pam_bwss"]
+# A plain `cargo build` / `cargo test` stays bwss alone (the static musl
+# release cannot build a cdylib); pass --workspace for pam_bwss too.
+default-members = ["."]
+
 [lints.rust]
 unsafe_code = "forbid"
 

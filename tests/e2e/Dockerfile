@@ -1,5 +1,6 @@
 # Linux environment for the bwss end-to-end tests: a Rust toolchain, a D-Bus
-# session bus, libsecret's secret-tool and python-secretstorage.
+# session bus, libsecret's secret-tool and python-secretstorage; pamtester
+# and keyutils for pam_bwss (tests/pam).
 # Build from the repository root: docker build -t bwss-e2e -f tests/e2e/Dockerfile .
 FROM rust:1-trixie
 
@@ -7,6 +8,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       dbus dbus-daemon libsecret-tools \
       python3 python3-pytest python3-secretstorage python3-cryptography python3-jeepney \
+      pamtester keyutils \
  && rm -rf /var/lib/apt/lists/*
 
 # bwss runs a pinentry only from a system directory the user cannot write

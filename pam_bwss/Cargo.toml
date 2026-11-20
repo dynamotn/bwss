@@ -1,0 +1,28 @@
+[package]
+name = "pam_bwss"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "PAM module: hands the login password to the dybw consumer through the kernel keyring (dybw ADR 0006)"
+publish = false
+
+[lib]
+# Cargo names the file libpam_bwss.so; it is installed as pam_bwss.so (README).
+crate-type = ["cdylib"]
+
+[lints.rust]
+# Allowed only in src/ffi.rs, the libpam and keyctl boundary.
+unsafe_code = "deny"
+# cargo llvm-cov sets --cfg coverage (src/ffi.rs flushes the forked child).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+
+[dependencies]
+zeroize = "1.9.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"

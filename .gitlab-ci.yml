@@ -44,8 +44,8 @@ lint:
   extends: .cargo-cache
   script:
     - rustup component add rustfmt clippy
-    - cargo fmt --check
-    - cargo clippy --locked --all-targets
+    - cargo fmt --all --check
+    - cargo clippy --locked --workspace --all-targets
 
 audit:
   stage: check
@@ -58,7 +58,7 @@ test:
   stage: test
   extends: .cargo-cache
   script:
-    - cargo test --locked
+    - cargo test --locked --workspace
     - cargo test --locked --release perf -- --ignored --nocapture
 
 e2e:
@@ -96,7 +96,9 @@ e2e:
   timeout: 20 minutes
 
 # Line coverage of src/ (unit + end-to-end), gated at 100% by
-# scripts/coverage.sh. Same setup as e2e, plus cargo-llvm-cov.
+# scripts/coverage.sh. Same setup as e2e, plus cargo-llvm-cov. pam_bwss is
+# measured on GitHub only: its tests need the keyring syscalls, which the
+# default seccomp profile of GitLab's Docker runners blocks.
 coverage:
   stage: test
   extends: .cargo-cache

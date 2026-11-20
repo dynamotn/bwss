@@ -1254,6 +1254,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pam_bwss"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zeroize",
+]
+
+[[package]]
 name = "password-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
