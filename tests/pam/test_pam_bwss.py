@@ -225,7 +225,7 @@ def test_the_harness_hands_over_a_login_like_pamtester():
 
 
 def test_a_token_never_goes_to_a_user_set_after_authentication():
-    # sudo -u, su: auth runs for one user, PAM_USER is then changed to another.
+    # sudo -u, doas: auth runs for one user, PAM_USER is then changed to another.
     password = secrets.token_urlsafe(12)
     set_password(password)
     result = harness("authenticate", f"user={OTHER}", "open_session", "setcred=refresh", password=password)

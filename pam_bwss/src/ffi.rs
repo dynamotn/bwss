@@ -4,8 +4,9 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 use std::mem::MaybeUninit;
-use std::panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook};
+use std::panic::{AssertUnwindSafe, catch_unwind, set_hook};
 use std::ptr;
+use std::sync::Once;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -156,10 +157,11 @@ fn in_child(uid: uid_t, gid: gid_t, entries: &[(&CStr, &[u8])]) {
     // Raw syscalls, not glibc's setxid wrappers (not async-signal-safe after a
     // fork). Groups are left alone only when already running as the user;
     // otherwise they must drop, and nothing is written unless all of it worked.
-    let groups = same_user || (setxid(libc::SYS_setgroups, 0, 0, 0) && setxid(libc::SYS_setresgid, gid, gid, gid));
+    let (uid_l, gid_l) = (c_long::from(uid), c_long::from(gid));
+    let groups = same_user || (drop_groups() && setxid(libc::SYS_setresgid, gid_l, gid_l, gid_l));
     // SAFETY: getgid, getegid, getuid and geteuid are async-signal-safe.
     let ids = || unsafe { (libc::getgid(), libc::getegid(), libc::getuid(), libc::geteuid()) };
-    let dropped = groups && setxid(libc::SYS_setresuid, uid, uid, uid) && {
+    let dropped = groups && setxid(libc::SYS_setresuid, uid_l, uid_l, uid_l) && {
         let (g, eg, u, eu) = ids();
         (same_user || (g == gid && eg == gid)) && u == uid && eu == uid
     };
@@ -173,10 +175,16 @@ fn in_child(uid: uid_t, gid: gid_t, entries: &[(&CStr, &[u8])]) {
     }
 }
 
-/// A raw setxid syscall (`setgroups(0, NULL)` takes zeros); true on success.
-fn setxid(nr: c_long, a: u32, b: u32, c: u32) -> bool {
-    // SAFETY: these syscalls read no memory but a NULL group list.
+/// A raw `setresuid`/`setresgid` syscall; true on success.
+fn setxid(nr: c_long, a: c_long, b: c_long, c: c_long) -> bool {
+    // SAFETY: these syscalls take ids only and read no memory.
     unsafe { libc::syscall(nr, a, b, c) == 0 }
+}
+
+/// A raw `setgroups(0, NULL)`: no supplementary groups; true on success.
+fn drop_groups() -> bool {
+    // SAFETY: an empty list, so the kernel reads nothing through the null pointer.
+    unsafe { libc::syscall(libc::SYS_setgroups, 0 as c_long, ptr::null::<gid_t>()) == 0 }
 }
 
 /// Replaces the entry `description` in `@u`. The key is born in the child's
@@ -222,12 +230,12 @@ fn exit_child() -> ! {
 /// Runs `hook` on the handle and returns `PAM_IGNORE`, whatever happens: a
 /// panic must not unwind into libpam, and the module never decides a login.
 fn entry(pamh: *mut PamHandle, hook: impl FnOnce(&Pam)) -> c_int {
-    // A silent panic hook for the time of the call: nothing reaches the host's
-    // log, and the host's own hook is back on return.
-    let host = take_hook();
-    set_hook(Box::new(|_| {}));
+    // This cdylib carries its own std, whose panic hook only its own panics
+    // reach: silencing it once keeps them out of the host's log and touches no
+    // hook of the host.
+    static SILENT: Once = Once::new();
+    SILENT.call_once(|| set_hook(Box::new(|_| {})));
     let _ = catch_unwind(AssertUnwindSafe(|| hook(&Pam(pamh))));
-    set_hook(host);
     PAM_IGNORE
 }
 

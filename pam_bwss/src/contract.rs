@@ -53,7 +53,7 @@ impl Kept {
     }
 
     /// The token, only for the user it was given for: a stack that changes
-    /// `PAM_USER` after `auth` (`sudo -u`, `su`) never hands one user's
+    /// `PAM_USER` after `auth` (`sudo -u`, `doas`) never hands one user's
     /// password to another. Dropping the rest wipes it.
     pub fn for_user(self, user: &[u8]) -> Option<Token> {
         (self.user.as_slice() == user).then_some(self.token)

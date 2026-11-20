@@ -354,7 +354,7 @@ automatic login) leaves nothing.
 | password change | `dybw:login-old`, then `dybw:login`: the old and the new password |
 
 The password goes only to the user it was typed for: a stack that changes
-the user after authentication (`sudo -u`, `su`) hands nothing over. Each
+the user after authentication (`sudo -u`, `doas`) hands nothing over. Each
 entry is a `user` key that only you can view, read and search, and the
 kernel drops it after 60 seconds.
 
