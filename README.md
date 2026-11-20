@@ -349,11 +349,19 @@ automatic login) leaves nothing.
 | When | It adds to your user keyring (`@u`) |
 |---|---|
 | session open, after a password login | `dybw:login`: the password |
+| a screen locker's unlock (`pam_setcred` with `PAM_REFRESH_CRED` or `PAM_REINITIALIZE_CRED`) | `dybw:login`: the password |
 | session close | `dybw:lock`: a lock request (the session id, no secret) |
 | password change | `dybw:login-old`, then `dybw:login`: the old and the new password |
 
-Each entry is a `user` key that only you can view, read and search, and the
-kernel drops it after 60 seconds. The consumer, the `login` protector of the
+The password goes only to the user it was typed for: a stack that changes
+the user after authentication (`sudo -u`, `su`) hands nothing over. Each
+entry is a `user` key that only you can view, read and search, and the
+kernel drops it after 60 seconds.
+
+With a `password required pam_unix.so` stack the module also runs after a
+change that `pam_unix` then fails to write, so `dybw:login-old` and
+`dybw:login` may describe a change that did not happen. The consumer keeps
+its old wrap until a later login verifies the new password. The consumer, the `login` protector of the
 dybw agent, is not released yet: until then the entries simply expire.
 
 Build it with a glibc toolchain (the static musl release cannot build it),
@@ -361,10 +369,14 @@ then install it as root into your distribution's module directory:
 
 ```sh
 cargo build --locked --release -p pam_bwss
-# Debian, Ubuntu: /usr/lib/x86_64-linux-gnu/security; Arch: /usr/lib/security;
-# Fedora: /usr/lib64/security
-sudo install -o root -g root -m 644 target/release/libpam_bwss.so /usr/lib/security/pam_bwss.so
+sudo install -o root -g root -m 644 target/release/libpam_bwss.so <moduledir>/pam_bwss.so
 ```
+
+| Distribution | `<moduledir>` |
+|---|---|
+| Debian, Ubuntu | `/usr/lib/x86_64-linux-gnu/security` (`aarch64-linux-gnu` on arm64) |
+| Arch | `/usr/lib/security` |
+| Fedora | `/usr/lib64/security` |
 
 bwss never edits `/etc/pam.d`; add the lines yourself. Each is `optional`
 and goes **after** `pam_unix`, never between a `[success=N]` line and the
@@ -380,6 +392,7 @@ module it jumps to.
   Auth-Type: Additional
   Auth:
   	optional	pam_bwss.so
+  Session-Interactive-Only: yes
   Session-Type: Additional
   Session:
   	optional	pam_bwss.so

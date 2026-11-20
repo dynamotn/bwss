@@ -35,6 +35,37 @@ pub const PERM: u32 = (VIEW | READ | SEARCH) << 24 | (VIEW | READ | SEARCH) << 1
 
 /// `PAM_UPDATE_AUTHTOK`: the phase of `pam_sm_chauthtok` that changes it.
 pub const PAM_UPDATE_AUTHTOK: i32 = 0x2000;
+/// `PAM_REINITIALIZE_CRED` and `PAM_REFRESH_CRED`: what a screen locker asks
+/// of `pam_setcred` after it authenticated again.
+pub const PAM_REINITIALIZE_CRED: i32 = 0x0008;
+pub const PAM_REFRESH_CRED: i32 = 0x0010;
+
+/// The copy `auth` keeps: the token, bound to the `PAM_USER` it was given for.
+#[derive(Clone)]
+pub struct Kept {
+    user: Token,
+    token: Token,
+}
+
+impl Kept {
+    pub fn new(user: Token, token: Token) -> Self {
+        Self { user, token }
+    }
+
+    /// The token, only for the user it was given for: a stack that changes
+    /// `PAM_USER` after `auth` (`sudo -u`, `su`) never hands one user's
+    /// password to another. Dropping the rest wipes it.
+    pub fn for_user(self, user: &[u8]) -> Option<Token> {
+        (self.user.as_slice() == user).then_some(self.token)
+    }
+}
+
+/// Whether `pam_sm_setcred` hands the kept token over, as session open does:
+/// for a screen locker's refresh, not for the `PAM_ESTABLISH_CRED` of a login
+/// (its session open follows) nor for `PAM_DELETE_CRED`.
+pub fn setcred_hands_over(flags: i32) -> bool {
+    flags & (PAM_REINITIALIZE_CRED | PAM_REFRESH_CRED) != 0
+}
 
 /// A token worth handing over: an absent or empty one (a login without a
 /// password) gives nothing.
@@ -67,6 +98,22 @@ mod tests {
     fn an_empty_token_gives_nothing() {
         assert_eq!(nonempty(Token::default()), None);
         assert_eq!(nonempty(Token::new(b"pw".to_vec())).as_deref().map(Vec::as_slice), Some(&b"pw"[..]));
+    }
+
+    #[test]
+    fn a_kept_token_goes_to_its_own_user_only() {
+        let kept = Kept::new(Token::new(b"alice".to_vec()), Token::new(b"pw".to_vec()));
+        assert_eq!(kept.clone().for_user(b"alice").as_deref().map(Vec::as_slice), Some(&b"pw"[..]));
+        assert!(kept.clone().for_user(b"bob").is_none(), "PAM_USER changed after auth");
+        assert!(kept.for_user(b"").is_none());
+    }
+
+    #[test]
+    fn only_a_refresh_of_credentials_hands_the_token_over() {
+        assert!(setcred_hands_over(PAM_REFRESH_CRED));
+        assert!(setcred_hands_over(PAM_REINITIALIZE_CRED | 0x8000), "PAM_SILENT does not matter");
+        assert!(!setcred_hands_over(0x0002), "PAM_ESTABLISH_CRED: session open follows");
+        assert!(!setcred_hands_over(0x0004), "PAM_DELETE_CRED");
     }
 
     #[test]
