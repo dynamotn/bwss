@@ -2,7 +2,10 @@
 # session bus, libsecret's secret-tool and python-secretstorage; pamtester
 # and keyutils for pam_bwss (tests/pam).
 # Build from the repository root: docker build -t bwss-e2e -f tests/e2e/Dockerfile .
-FROM rust:1-trixie
+# The toolchain is pinned: the 100% line-coverage gate depends on how rustc
+# maps lines (1.100 counts the closure line of `.map_err(..)?` on its own), so
+# a new rustc is a deliberate bump that fixes any new gap in the same change.
+FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
