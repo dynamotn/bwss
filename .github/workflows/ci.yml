@@ -81,6 +81,9 @@ jobs:
     env:
       # bwss only allows plain http for loopback, which the port mapping provides.
       BW_E2E_URL: http://127.0.0.1:8080
+      # The runner user can write /usr/local/bin, so bwss rightly refuses a
+      # pinentry there; this directory is created root-owned below.
+      BWSS_E2E_PINENTRY: /usr/libexec/bwss-e2e/fake-pinentry
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -95,7 +98,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends dbus dbus-daemon libsecret-tools \
             python3-pytest python3-secretstorage python3-cryptography python3-jeepney
           # bwss runs a pinentry only from a system directory the user cannot write.
-          sudo install -o root -g root -m 755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
+          sudo install -D -o root -g root -m 755 tests/e2e/fake_pinentry.py "$BWSS_E2E_PINENTRY"
+          # Fail here, not in every test, if a directory on the way is the user's.
+          for d in /usr /usr/libexec /usr/libexec/bwss-e2e; do test ! -w "$d" || { echo "$d is writable"; exit 1; }; done
       - run: cargo build --locked --release
       - name: Wait for Vaultwarden
         run: |
