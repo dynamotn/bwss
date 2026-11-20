@@ -17,23 +17,25 @@ jobs:
   build:
     name: static binary (${{ inputs.arch }})
     runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    # Alpine builds against musl natively; the result is a fully static binary.
-    container: rust:1-alpine
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - run: apk add --no-cache musl-dev file
-      - run: cargo build --locked --release
-      - name: Package
+      # Alpine builds against musl natively; the result is a fully static binary.
+      # It runs as a plain `docker run`, not a job container: GitHub runs no
+      # JavaScript action (checkout, upload) inside an Alpine container on arm64.
+      - name: Build and package
         env:
           ARCH: ${{ inputs.arch }}
         run: |
-          file target/release/bwss
-          strip target/release/bwss
-          mkdir -p dist
-          tar -C target/release -czf "dist/bwss-$ARCH-linux-musl.tar.gz" bwss
-          cd dist && sha256sum ./*.tar.gz > "bwss-$ARCH-linux-musl.tar.gz.sha256"
+          docker run --rm -e ARCH -v "$PWD":/src -w /src rust:1-alpine sh -euc '
+            apk add --no-cache musl-dev file
+            cargo build --locked --release
+            file target/release/bwss
+            strip target/release/bwss
+            mkdir -p dist
+            tar -C target/release -czf "dist/bwss-$ARCH-linux-musl.tar.gz" bwss
+            cd dist && sha256sum ./*.tar.gz > "bwss-$ARCH-linux-musl.tar.gz.sha256"'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: bwss-${{ inputs.arch }}
