@@ -1,101 +1,110 @@
-<div align="center">
+# bwss
 
-# 🔐 bwss
+**Your Linux keyring, stored in your Bitwarden vault.**
 
-**Your Linux keyring, in your Bitwarden vault.**
+bwss is a drop-in `org.freedesktop.secrets` provider. Apps that use
+libsecret, browsers, `secret-tool` and anything else that talks to
+gnome-keyring or KWallet keep working unchanged, but their secrets land in
+your Bitwarden or Vaultwarden vault and follow you to every machine.
 
-A drop-in replacement for gnome-keyring's Secret Service that keeps every
-secret in Bitwarden, so it follows you to every machine the way iCloud
-Keychain does on a Mac.
-
-`org.freedesktop.secrets` · Rust · Bitwarden & Vaultwarden · offline-first · per-app access control
-
-</div>
-
----
-
-Your browser, IDE, mail client, Wi-Fi manager and `git` keep their passwords
-in the desktop keyring. On Linux that keyring is a file on one machine: set up
-a new laptop and you start over; lose the disk and the secrets go with it.
-
-**bwss** implements the standard
-[freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/),
-so every app that already talks to gnome-keyring or KWallet works unchanged.
-The storage behind it is your Bitwarden vault: any login or secure note you
-mark with a `bwss:id` field becomes a keyring item.
+It adds per-app access control, an encrypted offline copy and a write queue
+for when the server is out of reach, and ships `pam_bwss`, a PAM module
+that hands your login password over so the keyring can unlock at login.
 
 ```console
 $ secret-tool store --label="GitHub token" service github user me
-Password: ••••••••          # first use: a pinentry dialog asks for your Bitwarden master password
+Password: ********
 $ secret-tool lookup service github
-ghp_8x7…
+ghp_8x7...
 ```
 
-…and *GitHub token* now shows up in Bitwarden on your phone, and in the
-keyring of every other machine running bwss.
+*GitHub token* is now a secure note in your vault, visible in every
+Bitwarden client and in the keyring of every other machine running bwss.
 
-## ✨ Features
+## Features
 
-- **Works with your existing apps.** Anything that speaks Secret Service:
-  libsecret (`secret-tool`, GNOME apps), Chromium and Electron apps such as
-  VS Code, NetworkManager, Python `keyring`/`secretstorage`, and `oo7`.
-- **Synced everywhere.** Items are ordinary Bitwarden logins and secure
-  notes, visible and editable in every Bitwarden client and shared by every
-  bwss instance on the same account.
-- **Unlock once.** The first app that needs a secret brings up a pinentry
-  dialog; so does `bwss unlock`.
-- **Locks itself.** On `bwss lock`, after an idle timeout, when the machine
-  goes to sleep, and when your session's screen locks.
-- **Per-app access control, like the macOS Keychain.** The app that created
-  an item uses it freely; any other app is asked *Allow / Deny*, then
-  *Always allow / Only this time*.
-- **Offline-first.** The last sync is cached, still encrypted. The keyring
-  unlocks and reads with no network; writes are queued in order and replayed
-  when you are back online.
-- **Locked, but findable.** A locked keyring still answers searches, so apps
-  trigger the unlock prompt instead of failing silently after a reboot.
-- **Your Bitwarden data stays intact.** Editing an item keeps its username,
-  URIs, custom fields, attachments and history; a replaced login password
-  goes into password history.
-- **Small and self-contained.** One binary (the musl build is fully static)
-  that talks to Bitwarden directly, with no `bw` CLI or Node.js.
+- **Works with existing apps**: anything that speaks the
+  [Secret Service API](https://specifications.freedesktop.org/secret-service/),
+  such as libsecret and `secret-tool`, GNOME apps, Chromium and Electron
+  apps, NetworkManager, Python `keyring` and `secretstorage`.
+- **Synced everywhere**: items are ordinary Bitwarden logins and secure
+  notes, shared by every Bitwarden client and every bwss on the account.
+- **Opt-in per item**: only items carrying a `bwss:id` field join the
+  keyring; the rest of your vault stays private.
+- **Per-app access control**: the app that created an item uses it freely;
+  any other app gets an *Allow / Deny* prompt, like the macOS Keychain.
+- **Offline-first**: unlock and read from an encrypted copy without
+  network; writes are queued in order and replayed when the server is back.
+- **Locks itself**: on `bwss lock`, after an idle timeout, on sleep and
+  when your screen locks.
+- **Leaves your data intact**: editing an item keeps its usernames, URIs,
+  other fields, attachments and password history.
+- **Small and self-contained**: one static binary that talks to Bitwarden
+  directly, with no `bw` CLI or Node.js.
+- **Self-hosting friendly**: works with Vaultwarden.
 
-## 🧭 How it compares
+## Quick start
 
-| | gnome-keyring | KeePassXC (Secret Service) | **bwss** |
-|---|---|---|---|
-| Where secrets live | local keyring file | local KDBX file | **your Bitwarden vault** |
-| Multi-device sync | — | sync the file yourself | **built in (Bitwarden)** |
-| Phone / browser access | — | via third-party apps | **every Bitwarden client** |
-| Works offline | ✓ | ✓ | ✓ (cached, queued writes) |
-| Ask before another app reads a secret | — | ✓ | ✓ |
-| Self-hostable server | — | — | ✓ (Vaultwarden) |
+### 1. Install
 
-## 🚀 Quick start
-
-**1. Build and install.**
+Prebuilt static binaries for x86_64 and aarch64 are published on the
+[GitHub releases page](https://github.com/dynamotn/bwss/releases); the first
+release candidate, v1.0.0-rc.1, is on its way.
 
 ```sh
-git clone <this repository> && cd bwss
-cargo install --path .            # puts bwss in ~/.cargo/bin (Rust 1.89 or newer)
+ARCH=x86_64            # or aarch64
+VERSION=v1.0.0-rc.1
+BASE=https://github.com/dynamotn/bwss/releases/download/$VERSION
+curl -LO "$BASE/bwss-$ARCH-linux-musl.tar.gz"
+curl -LO "$BASE/bwss-$ARCH-linux-musl.tar.gz.sha256"
+sha256sum -c "bwss-$ARCH-linux-musl.tar.gz.sha256"
+tar -xzf "bwss-$ARCH-linux-musl.tar.gz"
+install -Dm755 bwss ~/.local/bin/bwss
 ```
 
-cargo fetches dybw-core from `https://gitlab.com/dynamo-tools/dybw-core.git`,
-a public repository (MIT), so no credentials are needed.
-
-**2. Connect your account.** bwss shares one config file with the other dybw
-tools, `~/.config/dybw/config.toml`: your account is a profile there, and
-bwss's own settings go in `[bwss]`. Start from the example, then store a
-personal API key from the Bitwarden web vault (*Settings → Security → Keys →
-View API key*):
+Or build from source with Rust 1.89 or newer. This puts `bwss` in
+`~/.cargo/bin`:
 
 ```sh
-install -Dm644 contrib/config.example.toml ~/.config/dybw/config.toml   # then edit it
-bwss login --client-id user.xxxxxxxx      # asks for the client_secret
+git clone https://github.com/dynamotn/bwss.git && cd bwss
+cargo install --locked --path .
 ```
 
-**3. Take over the keyring.** Stop gnome-keyring's secrets component (or
-KWallet's or KeePassXC's integration) first, then:
+### 2. Configure
+
+bwss reads `~/.config/dybw/config.toml`, a file shared with the other dybw
+tools. A minimal one:
+
+```toml
+default = "personal"
+pinentry = "/usr/bin/pinentry-gnome3"   # or pinentry-qt, pinentry-gtk-2, ...
+
+[profiles.personal]
+server_url = "https://vault.bitwarden.com"   # or your Vaultwarden URL
+email = "you@example.com"
+
+[bwss]
+profile = "personal"
+```
+
+The pinentry must be a program you cannot write to, such as one installed
+by your package manager; otherwise the daemon refuses to start.
+[`contrib/config.example.toml`](contrib/config.example.toml) shows every
+key.
+
+Then save a personal API key from the web vault (*Settings > Security >
+Keys > View API key*). It only logs bwss in; decrypting still needs your
+master password.
+
+```sh
+bwss login --client-id user.xxxxxxxx     # asks for the client_secret
+```
+
+### 3. Enable the user service
+
+Free the bus name first if gnome-keyring or KWallet holds it (see
+[Replace gnome-keyring or KWallet](#replace-gnome-keyring-or-kwallet)),
+then install the systemd unit and the D-Bus activation file:
 
 ```sh
 install -Dm644 contrib/bwss.service ~/.config/systemd/user/bwss.service
@@ -105,267 +114,149 @@ systemctl --user daemon-reload
 systemctl --user enable --now bwss.service
 ```
 
-**4. Use it.** Your apps already know how. Check with `bwss status`.
+The unit runs `~/.cargo/bin/bwss`. If you installed the prebuilt binary in
+`~/.local/bin`, point it there before `daemon-reload`:
 
-**Coming from the old folder-based bwss?** bwss stops on a
-`~/.config/bwss/config.toml` and asks you to run `bwss config migrate`. That
-moves the account, settings, API key and device id into the shared file and
-state directory, and renames the old files to `*.migrated`; it refuses an old
-config with a key this version no longer has (remove that key, such as
-`whole_vault`, first). Vault items are not migrated: items the old version
-created carry `bwss:id` and show up as marked items, but its folder-based
-collections are not recognised. The cache and locked index are rebuilt, and
-an old offline queue is renamed `queue.json.legacy` and never replayed, so
-flush offline writes before upgrading. See
-[`docs/design.md`](docs/design.md) §14.
-
-## 🗂️ How your vault becomes a keyring
-
-```mermaid
-flowchart LR
-  A["apps<br/>(secret-tool, browsers,<br/>VS Code, NetworkManager…)"] -- "D-Bus · org.freedesktop.secrets" --> B[bwss]
-  B -- "pinentry" --> U((you))
-  B -- "HTTPS · end-to-end encrypted" --> V[(Bitwarden /<br/>Vaultwarden)]
-  B -. "encrypted cache<br/>+ offline queue" .-> C[(~/.cache/bwss)]
+```sh
+sed -i 's|%h/.cargo/bin/bwss|%h/.local/bin/bwss|' ~/.config/systemd/user/bwss.service
 ```
 
-**An item joins the keyring when it carries a custom field named `bwss:id`.**
-The value can be any non-empty text. Add the field to a personal login or
-secure note, in any folder, with any Bitwarden client. Unmarked items stay
-private: bwss reads only their field names, never decrypts them further, and
-never puts them on the bus.
+### 4. Unlock
 
-| Secret Service | Bitwarden |
+```console
+$ bwss unlock          # a pinentry dialog asks for your master password
+unlocked
+$ bwss status
+unlocked, 0 item(s), ...
+```
+
+You can also skip this step: the first app that needs a secret brings up
+the same dialog.
+
+### 5. Try it
+
+```sh
+secret-tool store --label="bwss test" service bwss-test user me
+secret-tool lookup service bwss-test
+secret-tool clear service bwss-test
+```
+
+The item shows up in the `secret-service` folder of your vault until you
+clear it.
+
+## Replace gnome-keyring or KWallet
+
+Only one program can own `org.freedesktop.secrets`. If another one has it,
+`bwss daemon` stops with a message that names the owner. To see who it is:
+
+```sh
+busctl --user status org.freedesktop.secrets | grep -E '^(PID|Comm)='
+```
+
+Then turn that provider's Secret Service off and log out and back in:
+
+- **gnome-keyring**: hide its secrets autostart entry. The D-Bus
+  activation file you installed in `~/.local/share/dbus-1/services` takes
+  precedence over the system one.
+
+  ```sh
+  cp /etc/xdg/autostart/gnome-keyring-secrets.desktop ~/.config/autostart/
+  echo 'Hidden=true' >> ~/.config/autostart/gnome-keyring-secrets.desktop
+  ```
+
+- **KWallet** (Plasma 6): turn off its Secret Service API.
+
+  ```sh
+  kwriteconfig6 --file kwalletrc --group org.freedesktop.secrets --key apiEnabled false
+  ```
+
+- **KeePassXC**: *Settings > Secret Service Integration*, untick
+  *Enable KeePassXC Freedesktop.org Secret Service integration*.
+
+`bwss daemon --replace` takes the name over from a running provider that
+allows it. bwss does not import the old keyring file: apps store their
+secrets again as you use them.
+
+## Store secrets from apps
+
+Apps need no setup. Whatever they store becomes a personal secure note in
+the `secret-service` folder (set `folder` under `[bwss]` to change it), with
+the secret and the app's lookup attributes in custom fields:
+
+| Field | Holds |
 |---|---|
-| default collection (`login`, alias `default`) | marked items without `bwss:collection` |
-| collection "Work" | items with `bwss:collection=work` |
-| item label | the `bwss:label` field, falling back to the `bwss:id` (the item name with `bwss derive on`) |
-| secret | see *Reading the secret* below |
-| attributes (`service=github`, …) | custom fields `bwss:attr:service`, … |
-| `session` collection | memory only, never stored |
+| `bwss:id` | The marker: an item is in the keyring only when it has this field. |
+| `bwss:password` | The secret. |
+| `bwss:attr:<name>` | One lookup attribute each, such as `bwss:attr:service = github`. |
+| `bwss:label` | The label apps show; without it, the label is the `bwss:id`. |
+| `bwss:acl` | The apps allowed without asking. |
 
-- **Finding an item you marked by hand.** Apps find it by `bwss:id`
-  (`secret-tool lookup bwss:id github`) or by the `bwss:attr:*` fields you add
-  with `dybw mark` or by hand. The item name, username and first URI
-  (`bwss:name`, `bwss:username`, `bwss:uri`) are hidden on the bus and in the
-  locked index unless you run `bwss derive on` on that device (ADR 0015).
-  Without `bwss:label` the label is the `bwss:id`, or the item name while
-  derived attributes are on. `bwss status` lists the marked items that have no
-  `bwss:attr:*` field.
-- **Reading the secret.** The first of these that exists wins:
-  1. a custom field `bwss:password` (even when empty);
-  2. the item's notes, when the field `bwss:location=notes` is set;
-  3. the login password (logins) or the note text (secure notes).
-- **Writing the secret** goes back where it was read. Changing a login
-  password keeps the old one in password history, as the official clients do.
-  Add a `bwss:password` field when you want an app-only value and leave the
-  login password alone. Binary secrets never go into your login password or
-  note text: bwss adds a hidden `bwss:password` with `bwss:encoding=base64`
-  instead.
-- **Your password history is protected** (ADR 0016). The first time an app
-  writes to a login password from this device, and whenever a write would push
-  out of a full history a password this device did not write, the pinentry
-  asks first: write to the login, keep the app's value separate (in a hidden
-  `bwss:password`, the value source from then on), or cancel. A queued change
-  that meets such a question waits; `bwss status` lists it and
-  `bwss answer` answers it.
-- **New items** that apps create are personal secure notes in the `folder`
-  from your config (default `secret-service`), with the secret in
-  `bwss:password`. A very large secret uses the new note's own notes.
-- **Deleting from an app** removes every `bwss:*` field. The item goes to the
-  Bitwarden trash only when nothing of yours is left; a login password, your
-  own notes or another tool's fields (such as `obsidian:*`) keep it, just no
-  longer marked.
-- **Collections** come from the `bwss:collection` field, not from folders.
-  `login` (alias `default`) always exists; the collections apps created are
-  listed in a secure note marked `bwss:id=_collections`.
+**Use an item you already have.** Add a custom field `bwss:id` with any
+non-empty value to a personal login or secure note, in any folder and with
+any Bitwarden client. Add `bwss:attr:*` fields for the attributes your app
+looks up, then sync:
 
-bwss follows the **dybw data model 1.6**, shared with the Obsidian plugin
-keychain-bitwarden. Under the hood it runs on **dybw-core**, the dybw tools'
-shared Rust core, which implements Bitwarden's client-side crypto (PBKDF2 or
-Argon2id, HKDF, AES-256-CBC with HMAC, and the newer COSE keys and blob
-items): only ciphertext crosses the network, the master password never
-leaves the machine, and the API key only *authenticates*; decrypting still
-needs the master password.
+```sh
+# Login "GitHub" with the custom fields  bwss:id = github  and  bwss:attr:service = github
+bwss sync
+secret-tool lookup service github        # the login password
+secret-tool lookup bwss:id github        # the same item, by its id
+```
 
-## 💻 Commands
+For a login, the secret is the login password; for a secure note, the note
+text. Add a `bwss:password` field to give apps a value of their own and
+leave the login password alone.
 
-| Command | What it does |
-|---|---|
-| `bwss daemon [--replace]` | Run the Secret Service (the systemd unit does this). `--replace` takes over from another running provider. |
-| `bwss status` | Locked or unlocked, item count, queued offline changes. |
-| `bwss unlock` | Unlock through the daemon's own pinentry; no password crosses the bus. |
-| `bwss unlock --password-stdin` | For scripts and login hooks: send the password read from stdin (see Security below). |
-| `bwss lock` | Lock the keyring and forget the keys. |
-| `bwss sync` | Pull changes from Bitwarden now (otherwise on a notification from the server, and every `sync_interval_seconds`). |
-| `bwss sync --accept-rollback` | When `bwss status` lists items the server sent older than the copy on this device (kept until then), take the server's versions in this one sync, for example after restoring the server from a backup. |
-| `bwss answer <id> login\|separate\|cancel` | Answer the password history question a queued change waits on, as `bwss status` lists it: write to the login password, keep the app's value in its own field, or drop the value change. The daemon asks you to confirm `login` and `separate` in its pinentry first. Then sync. |
-| `bwss login --client-id <id> [--client-secret-stdin]` | Save the API key of the profile bwss serves, bound to its server. |
-| `bwss acl off` / `on` | Turn per-app access control off or on, on this device only (asks on the terminal before turning it off). |
-| `bwss derive on` / `off` | Show the item name, username and URI of marked items to apps and in the locked index on this device, or hide them (the default; asks on the terminal before turning it on). `bwss index derived` is a deprecated alias. |
-| `bwss config migrate` | Move an old `~/.config/bwss/config.toml` into the shared dybw file. |
-| `bwss kdf accept` | After an unlock refused a KDF weaker than the one this device pinned: show it in the pinentry and, once you confirm it (check it in the web vault first), accept it on this device. |
-| `bwss security accept <version>` | After an unlock refused an older account security state: accept that version on this device, for a profile moved to another server or account. |
+Writes go back where they were read, and a replaced login password goes
+into password history. Before an app first overwrites a login password from
+this device, the pinentry asks whether to write it to the login or keep it
+separate. Deleting from an app removes the `bwss:*` fields and only trashes
+the item when nothing else of yours is left on it.
 
-## ⚙️ Configuration
+All the mapping rules, including collections and binary secrets, are in
+[docs/reference.md](docs/reference.md#how-items-map).
 
-Everything lives in `~/.config/dybw/config.toml`;
-[`contrib/config.example.toml`](contrib/config.example.toml) documents every
-key. In short:
+## Control which apps can read what
 
-- **Top level and profiles**: `default` (the profile to serve),
-  `[profiles.<name>]` with `server_url` and `email`, and the shared
-  `lock_timeout_minutes` (default 60; 0 turns the idle lock off),
-  `sync_interval_seconds` (default 300) and `pinentry`. A profile may
-  override the shared keys.
-- **`[bwss]`**: `profile`, `folder` for new items (default `secret-service`),
-  `backend` (`bitwarden`, or `memory` for tests and demos), and
-  `notifications` (default `true`): while unlocked, bwss follows the
-  server's notifications hub and pulls about two seconds after a change made
-  on another device. The `sync_interval_seconds` timer keeps running as the
-  fallback; `notifications = false` leaves only the timer.
-- An unknown key in the top level, the served profile or `[bwss]` stops bwss,
-  so typos fail loudly. Other tools' sections are ignored.
+Every read, change or delete of a secret is checked against the item's
+`bwss:acl` list. The app that created an item is on it. Any other app gets
+a pinentry prompt, *Allow / Deny*, then *Always allow / Only this time*.
+Only an explicit *Allow* grants access.
 
-State lives outside the config: the API key in
-`~/.local/state/dybw/profiles/<profile>/credentials` (mode `0600`), device
-decisions under `~/.local/state/dybw/tools/bwss/`, and the encrypted cache,
-offline queue and locked index under `~/.cache/bwss/`.
+```console
+$ python3 ~/bin/backup.py              # a script is an app of its own:
+                                       # answer "Always allow" once and it is not asked again
+$ python3 -c 'import keyring; ...'     # inline code cannot be identified:
+                                       # asked every time, never offered "Always allow"
+```
 
-## 🔒 Security
+- Apps are identified by their executable, and scripts by interpreter and
+  script path.
+- *Always allow* is stored in the item and syncs, but every other device
+  asks you once before it honours that grant.
+- To work like gnome-keyring, with no prompts on this device:
 
-The full model is in [`docs/design.md`](docs/design.md) §11; these are the
-parts you should know.
+  ```sh
+  bwss acl off                          # asks on the terminal first
+  systemctl --user restart bwss
+  ```
 
-**Keys and locking**
+Access control is a speed bump against quiet cross-app reads, not a
+sandbox; see [docs/security.md](docs/security.md#per-app-access-control).
 
-- The master password is used only locally, to derive keys. Key material is
-  zeroized when the keyring locks.
-- The keyring locks on `bwss lock`, after `lock_timeout_minutes` without use,
-  when the machine goes to sleep, and when the session locks (systemd-logind
-  on the system bus; without it bwss logs a warning and carries on). Run from
-  a login session, it follows that session's lock. Run as a systemd user
-  unit, which belongs to no session, it follows the screen lock of any
-  session of your own user, and no other user's. Lock signals are accepted
-  only from logind itself.
-- On Linux the daemon disables core dumps and ptrace-style attach. It does
-  not `mlock` memory.
+## Unlock at login with pam_bwss
 
-**Unlocking**
+`pam_bwss.so` reads the password your login already collected and leaves
+it in your kernel keyring for 60 seconds, for the process that unlocks the
+vault with it. It never prompts, logs, writes files or touches the
+network, and it never changes the outcome of a login.
 
-- `bwss unlock` is the safe way: the daemon asks through its own pinentry, so
-  no password crosses the bus.
-- `bwss unlock --password-stdin` sends the password over the session bus to
-  the process that owns bwss's control name, but only after checking that it
-  is a `bwss daemon` of your user running the same installed file as the CLI,
-  by its command line and start time. Because the daemon is not dumpable, its
-  `/proc/<pid>/exe` cannot be read, so this check is best effort: it stops a
-  look-alike service, not another process of yours that starts a real
-  `bwss daemon` to pass it. Use it only if you accept that.
-- Only the `bwss` CLI itself may send the master password to the daemon
-  (`Control1.UnlockWithPassword`); any other executable is refused.
+> **The consumer is not released yet.** The dybw agent's `login` protector,
+> which picks the password up and unlocks, is still to come. Until then the
+> entries expire unused and you unlock with `bwss unlock`.
 
-**Per-app access control**
-
-- The check fails closed: only an explicit *Allow* grants access.
-- A script run from a file (`python3 ~/bin/backup.py`) is an app of its own,
-  identified by interpreter and script path. Interpreters running code from
-  `-c`, `-m` or stdin, and apps bwss cannot identify, are asked every time and
-  are never offered *Always allow*. Programs that are themselves not dumpable
-  (gpg-agent, sandboxed browsers) cannot be identified, so they are asked
-  every time too.
-- Grants (`bwss:acl`) sync with the item, but a device honours one only after
-  it granted or confirmed it there. Those decisions live in
-  `~/.local/state/dybw/tools/bwss/acl-confirmed`, sealed with your vault key
-  and never synced; deleting the file makes bwss ask again.
-
-**On disk and on the network**
-
-- On disk there is only Bitwarden ciphertext, plus the locked index. Offline
-  writes are sealed under a key of their own, derived from your vault key.
-- The locked index holds salted SHA-256 hashes of the attributes apps set,
-  never secrets: the same trade-off gnome-keyring makes. The salt is in the
-  same file, so anyone who can read `~/.cache/bwss/locked-index.json` can test
-  guesses of those values offline. bwss accepts this because apps must find
-  locked items before the first unlock; unlocking at login (the planned
-  `pam_bwss`) is the long-term answer. Item names, usernames and URIs
-  stay out of the index, and off the bus, unless you run `bwss derive on` on that device.
-- HTTPS is required (plain http only for `localhost`), and redirects are not
-  followed, so the API key cannot be bounced to another host. The API key is
-  bound to the identity server it was entered for and is never sent to
-  another one.
-- Only authenticated encryption is accepted (EncString type 2, and type 7
-  on COSE accounts), and server-supplied KDF parameters are range-checked to
-  stop downgrades and resource exhaustion. Server answers are capped at
-  256 MiB.
-- A server cannot quietly weaken this device: a weaker KDF than the one
-  pinned here, an older account security state, or an item older than the
-  copy on this device stops the unlock or is held back until you accept it
-  (`bwss kdf accept`, `bwss security accept`, `bwss sync --accept-rollback`).
-  Items that need a newer bwss are left alone, never treated as deleted.
-
-**The bus and what you see**
-
-- bwss will not start unless it owns both of its bus names, and no other
-  process can take them over afterwards.
-- Secrets cross D-Bus encrypted whenever the client asks for it
-  (`dh-ietf1024-sha256-aes128-cbc-pkcs7`, the libsecret default).
-- A prompt belongs to the client that created it; nobody else can start or
-  dismiss it, and a client that leaves takes its pending action with it.
-- Text bwss shows you, such as an app's path or an item's label in a pinentry
-  prompt and server error messages, is put on one line with control
-  characters, ANSI escapes and invisible bidi characters removed, so it cannot
-  add or reorder text.
-
-**A synced config cannot weaken anything**
-
-- The config file may travel with your dotfiles, so nothing in it switches a
-  protection off. Access control and the derived index are device state, set
-  with `bwss acl` and `bwss derive` and confirmed on the terminal.
-- The pinentry must be a program you cannot write to, nor any directory above
-  it. A Homebrew-installed bwss also accepts a pinentry from the same Homebrew
-  prefix, but never one under your home directory. Otherwise the daemon
-  refuses to start. bwss never runs as root.
-
-**What bwss is not: a sandbox.** Access control identifies apps by executable
-path (`/proc/<pid>/exe`) and scripts by the script path in their command
-line, pinned to the process behind each bus connection. Any process running
-as your user can still inspect other processes, rewrite its own command line,
-slip code into an allowed script through the environment (`PYTHONPATH`,
-`PERL5OPT`, `RUBYOPT`, `NODE_OPTIONS`, `BASH_ENV`), or fork and exec an
-allowed binary to pose as it. bwss stops quiet cross-app reads, not a
-determined local attacker.
-
-## 🔑 Unlock at login: `pam_bwss`
-
-`pam_bwss.so` is a small PAM module (dybw ADR 0006) that hands your Linux
-login password to the process that unlocks your vault with it, through your
-kernel keyring. It reads the password the stack already collected and never
-prompts; it talks to no bus, socket or network, runs no KDF, logs nothing
-and writes no file. Every hook returns `PAM_IGNORE`, so it never changes the
-outcome of a login. A login without a password (fingerprint, SSH key,
-automatic login) leaves nothing.
-
-| When | It adds to your user keyring (`@u`) |
-|---|---|
-| session open, after a password login | `dybw:login`: the password |
-| a screen locker's unlock (`pam_setcred` with `PAM_REFRESH_CRED` or `PAM_REINITIALIZE_CRED`) | `dybw:login`: the password |
-| session close | `dybw:lock`: a lock request (the session id, no secret) |
-| password change | `dybw:login-old`, then `dybw:login`: the old and the new password |
-
-The password goes only to the user it was typed for: a stack that changes
-the user after authentication (`sudo -u`, `doas`) hands nothing over. Each
-entry is a `user` key that only you can view, read and search, and the
-kernel drops it after 60 seconds.
-
-With a `password required pam_unix.so` stack the module also runs after a
-change that `pam_unix` then fails to write, so `dybw:login-old` and
-`dybw:login` may describe a change that did not happen. The consumer keeps
-its old wrap until a later login verifies the new password. The consumer, the `login` protector of the
-dybw agent, is not released yet: until then the entries simply expire.
-
-Build it with a glibc toolchain (the static musl release cannot build it),
-then install it as root into your distribution's module directory:
+Build it with a glibc toolchain (the static release cannot), and install it
+into your distribution's module directory:
 
 ```sh
 cargo build --locked --release -p pam_bwss
@@ -378,32 +269,15 @@ sudo install -o root -g root -m 644 target/release/libpam_bwss.so <moduledir>/pa
 | Arch | `/usr/lib/security` |
 | Fedora | `/usr/lib64/security` |
 
-bwss never edits `/etc/pam.d`; add the lines yourself. Each is `optional`
-and goes **after** `pam_unix`, never between a `[success=N]` line and the
-module it jumps to.
+bwss never edits `/etc/pam.d`; add the lines yourself, each `optional` and
+**after** `pam_unix`. Keep a root shell open while you try a new stack.
 
-- **Debian, Ubuntu**: save this as `/usr/share/pam-configs/bwss`, then run
-  `sudo pam-auth-update` and tick it:
-
-  ```
-  Name: Hand the login password to the dybw agent (pam_bwss)
-  Default: no
-  Priority: 0
-  Auth-Type: Additional
-  Auth:
-  	optional	pam_bwss.so
-  Session-Interactive-Only: yes
-  Session-Type: Additional
-  Session:
-  	optional	pam_bwss.so
-  Password-Type: Additional
-  Password:
-  	optional	pam_bwss.so
-  ```
-
-- **Arch, Fedora and others**: at the end of the matching section of
-  `/etc/pam.d/login` and of your display manager's file (`gdm-password`,
-  `sddm`, `lightdm`), and of `/etc/pam.d/passwd` for the `password` line:
+- **Debian, Ubuntu**: save a profile as `/usr/share/pam-configs/bwss` and
+  run `sudo pam-auth-update`. The profile sets
+  `Session-Interactive-Only: yes`, so cron jobs and other non-interactive
+  sessions never run the module.
+- **Arch, Fedora and others**: add to `/etc/pam.d/login`, your display
+  manager's file (`gdm-password`, `sddm`, `lightdm`) and `/etc/pam.d/passwd`:
 
   ```
   auth      optional  pam_bwss.so
@@ -411,108 +285,140 @@ module it jumps to.
   password  optional  pam_bwss.so
   ```
 
-Keep a root shell open while you try a new PAM stack.
+The full profile, the keyring entries and the caveats are in
+[docs/pam_bwss.md](docs/pam_bwss.md).
 
-## 🧪 Status
+## Work offline
 
-bwss is **young**: tested, but not yet battle-tested. Try it before you trust
-it with secrets you cannot recover from Bitwarden itself.
+Nothing to configure. On every unlock and sync, bwss keeps the vault's
+ciphertext in `~/.cache/bwss`. When the server cannot be reached
+(connection errors, HTTP 429 or 5xx):
 
-| Check | Result |
+- **unlock and reads** use that copy, with the same password check;
+- **writes** apply to the keyring at once and wait, sealed, in
+  `~/.local/state/bwss/queue.json`;
+- **the queue is replayed in order** at the next sync that reaches the
+  server, every `sync_interval_seconds` (default 300) or on `bwss sync`.
+
+`bwss status` shows how many changes are queued. A change that needs your
+answer (such as overwriting a login password) waits until you run
+`bwss answer`.
+
+While online and unlocked, bwss also follows the server's notifications and
+pulls about two seconds after a change made on another device.
+
+## How it works
+
+```
+  secret-tool, browsers, VS Code, NetworkManager, Python keyring, ...
+                               |
+                               |  D-Bus session bus: org.freedesktop.secrets
+                               v
+  +------------------------------------------------------------+
+  | bwss daemon                                                |
+  |   Secret Service objects, sessions, prompts, per-app ACL,  |
+  |   idle / sleep / screen lock, locked index                 |
+  +------------------------------------------------------------+
+                               |
+                               v
+  +------------------------------------------------------------+
+  | vault worker (one thread that owns the unlocked vault)     |
+  |   offline copy, write queue, item mapping                  |
+  +------------------------------------------------------------+
+                               |
+                               v
+  +------------------------------------------------------------+
+  | dybw-core: Bitwarden crypto, API client, sync              |
+  +------------------------------------------------------------+
+                               |
+                               |  HTTPS, end-to-end encrypted
+                               v
+                    Bitwarden or Vaultwarden
+```
+
+The daemon answers Secret Service calls from an in-memory keyring built
+from the marked items, and asks you through pinentry for the master
+password and for access decisions. The vault worker holds the keys and
+does every unlock, read and write through
+[dybw-core](https://gitlab.com/dynamo-tools/dybw-core), the dybw tools'
+shared Rust core, which implements Bitwarden's client-side crypto. Only
+ciphertext leaves the machine.
+
+## Security model
+
+- **Your master password stays local.** It only derives keys; key material
+  is wiped on lock. The API key only logs in.
+- **Unlocked only while needed.** Idle timeout, sleep and screen lock all
+  lock the keyring.
+- **Fail-closed access control**, per app and per device.
+- **Only ciphertext on disk**, plus a locked index of salted attribute
+  hashes so apps can find locked items before the first unlock (the same
+  trade-off gnome-keyring makes).
+- **A server cannot quietly weaken the device**: a weaker KDF, an older
+  account security state or rolled-back items are held until you accept
+  them.
+- **A synced config cannot switch protections off**, and the daemon
+  refuses a pinentry you could replace. bwss never runs as root.
+- **Not a sandbox**: a determined process running as your user can still
+  pose as an allowed app.
+
+The details are in [docs/security.md](docs/security.md), the full model in
+[docs/design.md](docs/design.md) §11.
+
+## Commands
+
+| Command | What it does |
 |---|---|
-| Unit tests on Linux (mapping, write-back, the core's glue, sessions, keyring, access control, config, logind); the crypto's known-answer vectors are dybw-core's | 453 pass, 1 ignored (perf) |
-| dybw-core's conformance vectors (read, write, sync) | all pass but the 2 organization ones (not supported yet) |
-| End-to-end against Vaultwarden 1.37.4 | 108 pass |
-| `pam_bwss` under `pamtester` (keyring entries, timeout, permissions, empty token, lock, password change, nothing on disk) | 10 pass |
-| Line coverage of `src/`, unit and end-to-end combined | 100% |
-| `cargo fmt --check`, `cargo clippy --locked --all-targets` | clean |
+| `bwss status` | Locked or unlocked, item count, queued changes, anything that needs you. |
+| `bwss unlock` / `bwss lock` | Unlock through pinentry, or lock and forget the keys. |
+| `bwss sync` | Pull changes from Bitwarden now. |
+| `bwss login --client-id <id>` | Save the API key of the profile bwss serves. |
+| `bwss acl off` / `on` | Turn per-app access control off or on, on this device. |
+| `bwss derive on` / `off` | Show or hide item names, usernames and URIs to apps, on this device. |
+| `bwss daemon [--replace]` | Run the Secret Service (the systemd unit does this). |
 
-**Not tested yet**: bitwarden.com itself (every server test uses
-Vaultwarden), desktop apps such as Chromium and VS Code under a real session,
-screen locking under a real systemd-logind, and end-to-end tests on x86_64.
+`bwss answer`, `bwss kdf accept`, `bwss security accept`,
+`bwss sync --accept-rollback`, `bwss config migrate`, every configuration
+key and every file bwss writes are in
+[docs/reference.md](docs/reference.md). Coming from the old folder-based
+bwss? See [upgrading](docs/reference.md#upgrading-from-the-folder-based-bwss).
 
-**Roadmap**:
+## Status
 
-- the consumer of `pam_bwss` (the `login` protector), to unlock at login;
-- the Flatpak secret portal;
-- `bwss import`, to mark existing Bitwarden logins from any folder;
-- organization collections.
+bwss is heading for its first release candidate, **v1.0.0-rc.1**. It is
+tested, but not yet battle-tested: try it before you trust it with secrets
+you cannot recover from Bitwarden itself.
 
-## 🛠️ Development
+- **Platform**: Linux only (D-Bus, systemd-logind, the kernel keyring).
+- **Minimum Rust version**: 1.89.
+- **Tested**: unit tests, dybw-core's conformance vectors, an end-to-end
+  suite against Vaultwarden 1.37.4 with `secret-tool` and secretstorage,
+  `pam_bwss` under `pamtester`, and a 100% line-coverage gate.
+- **Not tested yet**: bitwarden.com itself (every server test uses
+  Vaultwarden), desktop apps such as Chromium and VS Code in a real
+  session, and screen locking under a real systemd-logind.
+- **Not supported yet**: organization collections, the Flatpak secret
+  portal, and unlocking at login (the `pam_bwss` consumer).
 
-```sh
-cargo test                                            # unit tests
-cargo test --release perf -- --ignored --nocapture    # performance budgets
-```
+## License
 
-The end-to-end suite runs in Docker on Linux (dbus, secret-tool,
-python-secretstorage). The image installs a fake pinentry in `/usr/local/bin`
-and runs the tests as a non-root user, since bwss trusts no pinentry for root.
-Most tests need a throwaway Vaultwarden, which the test container joins:
+The repository has no license file yet. dybw-core, which bwss builds on, is
+MIT-licensed.
 
-```sh
-docker build -t bwss-e2e -f tests/e2e/Dockerfile .
-
-# Recreate Vaultwarden for every run: a third run on one container hits HTTP 429.
-docker rm -f bw-it
-docker run -d --rm --name bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false \
-  -e DISABLE_ICON_DOWNLOAD=true -e LOGIN_RATELIMIT_MAX_BURST=1000 \
-  -e LOGIN_RATELIMIT_SECONDS=1 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
-  vaultwarden/server:1.37.4
-
-# The end-to-end suite
-docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
-  -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e
-
-# Or: unit and end-to-end tests with line coverage, gated at 100%
-docker run --rm --network container:bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
-  -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry \
-  bwss-e2e scripts/coverage.sh
-```
-
-`pam_bwss` has its own suite, which runs as root, adds a user and writes
-`/etc/pam.d/bwss-test-*` inside the container. Docker's defaults block the
-keyring syscalls and hide `/proc/keys`, so it needs two more options:
+## Development
 
 ```sh
-docker run --rm --security-opt seccomp=unconfined --security-opt systempaths=unconfined \
-  -v "$PWD":/src -v bwss-target:/target -v bwss-cargo:/usr/local/cargo/registry bwss-e2e \
-  sh -c 'cargo build --locked -p pam_bwss && PAM_BWSS_SO=/target/debug/libpam_bwss.so python3 -m pytest -q tests/pam'
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets
+cargo test --locked --workspace
 ```
 
-The kernel keyring is not namespaced: the test user's keys (uid 4242) live in
-the Docker host's kernel until they expire.
-
-`scripts/coverage.sh` builds an instrumented debug build, runs both suites,
-prints the uncovered lines of every file and fails below `COVERAGE_MIN`
-(default 100; pass `-e COVERAGE_MIN=0` to only measure). With `-e PAM_E2E=1`
-and the two options above it also measures `pam_bwss` over its suite, as the
-GitHub gate does. It excludes only
-`src/perf.rs` and `src/backend/tests.rs`. The lcov data is written to
-`/target/lcov.info` in the `bwss-target` volume, and copied to
-`target/lcov.info` when `/src` is writable.
-
-CI runs the same checks on both forges:
-
-- **GitHub** (`.github/workflows/`): fmt and clippy; unit tests on x86_64,
-  aarch64 and macOS; `cargo audit`; an MSRV check against `rust-version`; the
-  end-to-end suite against a Vaultwarden service container; and the 100%
-  coverage gate, `pam_bwss` included, which uploads `lcov.info`. It also builds static musl
-  binaries for x86_64 and aarch64, and a `v*` tag creates a release with those
-  binaries and their checksums. Actions are pinned to commit SHAs, and the
-  release path uses no caches.
-- **GitLab** (`.gitlab-ci.yml`): the same jobs except the MSRV check and the
-  `pam_bwss` suite, which its Docker runners' seccomp profile blocks.
-  Releases go to the Generic Package Registry and are linked from the release.
-  aarch64 builds need an arm64 runner (`ARM64_RUNNER_TAG`, default
-  `saas-linux-small-arm64`).
-
-The design is in [`docs/design.md`](docs/design.md): the item model,
-collections, writing and deletion, access control, locking, the offline queue,
-sessions and prompts, configuration, the security model and the test matrix.
-Implementation plans are in [`docs/superpowers/plans/`](docs/superpowers/plans/).
+The end-to-end suite runs in Docker against a throwaway Vaultwarden. See
+[docs/development.md](docs/development.md) for the end-to-end and
+`pam_bwss` suites, coverage and CI, and [docs/design.md](docs/design.md)
+for the design.
 
 ---
 
-<sub>bwss is an independent project. It is not affiliated with or endorsed by
-Bitwarden, Inc. "Bitwarden" is a trademark of Bitwarden, Inc.</sub>
+bwss is an independent project. It is not affiliated with or endorsed by
+Bitwarden, Inc. "Bitwarden" is a trademark of Bitwarden, Inc.
