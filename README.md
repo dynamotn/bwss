@@ -9,7 +9,8 @@ your Bitwarden or Vaultwarden vault and follow you to every machine.
 
 It adds per-app access control, an encrypted offline copy and a write queue
 for when the server is out of reach, and ships `pam_bwss`, a PAM module
-that hands your login password over so the keyring can unlock at login.
+that hands your login password to the dybw agent so your vault profiles
+unlock at login.
 
 ```console
 $ secret-tool store --label="GitHub token" service github user me
@@ -247,13 +248,15 @@ sandbox; see [docs/security.md](docs/security.md#per-app-access-control).
 ## Unlock at login with pam_bwss
 
 `pam_bwss.so` reads the password your login already collected and leaves
-it in your kernel keyring for 60 seconds, for the process that unlocks the
-vault with it. It never prompts, logs, writes files or touches the
-network, and it never changes the outcome of a login.
+it in your kernel keyring for 60 seconds. It never prompts, logs, writes
+files or touches the network, and it never changes the outcome of a login.
 
-> **The consumer is not released yet.** The dybw agent's `login` protector,
-> which picks the password up and unlocks, is still to come. Until then the
-> entries expire unused and you unlock with `bwss unlock`.
+It hands the login password to the dybw agent from
+[dybw](https://github.com/dynamotn/dybw), which takes it at once and
+unlocks every profile that has a `login` protector. Enrol a profile once
+with `dybw unlock add login`. A screen unlock unlocks those profiles again,
+and closing your last session locks them. bwss itself does not read these
+entries; it still unlocks with `bwss unlock` or on first use.
 
 Build it with a glibc toolchain (the static release cannot), and install it
 into your distribution's module directory:
@@ -398,7 +401,8 @@ you cannot recover from Bitwarden itself.
   Vaultwarden), desktop apps such as Chromium and VS Code in a real
   session, and screen locking under a real systemd-logind.
 - **Not supported yet**: organization collections, the Flatpak secret
-  portal, and unlocking at login (the `pam_bwss` consumer).
+  portal, and bwss itself unlocking at login (`pam_bwss` serves the dybw
+  agent today).
 
 ## License
 

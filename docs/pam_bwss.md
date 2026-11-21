@@ -1,14 +1,27 @@
 # pam_bwss
 
 `pam_bwss.so` is a small PAM module (dybw ADR 0006) that hands your Linux
-login password to the process that unlocks your vault with it, through your
-kernel keyring. The [README](../README.md#unlock-at-login-with-pam_bwss)
-has the install steps; this page has the details.
+login password to the dybw agent through your kernel keyring. The
+[README](../README.md#unlock-at-login-with-pam_bwss) has the install steps;
+this page has the details.
 
-> **The consumer is not released yet.** The `login` protector of the dybw
-> agent, which reads these entries and unlocks with them, is still to come.
-> Until then the entries simply expire, and you unlock with `bwss unlock`
-> or on first use.
+## Who reads it
+
+The dybw agent from [dybw](https://github.com/dynamotn/dybw) (Linux) is the
+consumer. It unlocks every profile that has a `login` protector, which you
+enrol once per profile with `dybw unlock add login`. While a profile has
+that protector, the agent checks the keyring every second, takes each entry
+and invalidates it at once:
+
+- `dybw:login` (a login or a screen unlock) unlocks those profiles;
+- `dybw:login-old` with `dybw:login` (a password change) re-wraps their
+  key for the new password;
+- `dybw:lock` locks every profile when it names your last open logind
+  session.
+
+bwss itself does not read these entries: it still unlocks with
+`bwss unlock` or on first use. Entries nobody takes expire after 60
+seconds.
 
 ## What it does
 
@@ -33,7 +46,7 @@ smartcard) leaves nothing.
   authentication in a separate process).
 - With a `password required pam_unix.so` stack the module also runs after a
   change that `pam_unix` then fails to write, so `dybw:login-old` and
-  `dybw:login` may describe a change that did not happen. The consumer keeps
+  `dybw:login` may describe a change that did not happen. The agent keeps
   its old wrap until a later login verifies the new password.
 - Any process of your own user can write `dybw:login` or `dybw:lock` into
   your keyring. That can delete the `login` protector or lock your
