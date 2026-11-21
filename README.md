@@ -49,8 +49,11 @@ Bitwarden client and in the keyring of every other machine running bwss.
 ### 1. Install
 
 Prebuilt static binaries for x86_64 and aarch64 are published on the
-[GitHub releases page](https://github.com/dynamotn/bwss/releases); the first
-release candidate, v1.0.0-rc.1, is on its way.
+[GitHub releases page](https://github.com/dynamotn/bwss/releases). Each
+release has `bwss-<arch>-linux-musl.tar.gz` (`<arch>` is `x86_64` or
+`aarch64`, no version in the name), holding only the `bwss` binary, and a
+`bwss-<arch>-linux-musl.tar.gz.sha256` next to it. `pam_bwss` is not in the
+release: build it from source ([below](#unlock-at-login-with-pam_bwss)).
 
 ```sh
 ARCH=x86_64            # or aarch64
@@ -388,7 +391,7 @@ bwss? See [upgrading](docs/reference.md#upgrading-from-the-folder-based-bwss).
 
 ## Status
 
-bwss is heading for its first release candidate, **v1.0.0-rc.1**. It is
+bwss is at its first release candidate, **v1.0.0-rc.1**. It is
 tested, but not yet battle-tested: try it before you trust it with secrets
 you cannot recover from Bitwarden itself.
 

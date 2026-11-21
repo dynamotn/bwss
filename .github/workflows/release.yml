@@ -32,4 +32,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "bwss $TAG" --generate-notes --verify-tag
+        run: |
+          prerelease=()
+          # A tag with a pre-release part (v1.0.0-rc.1) is marked prerelease.
+          [[ "$TAG" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "bwss $TAG" --generate-notes --verify-tag "${prerelease[@]}"
