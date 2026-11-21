@@ -406,8 +406,7 @@ you cannot recover from Bitwarden itself.
 
 ## License
 
-The repository has no license file yet. dybw-core, which bwss builds on, is
-MIT-licensed.
+bwss and `pam_bwss` are released under the [MIT License](LICENSE).
 
 ## Development
 

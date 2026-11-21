@@ -3,6 +3,7 @@ name = "pam_bwss"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+license = "MIT"
 description = "PAM module: hands the login password to the dybw consumer through the kernel keyring (dybw ADR 0006)"
 publish = false
 
